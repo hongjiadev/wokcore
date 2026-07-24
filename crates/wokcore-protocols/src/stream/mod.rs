@@ -16,6 +16,6 @@ pub enum ProtocolError {
     DecoderFailed,
     #[error("SSE stream ended with an unterminated frame")]
     UnexpectedEof,
-    #[error("event channel capacity must be greater than zero")]
+    #[error("event channel capacity must be between 1 and the runtime-supported maximum")]
     InvalidChannelCapacity,
 }

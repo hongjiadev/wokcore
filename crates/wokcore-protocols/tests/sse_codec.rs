@@ -299,10 +299,15 @@ fn bounded_channel_capacity_respects_the_tokio_semaphore_limit() {
         assert!(bounded_event_channel::<u8>(capacity).is_ok());
     }
     for capacity in [Semaphore::MAX_PERMITS + 1, usize::MAX] {
-        assert!(matches!(
-            bounded_event_channel::<u8>(capacity),
-            Err(ProtocolError::InvalidChannelCapacity)
-        ));
+        let error = match bounded_event_channel::<u8>(capacity) {
+            Err(error) => error,
+            Ok(_) => panic!("capacity above Tokio's maximum must be rejected"),
+        };
+        assert_eq!(error, ProtocolError::InvalidChannelCapacity);
+        assert_eq!(
+            error.to_string(),
+            "event channel capacity must be between 1 and the runtime-supported maximum"
+        );
     }
 }
 
