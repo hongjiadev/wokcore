@@ -1,0 +1,7 @@
+{
+  "error": {
+    "type": "gateway_error",
+    "code": "upstream_auth",
+    "message": "The upstream account needs to be authenticated again."
+  }
+}

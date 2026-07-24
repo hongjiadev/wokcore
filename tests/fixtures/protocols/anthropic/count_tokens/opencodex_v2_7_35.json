@@ -1,0 +1,18 @@
+{
+  "model": "mock/test-model",
+  "system": "be brief",
+  "messages": [
+    {
+      "role": "user",
+      "content": "count me please, this is a sentence"
+    }
+  ],
+  "tools": [
+    {
+      "name": "Read",
+      "input_schema": {
+        "type": "object"
+      }
+    }
+  ]
+}

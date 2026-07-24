@@ -25,3 +25,23 @@ The private pre-rewrite recovery bundle is stored in WokDocs, not this public re
 - Verification:
   - `cargo +1.97.1 clippy -p wokcore-core --all-targets --all-features -- -D warnings`
   - `cargo +1.97.1 test -p wokcore-core --all-features`
+
+## Runtime import 2: protocol substrate
+
+- Source repository: `https://github.com/hongjiadev/wokrouter`
+- Source commit: `226a40e08ad6c783e996ceed77b8e6dfe2640fb4`
+- Imported paths:
+  - `crates/wokrouter-protocols/src/**` → `crates/wokcore-protocols/src/**`
+  - `crates/wokrouter-protocols/tests/**` → `crates/wokcore-protocols/tests/**`
+  - `tests/fixtures/protocols/**` → `tests/fixtures/protocols/**`
+- Renames:
+  - Cargo package `wokrouter-protocols` → `wokcore-protocols`
+  - Rust crate path `wokrouter_protocols` → `wokcore_protocols`
+- Deliberate adaptation:
+  - the internal package is `publish = false`; protocol behavior and fixtures are otherwise retained.
+  - `tests/fixtures/protocols/.gitattributes` pins fixture LF endings and permits the legal SSE blank line at EOF without changing fixture wire bytes.
+- License: imported code and fixtures remain available under `MIT OR Apache-2.0`; third-party references remain listed in `NOTICE.md`.
+- Verification:
+  - `python tests/fixtures/protocols/cursor/verify_fixtures.py`
+  - `cargo +1.97.1 clippy -p wokcore-protocols --all-targets --all-features -- -D warnings`
+  - `cargo +1.97.1 test -p wokcore-protocols --all-features`

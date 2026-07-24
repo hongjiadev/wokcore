@@ -1,0 +1,28 @@
+{
+  "id": "msg_non_stream",
+  "type": "message",
+  "role": "assistant",
+  "content": [
+    {
+      "type": "text",
+      "text": "Hello"
+    },
+    {
+      "type": "tool_use",
+      "id": "toolu_non_stream",
+      "name": "read_file",
+      "input": {
+        "path": "README.md"
+      }
+    }
+  ],
+  "model": "claude-test",
+  "stop_reason": "tool_use",
+  "stop_sequence": null,
+  "usage": {
+    "input_tokens": 11,
+    "output_tokens": 17,
+    "cache_creation_input_tokens": 2,
+    "cache_read_input_tokens": 3
+  }
+}

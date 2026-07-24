@@ -1,0 +1,6 @@
+data: {"id":"chatcmpl_stream","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_azure","type":"function","function":{"name":"weather","arguments":"{\"city\":"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl_stream","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"Paris\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}}
+
+data: [DONE]
+

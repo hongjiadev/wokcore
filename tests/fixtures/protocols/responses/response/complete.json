@@ -1,0 +1,91 @@
+{
+  "id": "resp_fixture",
+  "object": "response",
+  "created_at": 1723456789,
+  "status": "completed",
+  "completed_at": 1723456790,
+  "error": null,
+  "incomplete_details": null,
+  "instructions": "trusted instructions",
+  "max_output_tokens": 512,
+  "model": "gpt-test",
+  "output": [
+    {
+      "id": "msg_1",
+      "type": "message",
+      "role": "assistant",
+      "status": "completed",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "你好",
+          "annotations": []
+        }
+      ]
+    },
+    {
+      "id": "reasoning_1",
+      "type": "reasoning",
+      "status": "completed",
+      "summary": [
+        {
+          "type": "summary_text",
+          "text": "先检查"
+        }
+      ]
+    },
+    {
+      "id": "tool_1",
+      "type": "function_call",
+      "call_id": "call_1",
+      "name": "read_file",
+      "arguments": "{\"path\":\"配置.toml\"}",
+      "status": "completed"
+    }
+  ],
+  "parallel_tool_calls": false,
+  "previous_response_id": "resp_previous",
+  "reasoning": {
+    "effort": "high",
+    "summary": "auto"
+  },
+  "store": false,
+  "temperature": 0.25,
+  "text": {
+    "format": {
+      "type": "text"
+    },
+    "verbosity": "low"
+  },
+  "tool_choice": {
+    "type": "function",
+    "name": "read_file"
+  },
+  "tools": [
+    {
+      "type": "function",
+      "name": "read_file",
+      "parameters": {
+        "type": "object"
+      }
+    }
+  ],
+  "top_p": 0.9,
+  "truncation": "auto",
+  "usage": {
+    "input_tokens": 10,
+    "input_tokens_details": {
+      "cached_tokens": 3
+    },
+    "output_tokens": 5,
+    "output_tokens_details": {
+      "reasoning_tokens": 2
+    },
+    "total_tokens": 15,
+    "vendor_usage": "kept"
+  },
+  "user": null,
+  "metadata": {
+    "fixture": "trusted"
+  }
+}

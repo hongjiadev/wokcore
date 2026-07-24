@@ -1,0 +1,4 @@
+data: {"responseId":"gemini_fixture","candidates":[{"content":{"role":"model","parts":[{"functionCall":{"id":"call_weather","name":"weather","args":{"city":"Paris"}}}]}}]}
+
+data: {"responseId":"gemini_fixture","usageMetadata":{"promptTokenCount":9,"candidatesTokenCount":4,"cachedContentTokenCount":2,"thoughtsTokenCount":1},"candidates":[{"finishReason":"STOP"}]}
+

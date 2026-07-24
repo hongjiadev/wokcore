@@ -7,6 +7,7 @@ All notable WokCore changes are documented in this file.
 ### Added
 
 - Internal `wokcore-core` domain types migrated from the recorded WokRouter source revision.
+- Internal canonical IR, bounded SSE primitives, Provider protocol codecs, and offline fixtures migrated from the recorded WokRouter source revision.
 
 ## [0.1.0] - 2026-07-24
 

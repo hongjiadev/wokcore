@@ -1,0 +1,109 @@
+[
+  {
+    "data": {
+      "id": "chatcmpl_fixture",
+      "object": "chat.completion.chunk",
+      "created": 1723456789,
+      "model": "gpt-test",
+      "choices": [{"index": 0, "delta": {"role": "assistant"}, "logprobs": null, "finish_reason": null}],
+      "usage": null,
+      "service_tier": "default",
+      "vendor_trace": "trace-safe"
+    }
+  },
+  {
+    "data": {
+      "id": "chatcmpl_fixture",
+      "object": "chat.completion.chunk",
+      "created": 1723456789,
+      "model": "gpt-test",
+      "choices": [{"index": 0, "delta": {"content": "Hello"}, "logprobs": null, "finish_reason": null}],
+      "usage": null,
+      "service_tier": "default",
+      "vendor_trace": "trace-safe"
+    }
+  },
+  {
+    "data": {
+      "id": "chatcmpl_fixture",
+      "object": "chat.completion.chunk",
+      "created": 1723456789,
+      "model": "gpt-test",
+      "choices": [{
+        "index": 0,
+        "delta": {"tool_calls": [{"index": 0, "id": "call_read", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":\""}}]},
+        "logprobs": null,
+        "finish_reason": null
+      }],
+      "usage": null,
+      "service_tier": "default",
+      "vendor_trace": "trace-safe"
+    }
+  },
+  {
+    "data": {
+      "id": "chatcmpl_fixture",
+      "object": "chat.completion.chunk",
+      "created": 1723456789,
+      "model": "gpt-test",
+      "choices": [{
+        "index": 0,
+        "delta": {"tool_calls": [{"index": 1, "id": "call_list", "type": "function", "function": {"name": "list_files", "arguments": "{\"path\":\"src\"}"}}]},
+        "logprobs": null,
+        "finish_reason": null
+      }],
+      "usage": null,
+      "service_tier": "default",
+      "vendor_trace": "trace-safe"
+    }
+  },
+  {
+    "data": {
+      "id": "chatcmpl_fixture",
+      "object": "chat.completion.chunk",
+      "created": 1723456789,
+      "model": "gpt-test",
+      "choices": [{
+        "index": 0,
+        "delta": {"tool_calls": [{"index": 0, "function": {"arguments": "README.md\"}"}}]},
+        "logprobs": null,
+        "finish_reason": null
+      }],
+      "usage": null,
+      "service_tier": "default",
+      "vendor_trace": "trace-safe"
+    }
+  },
+  {
+    "data": {
+      "id": "chatcmpl_fixture",
+      "object": "chat.completion.chunk",
+      "created": 1723456789,
+      "model": "gpt-test",
+      "choices": [{"index": 0, "delta": {}, "logprobs": null, "finish_reason": "tool_calls"}],
+      "usage": null,
+      "service_tier": "default",
+      "vendor_trace": "trace-safe"
+    }
+  },
+  {
+    "data": {
+      "id": "chatcmpl_fixture",
+      "object": "chat.completion.chunk",
+      "created": 1723456789,
+      "model": "gpt-test",
+      "choices": [],
+      "usage": {
+        "prompt_tokens": 12,
+        "completion_tokens": 7,
+        "total_tokens": 19,
+        "prompt_tokens_details": {"cached_tokens": 5},
+        "completion_tokens_details": {"reasoning_tokens": 2},
+        "vendor_usage": true
+      },
+      "service_tier": "default",
+      "vendor_trace": "trace-safe"
+    }
+  },
+  {"data": "[DONE]"}
+]

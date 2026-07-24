@@ -1,0 +1,378 @@
+[
+  {
+    "event": "response.created",
+    "data": {
+      "type": "response.created",
+      "response": {
+        "id": "resp_fixture",
+        "object": "response",
+        "created_at": 1723456789,
+        "status": "in_progress",
+        "completed_at": null,
+        "error": null,
+        "incomplete_details": null,
+        "instructions": "trusted instructions",
+        "max_output_tokens": 512,
+        "model": "gpt-test",
+        "output": [],
+        "parallel_tool_calls": false,
+        "previous_response_id": "resp_previous",
+        "reasoning": {
+          "effort": "high",
+          "summary": "auto"
+        },
+        "store": false,
+        "temperature": 0.25,
+        "text": {
+          "format": {
+            "type": "text"
+          },
+          "verbosity": "low"
+        },
+        "tool_choice": {
+          "type": "function",
+          "name": "read_file"
+        },
+        "tools": [
+          {
+            "type": "function",
+            "name": "read_file",
+            "parameters": {
+              "type": "object"
+            }
+          }
+        ],
+        "top_p": 0.9,
+        "truncation": "auto",
+        "usage": null,
+        "user": null,
+        "metadata": {
+          "fixture": "trusted"
+        }
+      },
+      "sequence_number": 1
+    }
+  },
+  {
+    "event": "response.output_item.added",
+    "data": {
+      "type": "response.output_item.added",
+      "output_index": 0,
+      "item": {
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "status": "in_progress",
+        "content": []
+      },
+      "sequence_number": 2
+    }
+  },
+  {
+    "event": "response.content_part.added",
+    "data": {
+      "type": "response.content_part.added",
+      "item_id": "msg_1",
+      "output_index": 0,
+      "content_index": 0,
+      "part": {
+        "type": "output_text",
+        "text": "",
+        "annotations": []
+      },
+      "sequence_number": 3
+    }
+  },
+  {
+    "event": "response.output_text.delta",
+    "data": {
+      "type": "response.output_text.delta",
+      "item_id": "msg_1",
+      "output_index": 0,
+      "content_index": 0,
+      "delta": "你好",
+      "sequence_number": 4
+    }
+  },
+  {
+    "event": "response.output_item.added",
+    "data": {
+      "type": "response.output_item.added",
+      "output_index": 1,
+      "item": {
+        "id": "reasoning_1",
+        "type": "reasoning",
+        "status": "in_progress",
+        "summary": []
+      },
+      "sequence_number": 5
+    }
+  },
+  {
+    "event": "response.reasoning_summary_part.added",
+    "data": {
+      "type": "response.reasoning_summary_part.added",
+      "item_id": "reasoning_1",
+      "output_index": 1,
+      "summary_index": 0,
+      "part": {
+        "type": "summary_text",
+        "text": ""
+      },
+      "sequence_number": 6
+    }
+  },
+  {
+    "event": "response.reasoning_summary_text.delta",
+    "data": {
+      "type": "response.reasoning_summary_text.delta",
+      "item_id": "reasoning_1",
+      "output_index": 1,
+      "summary_index": 0,
+      "delta": "先检查",
+      "sequence_number": 7
+    }
+  },
+  {
+    "event": "response.output_item.added",
+    "data": {
+      "type": "response.output_item.added",
+      "output_index": 2,
+      "item": {
+        "id": "tool_1",
+        "type": "function_call",
+        "call_id": "call_1",
+        "name": "read_file",
+        "arguments": "",
+        "status": "in_progress"
+      },
+      "sequence_number": 8
+    }
+  },
+  {
+    "event": "response.function_call_arguments.delta",
+    "data": {
+      "type": "response.function_call_arguments.delta",
+      "item_id": "tool_1",
+      "output_index": 2,
+      "delta": "{\"path\":\"配置.toml\"}",
+      "sequence_number": 9
+    }
+  },
+  {
+    "event": "response.output_text.done",
+    "data": {
+      "type": "response.output_text.done",
+      "item_id": "msg_1",
+      "output_index": 0,
+      "content_index": 0,
+      "text": "你好",
+      "sequence_number": 10
+    }
+  },
+  {
+    "event": "response.content_part.done",
+    "data": {
+      "type": "response.content_part.done",
+      "item_id": "msg_1",
+      "output_index": 0,
+      "content_index": 0,
+      "part": {
+        "type": "output_text",
+        "text": "你好",
+        "annotations": []
+      },
+      "sequence_number": 11
+    }
+  },
+  {
+    "event": "response.output_item.done",
+    "data": {
+      "type": "response.output_item.done",
+      "output_index": 0,
+      "item": {
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [
+          {
+            "type": "output_text",
+            "text": "你好",
+            "annotations": []
+          }
+        ]
+      },
+      "sequence_number": 12
+    }
+  },
+  {
+    "event": "response.reasoning_summary_text.done",
+    "data": {
+      "type": "response.reasoning_summary_text.done",
+      "item_id": "reasoning_1",
+      "output_index": 1,
+      "summary_index": 0,
+      "text": "先检查",
+      "sequence_number": 13
+    }
+  },
+  {
+    "event": "response.reasoning_summary_part.done",
+    "data": {
+      "type": "response.reasoning_summary_part.done",
+      "item_id": "reasoning_1",
+      "output_index": 1,
+      "summary_index": 0,
+      "part": {
+        "type": "summary_text",
+        "text": "先检查"
+      },
+      "sequence_number": 14
+    }
+  },
+  {
+    "event": "response.output_item.done",
+    "data": {
+      "type": "response.output_item.done",
+      "output_index": 1,
+      "item": {
+        "id": "reasoning_1",
+        "type": "reasoning",
+        "status": "completed",
+        "summary": [
+          {
+            "type": "summary_text",
+            "text": "先检查"
+          }
+        ]
+      },
+      "sequence_number": 15
+    }
+  },
+  {
+    "event": "response.function_call_arguments.done",
+    "data": {
+      "type": "response.function_call_arguments.done",
+      "item_id": "tool_1",
+      "name": "read_file",
+      "output_index": 2,
+      "arguments": "{\"path\":\"配置.toml\"}",
+      "sequence_number": 16
+    }
+  },
+  {
+    "event": "response.output_item.done",
+    "data": {
+      "type": "response.output_item.done",
+      "output_index": 2,
+      "item": {
+        "id": "tool_1",
+        "type": "function_call",
+        "call_id": "call_1",
+        "name": "read_file",
+        "arguments": "{\"path\":\"配置.toml\"}",
+        "status": "completed"
+      },
+      "sequence_number": 17
+    }
+  },
+  {
+    "event": "response.completed",
+    "data": {
+      "type": "response.completed",
+      "response": {
+        "id": "resp_fixture",
+        "object": "response",
+        "created_at": 1723456789,
+        "status": "completed",
+        "completed_at": 1723456790,
+        "error": null,
+        "incomplete_details": null,
+        "instructions": "trusted instructions",
+        "max_output_tokens": 512,
+        "model": "gpt-test",
+        "output": [
+          {
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [
+              {
+                "type": "output_text",
+                "text": "你好",
+                "annotations": []
+              }
+            ]
+          },
+          {
+            "id": "reasoning_1",
+            "type": "reasoning",
+            "status": "completed",
+            "summary": [
+              {
+                "type": "summary_text",
+                "text": "先检查"
+              }
+            ]
+          },
+          {
+            "id": "tool_1",
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "read_file",
+            "arguments": "{\"path\":\"配置.toml\"}",
+            "status": "completed"
+          }
+        ],
+        "parallel_tool_calls": false,
+        "previous_response_id": "resp_previous",
+        "reasoning": {
+          "effort": "high",
+          "summary": "auto"
+        },
+        "store": false,
+        "temperature": 0.25,
+        "text": {
+          "format": {
+            "type": "text"
+          },
+          "verbosity": "low"
+        },
+        "tool_choice": {
+          "type": "function",
+          "name": "read_file"
+        },
+        "tools": [
+          {
+            "type": "function",
+            "name": "read_file",
+            "parameters": {
+              "type": "object"
+            }
+          }
+        ],
+        "top_p": 0.9,
+        "truncation": "auto",
+        "usage": {
+          "input_tokens": 10,
+          "input_tokens_details": {
+            "cached_tokens": 3
+          },
+          "output_tokens": 5,
+          "output_tokens_details": {
+            "reasoning_tokens": 2
+          },
+          "total_tokens": 15,
+          "vendor_usage": "kept"
+        },
+        "user": null,
+        "metadata": {
+          "fixture": "trusted"
+        }
+      },
+      "sequence_number": 18
+    }
+  }
+]

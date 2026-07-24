@@ -1,0 +1,65 @@
+[
+  {
+    "type": "message_start",
+    "message": {
+      "id": "msg_thinking",
+      "type": "message",
+      "role": "assistant",
+      "content": [],
+      "model": "claude-test",
+      "stop_reason": null,
+      "stop_sequence": null,
+      "usage": {
+        "input_tokens": 11,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 3,
+        "output_tokens": 1
+      }
+    }
+  },
+  {
+    "type": "content_block_start",
+    "index": 0,
+    "content_block": {
+      "type": "thinking",
+      "thinking": "",
+      "signature": ""
+    }
+  },
+  {
+    "type": "content_block_delta",
+    "index": 0,
+    "delta": {
+      "type": "thinking_delta",
+      "thinking": "Reasoning summary."
+    }
+  },
+  {
+    "type": "content_block_delta",
+    "index": 0,
+    "delta": {
+      "type": "signature_delta",
+      "signature": "fixture-signature"
+    }
+  },
+  {
+    "type": "content_block_stop",
+    "index": 0
+  },
+  {
+    "type": "message_delta",
+    "delta": {
+      "stop_reason": "end_turn",
+      "stop_sequence": null
+    },
+    "usage": {
+      "output_tokens": 9,
+      "output_tokens_details": {
+        "thinking_tokens": 4
+      }
+    }
+  },
+  {
+    "type": "message_stop"
+  }
+]

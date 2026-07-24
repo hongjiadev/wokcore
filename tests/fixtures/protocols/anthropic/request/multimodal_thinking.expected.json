@@ -1,0 +1,64 @@
+{
+  "model": "claude-test",
+  "max_tokens": 2048,
+  "system": [
+    {
+      "type": "text",
+      "text": "System block.",
+      "cache_control": {
+        "type": "ephemeral"
+      }
+    }
+  ],
+  "messages": [
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "thinking",
+          "thinking": "Prior summary.",
+          "signature": "fixture-signature"
+        },
+        {
+          "type": "redacted_thinking",
+          "data": "fixture-redacted-data"
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "image",
+          "source": {
+            "type": "base64",
+            "media_type": "image/png",
+            "data": "iVBORw0KGgo="
+          }
+        },
+        {
+          "type": "document",
+          "source": {
+            "type": "base64",
+            "media_type": "application/pdf",
+            "data": "JVBERi0xLjQ="
+          },
+          "title": "Fixture PDF",
+          "context": "Synthetic."
+        },
+        {
+          "type": "text",
+          "text": "Inspect both."
+        }
+      ]
+    }
+  ],
+  "thinking": {
+    "type": "enabled",
+    "budget_tokens": 1024
+  },
+  "stream": false,
+  "trace_hint": {
+    "safe": true
+  }
+}

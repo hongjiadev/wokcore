@@ -1,0 +1,5 @@
+{
+  "model": "gpt-test",
+  "input": "你好，world",
+  "stream": false
+}

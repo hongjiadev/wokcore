@@ -1,0 +1,7 @@
+﻿: heartbeat
+
+event: response.output_text.delta
+data: {"delta":
+data: "你好"}
+
+: end heartbeat
