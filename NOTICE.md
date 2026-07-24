@@ -14,7 +14,9 @@ The initial WokCore domain types were migrated from WokRouter commit `226a40e08a
 
 The initial WokCore protocol substrate and fixtures were migrated from WokRouter commit `226a40e08ad6c783e996ceed77b8e6dfe2640fb4`. Package renames and the exact source mapping are recorded in `MIGRATION.md`.
 
-The migrated WokRouter domain types, protocol source, and fixture files retain the source MIT notice:
+The initial WokCore configuration storage was migrated from WokRouter commit `226a40e08ad6c783e996ceed77b8e6dfe2640fb4`. Its exact source-path and blob mapping, package rename, removed UI/LAN fields, validation adaptation, and retained atomic-write behavior are recorded in `MIGRATION.md`.
+
+The migrated WokRouter domain types, protocol source, fixture files, and configuration storage retain the source MIT notice:
 
 Copyright (c) 2026 WokRouter contributors
 

@@ -52,3 +52,26 @@ The private pre-rewrite recovery bundle is stored in WokDocs, not this public re
 - Every SSE `push` bounds the number of decoded frames before extending its return vector; Azure and Gemini derive that per-push limit from the configured event limit.
 - Azure and Gemini non-stream decoders aggregate `max_events` across decode and finish output.
 - `NOTICE.md` retains `Copyright (c) 2026 WokRouter contributors` for the migrated domain types, protocol source, and fixtures, and explains the source MIT notice alongside WokCore's `MIT OR Apache-2.0` dual-license terms.
+
+## Runtime import 3: configuration storage
+
+- Source repository: `https://github.com/hongjiadev/wokrouter`
+- Source commit: `226a40e08ad6c783e996ceed77b8e6dfe2640fb4`
+- Imported paths:
+  - `crates/wokrouter-storage/src/config/mod.rs` (blob `3af86aa15f068886e81d6a1d4852b6db81140309`) → `crates/wokcore-storage/src/config/mod.rs`
+  - `crates/wokrouter-storage/src/config/model.rs` (blob `cb37c701eda4816b19d6b81556b41f3b87a57956`) → `crates/wokcore-storage/src/config/model.rs`
+  - `crates/wokrouter-storage/src/config/store.rs` (blob `8dcc6f163940b9bc380901aabb5f202ba9eedac8`) → `crates/wokcore-storage/src/config/store.rs`
+  - configuration portions of `crates/wokrouter-storage/src/lib.rs` (blob `9617147ff895b56284ed9ec210624ef1044b7fe3`) → `crates/wokcore-storage/src/lib.rs`
+  - `crates/wokrouter-storage/tests/config_store.rs` (blob `33be6f371b22d8f3b68e9807ba36eec83bef272e`) → `crates/wokcore-storage/tests/config_store.rs` and the private replacement-cleanup test in `crates/wokcore-storage/src/config/store.rs`
+- Renames:
+  - Cargo package `wokrouter-storage` → internal, unpublished `wokcore-storage`
+  - Rust crate path `wokrouter_storage` → `wokcore_storage`
+- Deliberate adaptation:
+  - configuration is reduced to `server.port`, defaults to `10101`, and rejects port `0`;
+  - WokRouter host, private-LAN, UI locale, and UI timezone fields are removed rather than renamed;
+  - candidates are validated before the lock file is opened, so invalid commits create no artifacts;
+  - read-only absent loads, revision conflicts, same-directory temporary files, file synchronization, Windows `ReplaceFileW`, and Unix parent-directory synchronization are retained.
+- License: migrated configuration source and tests remain available under `MIT OR Apache-2.0`; the direct WokRouter source MIT notice remains retained in `NOTICE.md` and `LICENSE-MIT`.
+- Verification:
+  - `cargo +1.97.1 clippy -p wokcore-storage --all-targets --all-features -- -D warnings`
+  - `cargo +1.97.1 test -p wokcore-storage --all-features`
