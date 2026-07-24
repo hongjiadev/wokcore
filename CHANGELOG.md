@@ -12,6 +12,7 @@ All notable WokCore changes are documented in this file.
 
 ### Fixed
 
+- Configuration loading now rejects every field outside top-level `revision`/`server` and nested `server.port`, while preserving invalid source files.
 - Protocol channels, SSE frame aggregation, and Azure/Gemini event aggregation now fail closed at configured memory and event bounds.
 - OpenAI Responses streaming and non-stream aggregation now bound retained output, identifiers, output items, and serialized context and usage values.
 - Corrected the migrated WokRouter source MIT notice scope to cover domain types, protocol source, and fixtures while retaining the OpenCodex attribution.

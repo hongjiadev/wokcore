@@ -10,7 +10,7 @@ use tempfile::NamedTempFile;
 
 use crate::{StorageError, VersionedConfig};
 
-use super::AppConfig;
+use super::{AppConfig, model::PersistedConfig};
 
 #[cfg(unix)]
 use std::fs::File;
@@ -37,10 +37,16 @@ impl ConfigStore {
             Err(source) => return Err(StorageError::Io { source }),
         };
 
-        let loaded: VersionedConfig =
+        let persisted: PersistedConfig =
             toml_edit::de::from_str(&document).map_err(|error| StorageError::InvalidConfig {
                 message: error.to_string(),
             })?;
+        let loaded = VersionedConfig {
+            revision: persisted.revision,
+            config: AppConfig {
+                server: persisted.server,
+            },
+        };
         validate(&loaded.config)?;
         Ok(loaded)
     }
@@ -92,7 +98,11 @@ impl ConfigStore {
             })?,
             config: candidate.clone(),
         };
-        let document = toml_edit::ser::to_string_pretty(&committed).map_err(|error| {
+        let persisted = PersistedConfig {
+            revision: committed.revision,
+            server: committed.config.server.clone(),
+        };
+        let document = toml_edit::ser::to_string_pretty(&persisted).map_err(|error| {
             StorageError::SerializeConfig {
                 message: error.to_string(),
             }

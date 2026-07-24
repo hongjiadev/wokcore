@@ -62,7 +62,7 @@ The private pre-rewrite recovery bundle is stored in WokDocs, not this public re
   - `crates/wokrouter-storage/src/config/model.rs` (blob `cb37c701eda4816b19d6b81556b41f3b87a57956`) → `crates/wokcore-storage/src/config/model.rs`
   - `crates/wokrouter-storage/src/config/store.rs` (blob `8dcc6f163940b9bc380901aabb5f202ba9eedac8`) → `crates/wokcore-storage/src/config/store.rs`
   - configuration portions of `crates/wokrouter-storage/src/lib.rs` (blob `9617147ff895b56284ed9ec210624ef1044b7fe3`) → `crates/wokcore-storage/src/lib.rs`
-  - `crates/wokrouter-storage/tests/config_store.rs` (blob `33be6f371b22d8f3b68e9807ba36eec83bef272e`) → `crates/wokcore-storage/tests/config_store.rs` and the private replacement-cleanup test in `crates/wokcore-storage/src/config/store.rs`
+  - `crates/wokrouter-storage/tests/config_store.rs` (blob `33be6f371b22d8f3b68e9807ba36eec83bef272e`) → `crates/wokcore-storage/tests/config_store.rs`, including malformed-input and cross-process revision tests, and the private replacement-cleanup test in `crates/wokcore-storage/src/config/store.rs`
 - Renames:
   - Cargo package `wokrouter-storage` → internal, unpublished `wokcore-storage`
   - Rust crate path `wokrouter_storage` → `wokcore_storage`
@@ -75,3 +75,10 @@ The private pre-rewrite recovery bundle is stored in WokDocs, not this public re
 - Verification:
   - `cargo +1.97.1 clippy -p wokcore-storage --all-targets --all-features -- -D warnings`
   - `cargo +1.97.1 test -p wokcore-storage --all-features`
+
+## Runtime import 3 review hardening
+
+- The persisted configuration uses a private exact wire model rather than combining Serde flattening with unknown-field rejection.
+- Unknown top-level keys and unknown `server` keys now fail as invalid configuration without mutating the source file.
+- Cross-process tests restore the source implementation's two-process revision race and verify one success, one conflict, and final revision `1`.
+- Malformed TOML tests additionally preserve source bytes and modification time and reject temporary-file residue.
