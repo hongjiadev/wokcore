@@ -545,6 +545,26 @@ fn stream_encoder_rejects_events_after_completion() {
 }
 
 #[test]
+fn stream_encoder_rejects_payload_beyond_the_default_retained_state_limit() {
+    let mut codec = ResponsesCodec::new(encode_context());
+    codec
+        .encode_event(&CanonicalEvent::Created {
+            response_id: "resp_1".to_owned(),
+        })
+        .unwrap();
+
+    assert_eq!(
+        codec
+            .encode_event(&CanonicalEvent::OutputTextDelta {
+                item_id: "msg_1".to_owned(),
+                delta: "x".repeat(16 * 1024 * 1024 + 1),
+            })
+            .unwrap_err(),
+        GatewayError::invalid_request()
+    );
+}
+
+#[test]
 fn usage_is_cached_without_a_wire_event_and_is_required_for_completion() {
     let mut codec = ResponsesCodec::new(encode_context());
     codec

@@ -12,7 +12,8 @@ All notable WokCore changes are documented in this file.
 ### Fixed
 
 - Protocol channels, SSE frame aggregation, and Azure/Gemini event aggregation now fail closed at configured memory and event bounds.
-- Restored the migrated WokRouter source MIT notice and documented its relationship to WokCore's dual-license terms.
+- OpenAI Responses streaming and non-stream aggregation now bound retained output, identifiers, output items, and serialized context and usage values.
+- Corrected the migrated WokRouter source MIT notice scope to cover domain types, protocol source, and fixtures while retaining the OpenCodex attribution.
 
 ## [0.1.0] - 2026-07-24
 

@@ -37,12 +37,39 @@ pub struct ResponsesResponseTemplate {
     pub user: Option<String>,
 }
 
+const MAX_RESPONSES_AGGREGATE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_RESPONSES_OUTPUT_ITEMS: usize = 4_096;
+const MAX_RESPONSES_IDENTIFIER_BYTES: usize = 512;
+const MAX_RESPONSES_RETAINED_VALUE_BYTES: usize = 1024 * 1024;
+
+#[derive(Clone, Copy)]
+struct ResponsesLimits {
+    max_output_items: usize,
+    max_identifier_bytes: usize,
+    max_aggregate_bytes: usize,
+    max_value_bytes: usize,
+}
+
+impl Default for ResponsesLimits {
+    fn default() -> Self {
+        Self {
+            max_output_items: MAX_RESPONSES_OUTPUT_ITEMS,
+            max_identifier_bytes: MAX_RESPONSES_IDENTIFIER_BYTES,
+            max_aggregate_bytes: MAX_RESPONSES_AGGREGATE_BYTES,
+            max_value_bytes: MAX_RESPONSES_RETAINED_VALUE_BYTES,
+        }
+    }
+}
+
 pub struct ResponsesCodec {
     context: ResponsesEncodeContext,
+    limits: ResponsesLimits,
+    context_validated: bool,
     terminal: bool,
     sequence_number: u64,
     response_id: Option<String>,
     output: Vec<ResponsesOutput>,
+    aggregate_bytes: usize,
     usage: Option<Value>,
 }
 
@@ -76,12 +103,19 @@ type WireEvent = (&'static str, Value);
 
 impl ResponsesCodec {
     pub fn new(context: ResponsesEncodeContext) -> Self {
+        Self::with_limits(context, ResponsesLimits::default())
+    }
+
+    fn with_limits(context: ResponsesEncodeContext, limits: ResponsesLimits) -> Self {
         Self {
             context,
+            limits,
+            context_validated: false,
             terminal: false,
             sequence_number: 1,
             response_id: None,
             output: Vec::new(),
+            aggregate_bytes: 0,
             usage: None,
         }
     }
@@ -90,7 +124,15 @@ impl ResponsesCodec {
         context: ResponsesEncodeContext,
         events: &[CanonicalEvent],
     ) -> Result<Value, GatewayError> {
-        let mut codec = Self::new(context);
+        Self::encode_response_with_limits(context, events, ResponsesLimits::default())
+    }
+
+    fn encode_response_with_limits(
+        context: ResponsesEncodeContext,
+        events: &[CanonicalEvent],
+        limits: ResponsesLimits,
+    ) -> Result<Value, GatewayError> {
+        let mut codec = Self::with_limits(context, limits);
         let mut response = None;
 
         for event in events {
@@ -137,6 +179,7 @@ impl ResponsesCodec {
         if self.terminal {
             return Err(GatewayError::invalid_request());
         }
+        self.validate_context_once()?;
 
         match event {
             CanonicalEvent::Created { response_id } => self.encode_created(response_id),
@@ -159,9 +202,10 @@ impl ResponsesCodec {
     }
 
     fn encode_created(&mut self, response_id: &str) -> Result<Vec<WireEvent>, GatewayError> {
-        if self.response_id.is_some() || response_id.is_empty() {
+        if self.response_id.is_some() {
             return Err(GatewayError::invalid_request());
         }
+        self.limits.validate_identifier(response_id)?;
         self.response_id = Some(response_id.to_owned());
         let response = self.response_value("in_progress", Vec::new(), Value::Null);
         Ok(vec![self.wire(
@@ -351,7 +395,7 @@ impl ResponsesCodec {
         if self.usage.is_some() {
             return Err(GatewayError::invalid_request());
         }
-        self.usage = Some(usage_value(usage));
+        self.usage = Some(self.limits.validate_usage(usage)?);
         Ok(Vec::new())
     }
 
@@ -525,24 +569,45 @@ impl ResponsesCodec {
         }
     }
 
+    fn validate_context_once(&mut self) -> Result<(), GatewayError> {
+        if !self.context_validated {
+            self.limits.validate_context(&self.context)?;
+            self.context_validated = true;
+        }
+        Ok(())
+    }
+
+    fn checked_aggregate_bytes(&self, additional: usize) -> Result<usize, GatewayError> {
+        self.aggregate_bytes
+            .checked_add(additional)
+            .filter(|total| *total <= self.limits.max_aggregate_bytes)
+            .ok_or_else(GatewayError::invalid_request)
+    }
+
     fn append_text(&mut self, item_id: &str, delta: &str) -> Result<(usize, bool), GatewayError> {
-        if item_id.is_empty() {
+        self.limits.validate_identifier(item_id)?;
+        if let Some(output_index) = self.find_output(item_id) {
+            if !matches!(self.output[output_index], ResponsesOutput::Text { .. }) {
+                return Err(GatewayError::invalid_request());
+            }
+            let aggregate_bytes = self.checked_aggregate_bytes(delta.len())?;
+            let ResponsesOutput::Text { text, .. } = &mut self.output[output_index] else {
+                unreachable!("the output kind was checked before mutation");
+            };
+            text.push_str(delta);
+            self.aggregate_bytes = aggregate_bytes;
+            return Ok((output_index, false));
+        }
+        if self.output.len() >= self.limits.max_output_items {
             return Err(GatewayError::invalid_request());
         }
-        if let Some(output_index) = self.find_output(item_id) {
-            match &mut self.output[output_index] {
-                ResponsesOutput::Text { text, .. } => {
-                    text.push_str(delta);
-                    return Ok((output_index, false));
-                }
-                _ => return Err(GatewayError::invalid_request()),
-            }
-        }
+        let aggregate_bytes = self.checked_aggregate_bytes(delta.len())?;
         let output_index = self.output.len();
         self.output.push(ResponsesOutput::Text {
             item_id: item_id.to_owned(),
             text: delta.to_owned(),
         });
+        self.aggregate_bytes = aggregate_bytes;
         Ok((output_index, true))
     }
 
@@ -551,23 +616,29 @@ impl ResponsesCodec {
         item_id: &str,
         delta: &str,
     ) -> Result<(usize, bool), GatewayError> {
-        if item_id.is_empty() {
+        self.limits.validate_identifier(item_id)?;
+        if let Some(output_index) = self.find_output(item_id) {
+            if !matches!(self.output[output_index], ResponsesOutput::Reasoning { .. }) {
+                return Err(GatewayError::invalid_request());
+            }
+            let aggregate_bytes = self.checked_aggregate_bytes(delta.len())?;
+            let ResponsesOutput::Reasoning { text, .. } = &mut self.output[output_index] else {
+                unreachable!("the output kind was checked before mutation");
+            };
+            text.push_str(delta);
+            self.aggregate_bytes = aggregate_bytes;
+            return Ok((output_index, false));
+        }
+        if self.output.len() >= self.limits.max_output_items {
             return Err(GatewayError::invalid_request());
         }
-        if let Some(output_index) = self.find_output(item_id) {
-            match &mut self.output[output_index] {
-                ResponsesOutput::Reasoning { text, .. } => {
-                    text.push_str(delta);
-                    return Ok((output_index, false));
-                }
-                _ => return Err(GatewayError::invalid_request()),
-            }
-        }
+        let aggregate_bytes = self.checked_aggregate_bytes(delta.len())?;
         let output_index = self.output.len();
         self.output.push(ResponsesOutput::Reasoning {
             item_id: item_id.to_owned(),
             text: delta.to_owned(),
         });
+        self.aggregate_bytes = aggregate_bytes;
         Ok((output_index, true))
     }
 
@@ -578,28 +649,34 @@ impl ResponsesCodec {
         name: &str,
         delta: &str,
     ) -> Result<(usize, bool), GatewayError> {
-        if item_id.is_empty() || call_id.is_empty() || name.is_empty() {
-            return Err(GatewayError::invalid_request());
-        }
+        self.limits.validate_identifier(item_id)?;
+        self.limits.validate_identifier(call_id)?;
+        self.limits.validate_identifier(name)?;
         if let Some(output_index) = self.find_output(item_id) {
-            match &mut self.output[output_index] {
+            match &self.output[output_index] {
                 ResponsesOutput::Tool {
                     call_id: existing_call_id,
                     name: existing_name,
-                    arguments,
                     ..
-                } if existing_call_id == call_id && existing_name == name => {
-                    arguments.push_str(delta);
-                    return Ok((output_index, false));
-                }
+                } if existing_call_id == call_id && existing_name == name => {}
                 _ => return Err(GatewayError::invalid_request()),
             }
+            let aggregate_bytes = self.checked_aggregate_bytes(delta.len())?;
+            let ResponsesOutput::Tool { arguments, .. } = &mut self.output[output_index] else {
+                unreachable!("the output kind was checked before mutation");
+            };
+            arguments.push_str(delta);
+            self.aggregate_bytes = aggregate_bytes;
+            return Ok((output_index, false));
         }
-        if self.output.iter().any(
-            |output| matches!(output, ResponsesOutput::Tool { call_id: existing, .. } if existing == call_id),
-        ) {
+        if self.output.len() >= self.limits.max_output_items
+            || self.output.iter().any(
+                |output| matches!(output, ResponsesOutput::Tool { call_id: existing, .. } if existing == call_id),
+            )
+        {
             return Err(GatewayError::invalid_request());
         }
+        let aggregate_bytes = self.checked_aggregate_bytes(delta.len())?;
         let output_index = self.output.len();
         self.output.push(ResponsesOutput::Tool {
             item_id: item_id.to_owned(),
@@ -607,6 +684,7 @@ impl ResponsesCodec {
             name: name.to_owned(),
             arguments: delta.to_owned(),
         });
+        self.aggregate_bytes = aggregate_bytes;
         Ok((output_index, true))
     }
 
@@ -666,6 +744,61 @@ impl ResponsesCodec {
                     .chain([("sequence_number", json!(sequence_number))]),
             ),
         )
+    }
+}
+
+impl ResponsesLimits {
+    fn validate_identifier(self, value: &str) -> Result<(), GatewayError> {
+        if value.is_empty() || value.len() > self.max_identifier_bytes {
+            Err(GatewayError::invalid_request())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn validate_context(self, context: &ResponsesEncodeContext) -> Result<(), GatewayError> {
+        self.validate_identifier(context.model.as_str())?;
+        if let Some(previous_response_id) = &context.response.previous_response_id {
+            self.validate_identifier(previous_response_id)?;
+        }
+        self.validate_string_map(&context.response.metadata)?;
+        if context.response.tools.len() > self.max_output_items {
+            return Err(GatewayError::invalid_request());
+        }
+        self.validate_serialized(&context.response.error)?;
+        self.validate_serialized(&context.response.incomplete_details)?;
+        self.validate_serialized(&context.response.instructions)?;
+        self.validate_serialized(&context.response.reasoning)?;
+        self.validate_serialized(&context.response.text)?;
+        self.validate_serialized(&context.response.tool_choice)?;
+        self.validate_serialized(&context.response.tools)?;
+        self.validate_serialized(&context.response.truncation)?;
+        self.validate_serialized(&context.response.user)
+    }
+
+    fn validate_usage(self, usage: &Usage) -> Result<Value, GatewayError> {
+        self.validate_string_map(&usage.extensions)?;
+        let value = usage_value(usage);
+        self.validate_serialized(&value)?;
+        Ok(value)
+    }
+
+    fn validate_string_map(self, values: &BTreeMap<String, Value>) -> Result<(), GatewayError> {
+        if values.len() > self.max_output_items {
+            return Err(GatewayError::invalid_request());
+        }
+        for key in values.keys() {
+            self.validate_identifier(key)?;
+        }
+        self.validate_serialized(values)
+    }
+
+    fn validate_serialized<T: Serialize>(self, value: &T) -> Result<(), GatewayError> {
+        if serde_json::to_vec(value).is_ok_and(|encoded| encoded.len() <= self.max_value_bytes) {
+            Ok(())
+        } else {
+            Err(GatewayError::invalid_request())
+        }
     }
 }
 
@@ -754,4 +887,323 @@ fn usage_value(usage: &Usage) -> Value {
             .or_insert_with(|| extension.clone());
     }
     Value::Object(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tiny_limits() -> ResponsesLimits {
+        ResponsesLimits {
+            max_output_items: 2,
+            max_identifier_bytes: 8,
+            max_aggregate_bytes: 8,
+            max_value_bytes: 1_024,
+        }
+    }
+
+    fn context() -> ResponsesEncodeContext {
+        ResponsesEncodeContext {
+            model: PublicModelId::new("model"),
+            created_at: 1,
+            response: ResponsesResponseTemplate {
+                completed_at: Some(2),
+                error: None,
+                incomplete_details: None,
+                instructions: None,
+                max_output_tokens: None,
+                metadata: BTreeMap::new(),
+                parallel_tool_calls: false,
+                previous_response_id: None,
+                reasoning: Value::Null,
+                store: false,
+                temperature: None,
+                text: Value::Null,
+                tool_choice: Value::Null,
+                tools: Vec::new(),
+                top_p: None,
+                truncation: Value::Null,
+                user: None,
+            },
+        }
+    }
+
+    fn created() -> CanonicalEvent {
+        CanonicalEvent::Created {
+            response_id: "resp".to_owned(),
+        }
+    }
+
+    fn usage() -> CanonicalEvent {
+        CanonicalEvent::Usage(Usage {
+            input_tokens: 1,
+            output_tokens: 1,
+            cached_input_tokens: None,
+            reasoning_tokens: None,
+            extensions: BTreeMap::new(),
+        })
+    }
+
+    fn assert_aggregate_rejected_atomically(first: CanonicalEvent, second: CanonicalEvent) {
+        let mut codec = ResponsesCodec::with_limits(context(), tiny_limits());
+        codec.encode_event(&created()).unwrap();
+        codec.encode_event(&first).unwrap();
+
+        assert_eq!(
+            codec.encode_event(&second).unwrap_err(),
+            GatewayError::invalid_request()
+        );
+        assert_eq!(codec.aggregate_bytes, 5);
+        assert_eq!(codec.output.len(), 1);
+        let retained = match &codec.output[0] {
+            ResponsesOutput::Text { text, .. } | ResponsesOutput::Reasoning { text, .. } => text,
+            ResponsesOutput::Tool { arguments, .. } => arguments,
+        };
+        assert_eq!(retained, "12345");
+    }
+
+    #[test]
+    fn private_limits_bound_stream_deltas_atomically() {
+        assert_aggregate_rejected_atomically(
+            CanonicalEvent::OutputTextDelta {
+                item_id: "text".to_owned(),
+                delta: "12345".to_owned(),
+            },
+            CanonicalEvent::OutputTextDelta {
+                item_id: "text".to_owned(),
+                delta: "6789".to_owned(),
+            },
+        );
+        assert_aggregate_rejected_atomically(
+            CanonicalEvent::ReasoningDelta {
+                item_id: "reason".to_owned(),
+                delta: "12345".to_owned(),
+            },
+            CanonicalEvent::ReasoningDelta {
+                item_id: "reason".to_owned(),
+                delta: "6789".to_owned(),
+            },
+        );
+        assert_aggregate_rejected_atomically(
+            CanonicalEvent::ToolCallDelta {
+                item_id: "tool".to_owned(),
+                call_id: "call".to_owned(),
+                name: "run".to_owned(),
+                delta: "12345".to_owned(),
+            },
+            CanonicalEvent::ToolCallDelta {
+                item_id: "tool".to_owned(),
+                call_id: "call".to_owned(),
+                name: "run".to_owned(),
+                delta: "6789".to_owned(),
+            },
+        );
+    }
+
+    #[test]
+    fn private_limits_bound_stream_items_and_identifiers_atomically() {
+        let mut response_id = ResponsesCodec::with_limits(context(), tiny_limits());
+        assert_eq!(
+            response_id
+                .encode_event(&CanonicalEvent::Created {
+                    response_id: "123456789".to_owned(),
+                })
+                .unwrap_err(),
+            GatewayError::invalid_request()
+        );
+        assert!(response_id.response_id.is_none());
+
+        for event in [
+            CanonicalEvent::OutputTextDelta {
+                item_id: "123456789".to_owned(),
+                delta: String::new(),
+            },
+            CanonicalEvent::ToolCallDelta {
+                item_id: "tool".to_owned(),
+                call_id: "123456789".to_owned(),
+                name: "run".to_owned(),
+                delta: String::new(),
+            },
+            CanonicalEvent::ToolCallDelta {
+                item_id: "tool".to_owned(),
+                call_id: "call".to_owned(),
+                name: "123456789".to_owned(),
+                delta: String::new(),
+            },
+        ] {
+            let mut codec = ResponsesCodec::with_limits(context(), tiny_limits());
+            codec.encode_event(&created()).unwrap();
+            assert_eq!(
+                codec.encode_event(&event).unwrap_err(),
+                GatewayError::invalid_request()
+            );
+            assert!(codec.output.is_empty());
+            assert_eq!(codec.aggregate_bytes, 0);
+        }
+
+        let mut oversized_new_item = ResponsesCodec::with_limits(context(), tiny_limits());
+        oversized_new_item.encode_event(&created()).unwrap();
+        assert_eq!(
+            oversized_new_item
+                .encode_event(&CanonicalEvent::OutputTextDelta {
+                    item_id: "text".to_owned(),
+                    delta: "123456789".to_owned(),
+                })
+                .unwrap_err(),
+            GatewayError::invalid_request()
+        );
+        assert!(oversized_new_item.output.is_empty());
+        assert_eq!(oversized_new_item.aggregate_bytes, 0);
+
+        let mut items = ResponsesCodec::with_limits(context(), tiny_limits());
+        items.encode_event(&created()).unwrap();
+        for item_id in ["one", "two"] {
+            items
+                .encode_event(&CanonicalEvent::OutputTextDelta {
+                    item_id: item_id.to_owned(),
+                    delta: String::new(),
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            items
+                .encode_event(&CanonicalEvent::OutputTextDelta {
+                    item_id: "three".to_owned(),
+                    delta: String::new(),
+                })
+                .unwrap_err(),
+            GatewayError::invalid_request()
+        );
+        assert_eq!(items.output.len(), 2);
+        assert_eq!(items.aggregate_bytes, 0);
+    }
+
+    #[test]
+    fn private_limits_bound_context_and_usage_values() {
+        for oversized in [
+            {
+                let mut value = context();
+                value.model = PublicModelId::new("123456789");
+                value
+            },
+            {
+                let mut value = context();
+                value.response.previous_response_id = Some("123456789".to_owned());
+                value
+            },
+            {
+                let mut value = context();
+                value
+                    .response
+                    .metadata
+                    .insert("123456789".to_owned(), Value::Null);
+                value
+            },
+            {
+                let mut value = context();
+                value.response.instructions = Some(json!("x".repeat(1_100)));
+                value
+            },
+        ] {
+            let mut codec = ResponsesCodec::with_limits(oversized, tiny_limits());
+            assert_eq!(
+                codec.encode_event(&created()).unwrap_err(),
+                GatewayError::invalid_request()
+            );
+            assert!(codec.response_id.is_none());
+        }
+
+        let mut usage_codec = ResponsesCodec::with_limits(context(), tiny_limits());
+        usage_codec.encode_event(&created()).unwrap();
+        assert_eq!(
+            usage_codec
+                .encode_event(&CanonicalEvent::Usage(Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cached_input_tokens: None,
+                    reasoning_tokens: None,
+                    extensions: BTreeMap::from([("large".to_owned(), json!("x".repeat(1_100)),)]),
+                }))
+                .unwrap_err(),
+            GatewayError::invalid_request()
+        );
+        assert!(usage_codec.usage.is_none());
+    }
+
+    #[test]
+    fn private_limits_bound_non_stream_aggregation_and_items() {
+        let aggregate_events = vec![
+            created(),
+            CanonicalEvent::OutputTextDelta {
+                item_id: "text".to_owned(),
+                delta: "12345".to_owned(),
+            },
+            CanonicalEvent::OutputTextDelta {
+                item_id: "text".to_owned(),
+                delta: "6789".to_owned(),
+            },
+            usage(),
+            CanonicalEvent::Completed,
+        ];
+        assert_eq!(
+            ResponsesCodec::encode_response_with_limits(
+                context(),
+                &aggregate_events,
+                tiny_limits(),
+            )
+            .unwrap_err(),
+            GatewayError::invalid_request()
+        );
+
+        let item_events = vec![
+            created(),
+            CanonicalEvent::OutputTextDelta {
+                item_id: "one".to_owned(),
+                delta: String::new(),
+            },
+            CanonicalEvent::ReasoningDelta {
+                item_id: "two".to_owned(),
+                delta: String::new(),
+            },
+            CanonicalEvent::ToolCallDelta {
+                item_id: "three".to_owned(),
+                call_id: "call".to_owned(),
+                name: "run".to_owned(),
+                delta: String::new(),
+            },
+            usage(),
+            CanonicalEvent::Completed,
+        ];
+        assert_eq!(
+            ResponsesCodec::encode_response_with_limits(context(), &item_events, tiny_limits())
+                .unwrap_err(),
+            GatewayError::invalid_request()
+        );
+    }
+
+    #[test]
+    fn private_limits_accept_exact_boundaries_and_preserve_completed_output() {
+        let events = [
+            CanonicalEvent::Created {
+                response_id: "12345678".to_owned(),
+            },
+            CanonicalEvent::OutputTextDelta {
+                item_id: "12345678".to_owned(),
+                delta: "1234".to_owned(),
+            },
+            CanonicalEvent::ToolCallDelta {
+                item_id: "tool".to_owned(),
+                call_id: "12345678".to_owned(),
+                name: "12345678".to_owned(),
+                delta: "5678".to_owned(),
+            },
+            usage(),
+            CanonicalEvent::Completed,
+        ];
+        let response =
+            ResponsesCodec::encode_response_with_limits(context(), &events, tiny_limits()).unwrap();
+
+        assert_eq!(response["output"][0]["content"][0]["text"], "1234");
+        assert_eq!(response["output"][1]["arguments"], "5678");
+    }
 }

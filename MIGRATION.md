@@ -21,7 +21,7 @@ The private pre-rewrite recovery bundle is stored in WokDocs, not this public re
   - `crates/wokrouter-core/src/secret.rs` → `crates/wokcore-core/src/secret.rs`
 - Deliberate adaptation:
   - `crates/wokcore-core/src/lib.rs` identifies `WokCore` and omits the WokRouter-only `control_protocol` field.
-- License: imported code remains available under `MIT OR Apache-2.0`; retained OpenCodex MIT attribution is listed in `NOTICE.md`.
+- License: imported code remains available under `MIT OR Apache-2.0`. The direct WokRouter source copyright and permission notice is retained in `NOTICE.md`, with its terms reproduced in `LICENSE-MIT`; the OpenCodex MIT attribution remains listed in `NOTICE.md`.
 - Verification:
   - `cargo +1.97.1 clippy -p wokcore-core --all-targets --all-features -- -D warnings`
   - `cargo +1.97.1 test -p wokcore-core --all-features`
@@ -51,4 +51,4 @@ The private pre-rewrite recovery bundle is stored in WokDocs, not this public re
 - Bounded channels reject capacities outside Tokio's supported semaphore range instead of panicking.
 - Every SSE `push` bounds the number of decoded frames before extending its return vector; Azure and Gemini derive that per-push limit from the configured event limit.
 - Azure and Gemini non-stream decoders aggregate `max_events` across decode and finish output.
-- `NOTICE.md` retains `Copyright (c) 2026 WokRouter contributors` and explains the source MIT notice alongside WokCore's `MIT OR Apache-2.0` dual-license terms.
+- `NOTICE.md` retains `Copyright (c) 2026 WokRouter contributors` for the migrated domain types, protocol source, and fixtures, and explains the source MIT notice alongside WokCore's `MIT OR Apache-2.0` dual-license terms.
