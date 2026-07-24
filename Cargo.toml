@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = ["apps/wokcore"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.97.1"
+repository = "https://github.com/hongjiadev/wokcore"
+
+[workspace.dependencies]
+clap = { version = "4.6.4", features = ["derive"] }

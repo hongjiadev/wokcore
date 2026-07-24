@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  quality:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: 1.97.1
+          components: clippy, rustfmt
+      - name: Self-test public repository hygiene checker
+        shell: pwsh
+        run: pwsh tests/scripts/check-public-repo-hygiene.tests.ps1
+      - name: Check public repository hygiene
+        shell: pwsh
+        run: pwsh tests/scripts/check-public-repo-hygiene.ps1
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Lint workspace
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Test workspace
+        run: cargo test --workspace --all-features --locked
+      - name: Check dependency policy
+        uses: EmbarkStudios/cargo-deny-action@v2.1.1
+        with:
+          rust-version: 1.97.1
+          command: check
+          arguments: --all-features
+
+  target-check:
+    name: target-check (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-15
+            target: x86_64-apple-darwin
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: 1.97.1
+          target: ${{ matrix.target }}
+      - name: Check target
+        run: cargo check --workspace --all-features --locked --target ${{ matrix.target }}
+
+  required-targets:
+    if: always()
+    needs: target-check
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require every target
+        env:
+          TARGET_RESULT: ${{ needs.target-check.result }}
+        run: test "$TARGET_RESULT" = "success"
