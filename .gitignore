@@ -1,4 +1,5 @@
 /target/
+/.worktrees/
 /.superpowers/
 /.subpowers/
 /docs/superpowers/
