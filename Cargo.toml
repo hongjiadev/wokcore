@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["apps/wokcore"]
+members = [
+  "apps/wokcore",
+  "crates/wokcore-core",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -11,3 +14,6 @@ repository = "https://github.com/hongjiadev/wokcore"
 
 [workspace.dependencies]
 clap = { version = "4.6.4", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive"] }
+thiserror = "2.0.19"
+uuid = { version = "1.24.0", features = ["serde", "v4"] }
