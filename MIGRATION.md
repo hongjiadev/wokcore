@@ -82,3 +82,33 @@ The private pre-rewrite recovery bundle is stored in WokDocs, not this public re
 - Unknown top-level keys and unknown `server` keys now fail as invalid configuration without mutating the source file.
 - Cross-process tests restore the source implementation's two-process revision race and verify one success, one conflict, and final revision `1`.
 - Malformed TOML tests additionally preserve source bytes and modification time and reject temporary-file residue.
+
+## Runtime import 4: secret storage
+
+- Source repository: `https://github.com/hongjiadev/wokrouter`
+- Source commit: `226a40e08ad6c783e996ceed77b8e6dfe2640fb4`
+- Imported paths:
+  - `crates/wokrouter-storage/src/secrets/mod.rs` (blob `d385a6e8f3ede1ad62f2b174424c9a2f070b001c`) → `crates/wokcore-storage/src/secrets/mod.rs`
+  - `crates/wokrouter-storage/src/secrets/store.rs` (blob `29c0d52c8c9df7d0c6f8a7ea015389cea5917af3`) → `crates/wokcore-storage/src/secrets/store.rs`
+  - `crates/wokrouter-storage/src/secrets/memory.rs` (blob `2018b6483bf74b42a8fbf5e1ed2e45b9787f64bf`) → `crates/wokcore-storage/src/secrets/memory.rs`
+  - `crates/wokrouter-storage/src/secrets/native.rs` (blob `2db05c07e26dcc2b8b8e0eed044819c977bcbb58`) → `crates/wokcore-storage/src/secrets/native.rs`
+  - `crates/wokrouter-storage/src/secrets/environment.rs` (blob `f9d0e54a366e1d9595ab42f839e9ef19bbc9ddc3`) → `crates/wokcore-storage/src/secrets/environment.rs`
+  - `crates/wokrouter-storage/src/secrets/permissioned_file.rs` (blob `cf6fa6015e08e62d65bbcf7a49156b38dcb51521`) → `crates/wokcore-storage/src/secrets/permissioned_file.rs`
+  - secret-storage portions of `crates/wokrouter-storage/src/lib.rs` (blob `9617147ff895b56284ed9ec210624ef1044b7fe3`) → `crates/wokcore-storage/src/lib.rs`
+  - offline secret contracts from `crates/wokrouter-storage/tests/secret_store.rs` (blob `4292f0ace6d0f6c83b6b6919944a28fafc029d94`) → `crates/wokcore-storage/tests/secret_store.rs`
+- Renames:
+  - Cargo package `wokrouter-storage` → internal, unpublished `wokcore-storage`
+  - Rust crate path `wokrouter_storage` → `wokcore_storage`
+  - native credential service identity `dev.wokrouter.credentials` → `dev.wokcore.credentials`
+- Deliberate adaptation:
+  - every native keyring operation constructs its entry inside `tokio::task::spawn_blocking`; secret material is moved into the blocking closure, and join/backend diagnostics map to non-diagnostic storage errors;
+  - environment and permissioned-file stores accept only their explicitly configured `SecretRef`, remain read-only, and never act as an automatic fallback for native storage;
+  - `MAX_HEADLESS_SECRET_BYTES` limits environment and file inputs to `64 KiB`; file reads check metadata on the opened handle and use `take(limit + 1)` before decoding;
+  - invalid environment/file encodings and oversized buffers are zeroized on rejection;
+  - Unix mode checks and Windows owner/DACL checks remain fail closed and operate on the opened file handle, preventing path-swap replacement;
+  - no writable plaintext secret store is included, and tests never invoke the real OS credential store.
+- License: migrated secret-storage source and tests remain available under `MIT OR Apache-2.0`; the direct WokRouter source MIT notice remains retained in `NOTICE.md` and `LICENSE-MIT`.
+- Verification:
+  - `cargo +1.97.1 clippy -p wokcore-storage --all-targets --all-features -- -D warnings`
+  - `cargo +1.97.1 test -p wokcore-storage --test secret_store`
+  - `cargo +1.97.1 test -p wokcore-storage --all-features`

@@ -9,6 +9,7 @@ All notable WokCore changes are documented in this file.
 - Internal `wokcore-core` domain types migrated from the recorded WokRouter source revision.
 - Internal canonical IR, bounded SSE primitives, Provider protocol codecs, and offline fixtures migrated from the recorded WokRouter source revision.
 - Internal `wokcore-storage` configuration storage with a loopback-only, non-zero port contract and revision-checked atomic commits.
+- Internal memory, native credential, environment, and permissioned-file secret stores with explicit read-only headless configuration and a 64 KiB input limit.
 
 ### Fixed
 

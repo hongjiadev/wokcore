@@ -1,8 +1,13 @@
-//! Durable configuration storage for WokCore.
+//! Durable configuration and secret storage for WokCore.
 
 pub mod config;
+pub mod secrets;
 
 pub use config::{AppConfig, ConfigStore, ServerConfig, VersionedConfig};
+pub use secrets::{
+    EnvironmentSecretStore, HeadlessSecretStoreConfig, MAX_HEADLESS_SECRET_BYTES,
+    MemorySecretStore, NativeSecretStore, PermissionedFileSecretStore, SecretStore,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
@@ -17,4 +22,18 @@ pub enum StorageError {
         #[source]
         source: std::io::Error,
     },
+    #[error("secret was not found")]
+    SecretNotFound,
+    #[error("the secret backend failed without exposing secret material")]
+    SecretBackendFailure,
+    #[error("the selected secret backend is read-only")]
+    ReadOnlySecretStore,
+    #[error("the explicit headless secret backend configuration does not match this store")]
+    InvalidHeadlessSecretStoreConfig,
+    #[error("the secret file grants access beyond the current user")]
+    InsecureSecretFilePermissions,
+    #[error("secret material is not valid UTF-8")]
+    InvalidSecretEncoding,
+    #[error("secret material exceeds the 64 KiB headless limit")]
+    SecretTooLarge,
 }
