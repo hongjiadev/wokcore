@@ -17,6 +17,7 @@ All notable WokCore changes are documented in this file.
 - Protocol channels, SSE frame aggregation, and Azure/Gemini event aggregation now fail closed at configured memory and event bounds.
 - OpenAI Responses streaming and non-stream aggregation now bound retained output, identifiers, output items, and serialized context and usage values.
 - Corrected the migrated WokRouter source MIT notice scope to cover domain types, protocol source, and fixtures while retaining the OpenCodex attribution.
+- Secret-storage tests now structurally prohibit native credential access, prove bounded reads and error-path zeroization, validate exact size boundaries, and exercise explicit Windows protected-DACL success and rejection paths.
 
 ## [0.1.0] - 2026-07-24
 

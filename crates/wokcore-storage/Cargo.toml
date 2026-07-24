@@ -21,3 +21,7 @@ toml_edit.workspace = true
 windows-sys.workspace = true
 zeroize.workspace = true
 wokcore-core = { path = "../wokcore-core" }
+
+[dev-dependencies]
+proc-macro2 = "1"
+syn = { version = "2", features = ["full", "visit"] }

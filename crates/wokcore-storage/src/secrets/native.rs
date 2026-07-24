@@ -115,6 +115,22 @@ mod tests {
     }
 
     #[test]
+    fn bad_data_format_bytes_and_diagnostic_map_to_a_generic_error() {
+        let bytes_canary = ["bad", "data", "secret"].join("-");
+        let diagnostic_canary = ["bad", "data", "diagnostic"].join("-");
+
+        let error = map_keyring_error(keyring::Error::BadDataFormat(
+            bytes_canary.clone().into_bytes(),
+            Box::new(BackendDiagnostic(diagnostic_canary.clone())),
+        ));
+
+        assert!(matches!(error, StorageError::SecretBackendFailure));
+        let rendered = format!("{error:?} {error}");
+        assert!(!rendered.contains(&bytes_canary));
+        assert!(!rendered.contains(&diagnostic_canary));
+    }
+
+    #[test]
     fn native_no_entry_retains_not_found_semantics_without_a_backend_message() {
         let error = map_keyring_error(keyring::Error::NoEntry);
 

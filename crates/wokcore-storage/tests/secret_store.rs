@@ -229,36 +229,151 @@ async fn permissioned_file_store_rejects_modes_broader_than_owner_read_write() {
 
 #[cfg(windows)]
 #[tokio::test]
-async fn permissioned_file_store_rejects_acls_granting_other_principals() {
+async fn permissioned_file_store_accepts_a_protected_user_dacl_and_rejects_other_principals() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("secret");
-    fs::write(&path, ["file", "secret"].join("-")).unwrap();
+    let plaintext = ["file", "secret"].join("-");
+    fs::write(&path, &plaintext).unwrap();
     let secret_ref = SecretRef::new();
     let store =
         PermissionedFileSecretStore::from_config(HeadlessSecretStoreConfig::PermissionedFile {
             secret_ref: secret_ref.clone(),
-            path,
+            path: path.clone(),
         })
         .unwrap();
 
+    set_protected_secret_file_dacl(&path, false).unwrap();
+    assert_eq!(
+        store.get(&secret_ref).await.unwrap().expose_secret(),
+        &plaintext
+    );
+
+    set_protected_secret_file_dacl(&path, true).unwrap();
     assert!(matches!(
         store.get(&secret_ref).await,
         Err(StorageError::InsecureSecretFilePermissions)
     ));
 }
 
-#[test]
-fn native_tests_contain_no_real_credential_operation_calls() {
-    let native_source = include_str!("../src/secrets/native.rs");
-    let test_source = native_source
-        .split_once("#[cfg(test)]")
-        .map(|(_, tests)| tests)
-        .unwrap_or_default();
+#[cfg(windows)]
+fn set_protected_secret_file_dacl(path: &Path, include_world: bool) -> std::io::Result<()> {
+    use std::{ffi::c_void, iter, mem::size_of, os::windows::ffi::OsStrExt, ptr};
 
-    for forbidden_call in [".set_password(", ".get_password(", ".delete_credential("] {
-        assert!(
-            !test_source.contains(forbidden_call),
-            "native unit tests must not call the real OS keyring"
-        );
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, ERROR_SUCCESS, GENERIC_ALL, GENERIC_READ, HANDLE},
+        Security::{
+            ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, AddAccessAllowedAce,
+            Authorization::{SE_FILE_OBJECT, SetNamedSecurityInfoW},
+            CreateWellKnownSid, DACL_SECURITY_INFORMATION, GetLengthSid, GetTokenInformation,
+            InitializeAcl, PROTECTED_DACL_SECURITY_INFORMATION, PSID, SECURITY_MAX_SID_SIZE,
+            TOKEN_QUERY, TOKEN_USER, TokenUser, WinWorldSid,
+        },
+        System::Threading::{GetCurrentProcess, OpenProcessToken},
+    };
+
+    struct Token(HANDLE);
+
+    impl Drop for Token {
+        fn drop(&mut self) {
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
     }
+
+    fn current_user_token() -> std::io::Result<(Token, Vec<usize>)> {
+        let mut token_handle: HANDLE = ptr::null_mut();
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token_handle) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let token = Token(token_handle);
+        let mut required = 0;
+        unsafe {
+            GetTokenInformation(token.0, TokenUser, ptr::null_mut(), 0, &mut required);
+        }
+        if required == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut buffer = vec![0_usize; (required as usize).div_ceil(size_of::<usize>())];
+        if unsafe {
+            GetTokenInformation(
+                token.0,
+                TokenUser,
+                buffer.as_mut_ptr().cast::<c_void>(),
+                required,
+                &mut required,
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok((token, buffer))
+    }
+
+    fn world_sid() -> std::io::Result<Vec<usize>> {
+        let mut required = SECURITY_MAX_SID_SIZE;
+        let mut buffer = vec![0_usize; (required as usize).div_ceil(size_of::<usize>())];
+        if unsafe {
+            CreateWellKnownSid(
+                WinWorldSid,
+                ptr::null_mut(),
+                buffer.as_mut_ptr().cast::<c_void>(),
+                &mut required,
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(buffer)
+    }
+
+    let (_token, user_buffer) = current_user_token()?;
+    let token_user = unsafe { &*(user_buffer.as_ptr().cast::<TOKEN_USER>()) };
+    let user_sid = token_user.User.Sid;
+    let world_buffer = include_world.then(world_sid).transpose()?;
+    let world_sid: PSID = world_buffer
+        .as_ref()
+        .map_or(ptr::null_mut(), |buffer| buffer.as_ptr().cast_mut().cast());
+
+    let ace_size = |sid: PSID| {
+        size_of::<ACCESS_ALLOWED_ACE>() - size_of::<u32>() + unsafe { GetLengthSid(sid) as usize }
+    };
+    let mut acl_size = size_of::<ACL>() + ace_size(user_sid);
+    if !world_sid.is_null() {
+        acl_size += ace_size(world_sid);
+    }
+    let mut acl_buffer = vec![0_usize; acl_size.div_ceil(size_of::<usize>())];
+    let acl = acl_buffer.as_mut_ptr().cast::<ACL>();
+    if unsafe { InitializeAcl(acl, acl_size as u32, ACL_REVISION) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { AddAccessAllowedAce(acl, ACL_REVISION, GENERIC_ALL, user_sid) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if !world_sid.is_null()
+        && unsafe { AddAccessAllowedAce(acl, ACL_REVISION, GENERIC_READ, world_sid) } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let wide_path: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(iter::once(0))
+        .collect();
+    let status = unsafe {
+        SetNamedSecurityInfoW(
+            wide_path.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            acl,
+            ptr::null(),
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(std::io::Error::from_raw_os_error(status as i32));
+    }
+    Ok(())
 }

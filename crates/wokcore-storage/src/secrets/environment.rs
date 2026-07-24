@@ -77,15 +77,20 @@ fn secret_from_os_string(value: OsString) -> Result<SecretString, StorageError> 
 mod tests {
     use std::ffi::OsString;
 
+    use secrecy::ExposeSecret;
+
     use super::secret_from_os_string;
     use crate::{MAX_HEADLESS_SECRET_BYTES, StorageError};
 
     #[test]
-    fn oversized_environment_value_is_rejected_by_the_named_limit() {
-        let value = OsString::from("x".repeat(MAX_HEADLESS_SECRET_BYTES + 1));
+    fn environment_value_accepts_the_exact_limit_and_rejects_one_more_byte() {
+        let accepted =
+            secret_from_os_string(OsString::from("x".repeat(MAX_HEADLESS_SECRET_BYTES))).unwrap();
+        let rejected = OsString::from("x".repeat(MAX_HEADLESS_SECRET_BYTES + 1));
 
+        assert_eq!(accepted.expose_secret().len(), MAX_HEADLESS_SECRET_BYTES);
         assert!(matches!(
-            secret_from_os_string(value),
+            secret_from_os_string(rejected),
             Err(StorageError::SecretTooLarge)
         ));
     }

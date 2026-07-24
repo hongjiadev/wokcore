@@ -59,9 +59,12 @@ fn read_file_contents(file: &mut File) -> Result<String, StorageError> {
     if metadata.len() > MAX_HEADLESS_SECRET_BYTES as u64 {
         return Err(StorageError::SecretTooLarge);
     }
+    read_bounded_secret(file, metadata.len() as usize)
+}
 
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    let mut bounded = file.take((MAX_HEADLESS_SECRET_BYTES + 1) as u64);
+fn read_bounded_secret(reader: impl Read, capacity_hint: usize) -> Result<String, StorageError> {
+    let mut bytes = Vec::with_capacity(capacity_hint.min(MAX_HEADLESS_SECRET_BYTES));
+    let mut bounded = reader.take((MAX_HEADLESS_SECRET_BYTES + 1) as u64);
     if let Err(source) = bounded.read_to_end(&mut bytes) {
         bytes.zeroize();
         return Err(StorageError::Io { source });
@@ -82,6 +85,46 @@ fn read_file_contents(file: &mut File) -> Result<String, StorageError> {
 
 fn zeroize_invalid_secret_bytes(bytes: &mut [u8]) {
     bytes.zeroize();
+    #[cfg(test)]
+    INVALID_UTF8_ZEROIZE_OBSERVER.with(|observer| {
+        if let Some(observer) = observer.borrow().as_ref() {
+            observer(bytes);
+        }
+    });
+}
+
+#[cfg(test)]
+type InvalidUtf8ZeroizeObserver = Box<dyn Fn(&[u8])>;
+
+#[cfg(test)]
+thread_local! {
+    static INVALID_UTF8_ZEROIZE_OBSERVER:
+        std::cell::RefCell<Option<InvalidUtf8ZeroizeObserver>> =
+            const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn with_invalid_utf8_zeroize_observer<T>(
+    observer: impl Fn(&[u8]) + 'static,
+    operation: impl FnOnce() -> T,
+) -> T {
+    INVALID_UTF8_ZEROIZE_OBSERVER.with(|slot| {
+        assert!(slot.borrow().is_none());
+        *slot.borrow_mut() = Some(Box::new(observer));
+    });
+
+    struct ResetObserver;
+
+    impl Drop for ResetObserver {
+        fn drop(&mut self) {
+            INVALID_UTF8_ZEROIZE_OBSERVER.with(|slot| {
+                slot.borrow_mut().take();
+            });
+        }
+    }
+
+    let _reset = ResetObserver;
+    operation()
 }
 
 #[cfg(unix)]
@@ -288,13 +331,46 @@ fn verify_permissions(_file: &File) -> Result<(), StorageError> {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, fs::File};
+    use std::{
+        cell::Cell,
+        fs,
+        fs::File,
+        io::{Cursor, Seek},
+        rc::Rc,
+    };
 
-    use super::{read_file_contents, zeroize_invalid_secret_bytes};
+    use super::{read_bounded_secret, read_file_contents, with_invalid_utf8_zeroize_observer};
     use crate::{MAX_HEADLESS_SECRET_BYTES, StorageError};
 
     #[test]
-    fn oversized_file_is_rejected_by_metadata_and_bounded_reading() {
+    fn bounded_reader_accepts_the_exact_limit_and_rejects_one_more_byte() {
+        let mut accepted = Cursor::new(vec![b'x'; MAX_HEADLESS_SECRET_BYTES]);
+        let value = read_bounded_secret(&mut accepted, 0).unwrap();
+        let mut rejected = Cursor::new(vec![b'x'; MAX_HEADLESS_SECRET_BYTES + 1]);
+
+        assert_eq!(value.len(), MAX_HEADLESS_SECRET_BYTES);
+        assert!(matches!(
+            read_bounded_secret(&mut rejected, 0),
+            Err(StorageError::SecretTooLarge)
+        ));
+    }
+
+    #[test]
+    fn bounded_reader_stops_after_limit_plus_one_byte() {
+        let mut reader = Cursor::new(vec![b'x'; MAX_HEADLESS_SECRET_BYTES + 2]);
+
+        assert!(matches!(
+            read_bounded_secret(&mut reader, 0),
+            Err(StorageError::SecretTooLarge)
+        ));
+        assert_eq!(
+            reader.stream_position().unwrap(),
+            (MAX_HEADLESS_SECRET_BYTES + 1) as u64
+        );
+    }
+
+    #[test]
+    fn metadata_rejects_oversized_file_before_reading() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("secret");
         fs::write(&path, vec![b'x'; MAX_HEADLESS_SECRET_BYTES + 1]).unwrap();
@@ -307,20 +383,21 @@ mod tests {
     }
 
     #[test]
-    fn invalid_utf8_is_rejected_and_its_buffer_is_zeroized() {
+    fn invalid_utf8_read_error_exposes_only_a_zeroized_buffer_to_the_test_observer() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("secret");
         fs::write(&path, [0xff]).unwrap();
         let mut file = File::open(path).unwrap();
+        let observed_zeroized = Rc::new(Cell::new(false));
+        let observer_result = Rc::clone(&observed_zeroized);
 
-        assert!(matches!(
-            read_file_contents(&mut file),
-            Err(StorageError::InvalidSecretEncoding)
-        ));
+        let result = with_invalid_utf8_zeroize_observer(
+            move |bytes| observer_result.set(bytes.iter().all(|byte| *byte == 0)),
+            || read_file_contents(&mut file),
+        );
 
-        let mut bytes = vec![0xff, 0xfe];
-        zeroize_invalid_secret_bytes(&mut bytes);
-        assert_eq!(bytes, vec![0, 0]);
+        assert!(matches!(result, Err(StorageError::InvalidSecretEncoding)));
+        assert!(observed_zeroized.get());
     }
 
     #[test]
