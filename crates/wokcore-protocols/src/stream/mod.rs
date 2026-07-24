@@ -8,6 +8,8 @@ pub use sse::{DEFAULT_MAX_SSE_FRAME_BYTES, SseDecoder, SseFrame, encode_sse};
 pub enum ProtocolError {
     #[error("SSE frame exceeds the {limit}-byte limit")]
     FrameTooLarge { limit: usize },
+    #[error("SSE push exceeds the {limit}-frame limit")]
+    TooManyFrames { limit: usize },
     #[error("SSE field is not valid UTF-8")]
     InvalidUtf8,
     #[error("SSE decoder cannot be reused after an error")]

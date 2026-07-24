@@ -1,6 +1,6 @@
 use std::future::Future;
 
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 
 use super::ProtocolError;
 
@@ -35,7 +35,7 @@ impl<T> EventReceiver<T> {
 pub fn bounded_event_channel<T>(
     capacity: usize,
 ) -> Result<(mpsc::Sender<T>, EventReceiver<T>), ProtocolError> {
-    if capacity == 0 {
+    if capacity == 0 || capacity > Semaphore::MAX_PERMITS {
         return Err(ProtocolError::InvalidChannelCapacity);
     }
 

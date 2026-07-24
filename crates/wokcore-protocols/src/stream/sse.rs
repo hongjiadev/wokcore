@@ -6,6 +6,7 @@ use serde_json::Value;
 use super::ProtocolError;
 
 pub const DEFAULT_MAX_SSE_FRAME_BYTES: usize = 1024 * 1024;
+pub const DEFAULT_MAX_SSE_FRAMES_PER_PUSH: usize = 4096;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SseFrame {
@@ -15,6 +16,7 @@ pub struct SseFrame {
 
 pub struct SseDecoder {
     max_frame_bytes: usize,
+    max_frames_per_push: usize,
     frame_bytes: usize,
     line: Vec<u8>,
     event: Option<String>,
@@ -28,8 +30,13 @@ pub struct SseDecoder {
 
 impl SseDecoder {
     pub fn new(max_frame_bytes: usize) -> Self {
+        Self::with_limits(max_frame_bytes, DEFAULT_MAX_SSE_FRAMES_PER_PUSH)
+    }
+
+    pub fn with_limits(max_frame_bytes: usize, max_frames_per_push: usize) -> Self {
         Self {
             max_frame_bytes,
+            max_frames_per_push,
             frame_bytes: 0,
             line: Vec::new(),
             event: None,
@@ -136,6 +143,11 @@ impl SseDecoder {
 
         if line.is_empty() {
             if self.saw_data {
+                if frames.len() >= self.max_frames_per_push {
+                    return Err(ProtocolError::TooManyFrames {
+                        limit: self.max_frames_per_push,
+                    });
+                }
                 frames.push(SseFrame {
                     event: self.event.take(),
                     data: mem::take(&mut self.data),

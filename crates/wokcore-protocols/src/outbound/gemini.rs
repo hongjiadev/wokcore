@@ -180,8 +180,12 @@ impl GeminiAdapter {
         let value: Value =
             serde_json::from_slice(body).map_err(|_| GatewayError::invalid_request())?;
         let mut decoder = GeminiResponseDecoder::new(request_id, self.limits);
+        let mut emitted_events = 0;
         let mut events = decoder.decode_value(&value)?;
-        events.extend(decoder.finish()?);
+        account_stream_events(&mut emitted_events, events.len(), self.limits)?;
+        let completed = decoder.finish()?;
+        account_stream_events(&mut emitted_events, completed.len(), self.limits)?;
+        events.extend(completed);
         Ok(events)
     }
 
@@ -191,7 +195,10 @@ impl GeminiAdapter {
 
     pub fn stream_decoder(&self, request_id: RequestId) -> GeminiStreamDecoder {
         GeminiStreamDecoder {
-            sse: SseDecoder::new(self.limits.max_stream_frame_bytes),
+            sse: SseDecoder::with_limits(
+                self.limits.max_stream_frame_bytes,
+                self.limits.max_events,
+            ),
             response: GeminiResponseDecoder::new(request_id, self.limits),
             received_bytes: 0,
             limits: self.limits,

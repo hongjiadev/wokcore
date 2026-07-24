@@ -45,3 +45,10 @@ The private pre-rewrite recovery bundle is stored in WokDocs, not this public re
   - `python tests/fixtures/protocols/cursor/verify_fixtures.py`
   - `cargo +1.97.1 clippy -p wokcore-protocols --all-targets --all-features -- -D warnings`
   - `cargo +1.97.1 test -p wokcore-protocols --all-features`
+
+## Runtime import 2 review hardening
+
+- Bounded channels reject capacities outside Tokio's supported semaphore range instead of panicking.
+- Every SSE `push` bounds the number of decoded frames before extending its return vector; Azure and Gemini derive that per-push limit from the configured event limit.
+- Azure and Gemini non-stream decoders aggregate `max_events` across decode and finish output.
+- `NOTICE.md` retains `Copyright (c) 2026 WokRouter contributors` and explains the source MIT notice alongside WokCore's `MIT OR Apache-2.0` dual-license terms.

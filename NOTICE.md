@@ -13,3 +13,9 @@ Cockpit Tools is a design reference only. No Cockpit Tools source code is includ
 The initial WokCore domain types were migrated from WokRouter commit `226a40e08ad6c783e996ceed77b8e6dfe2640fb4`. The source-path mapping and deliberate adaptations are recorded in `MIGRATION.md`.
 
 The initial WokCore protocol substrate and fixtures were migrated from WokRouter commit `226a40e08ad6c783e996ceed77b8e6dfe2640fb4`. Package renames and the exact source mapping are recorded in `MIGRATION.md`.
+
+The migrated WokRouter protocol source and fixture files retain the source MIT notice:
+
+Copyright (c) 2026 WokRouter contributors
+
+Those migrated files continue to be covered by the source MIT notice and are distributed in WokCore under this repository's `MIT OR Apache-2.0` dual-license terms. WokCore's own `LICENSE-MIT` remains unchanged.

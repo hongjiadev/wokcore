@@ -1,6 +1,7 @@
 use std::{future::pending, time::Duration};
 
 use serde_json::json;
+use tokio::sync::Semaphore;
 use wokcore_protocols::stream::{
     DEFAULT_MAX_SSE_FRAME_BYTES, ProtocolError, ReceiveError, SseDecoder, SseFrame,
     bounded_event_channel, encode_sse,
@@ -26,6 +27,10 @@ fn decode_in_chunks(input: &[u8], chunk_sizes: impl IntoIterator<Item = usize>) 
     }
 
     frames
+}
+
+fn repeated_sse_frames(count: usize) -> Vec<u8> {
+    b"data: x\n\n".repeat(count)
 }
 
 fn pseudo_random_chunk_sizes(input_len: usize) -> Vec<usize> {
@@ -171,6 +176,42 @@ fn decoder_defaults_to_a_strict_one_mibibyte_limit() {
 }
 
 #[test]
+fn decoder_bounds_frames_returned_by_one_push_and_fails_closed() {
+    let limit = 4096;
+    let mut at_limit = SseDecoder::new(1024);
+    assert_eq!(
+        at_limit.push(&repeated_sse_frames(limit)).unwrap().len(),
+        limit
+    );
+
+    let mut above_limit = SseDecoder::new(1024);
+    let error = above_limit
+        .push(&repeated_sse_frames(limit + 1))
+        .expect_err("one push must not aggregate an unbounded frame vector");
+    assert_eq!(format!("{error:?}"), "TooManyFrames { limit: 4096 }");
+    assert_eq!(
+        above_limit.push(b"data: later\n\n"),
+        Err(ProtocolError::DecoderFailed)
+    );
+}
+
+#[test]
+fn decoder_supports_a_custom_per_push_frame_limit() {
+    let mut at_limit = SseDecoder::with_limits(1024, 2);
+    assert_eq!(at_limit.push(&repeated_sse_frames(2)).unwrap().len(), 2);
+
+    let mut above_limit = SseDecoder::with_limits(1024, 2);
+    assert_eq!(
+        above_limit.push(&repeated_sse_frames(3)),
+        Err(ProtocolError::TooManyFrames { limit: 2 })
+    );
+    assert_eq!(
+        above_limit.push(b"data: later\n\n"),
+        Err(ProtocolError::DecoderFailed)
+    );
+}
+
+#[test]
 fn decoder_rejects_invalid_utf8_and_fails_closed() {
     let mut decoder = SseDecoder::new(1024);
 
@@ -250,6 +291,19 @@ fn bounded_channel_rejects_zero_capacity() {
         bounded_event_channel::<u8>(0),
         Err(ProtocolError::InvalidChannelCapacity)
     ));
+}
+
+#[test]
+fn bounded_channel_capacity_respects_the_tokio_semaphore_limit() {
+    for capacity in [Semaphore::MAX_PERMITS - 1, Semaphore::MAX_PERMITS] {
+        assert!(bounded_event_channel::<u8>(capacity).is_ok());
+    }
+    for capacity in [Semaphore::MAX_PERMITS + 1, usize::MAX] {
+        assert!(matches!(
+            bounded_event_channel::<u8>(capacity),
+            Err(ProtocolError::InvalidChannelCapacity)
+        ));
+    }
 }
 
 #[tokio::test]

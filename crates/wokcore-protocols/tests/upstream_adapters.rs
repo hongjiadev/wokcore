@@ -402,6 +402,102 @@ fn azure_usage_wire_preserves_extensions_and_rejects_malformed_known_fields() {
 }
 
 #[test]
+fn gemini_non_stream_event_limit_is_aggregate_across_decode_and_finish() {
+    let adapter = |max_events| {
+        GeminiAdapter::new(
+            GeminiConfig::new(Url::parse("https://example.test/").unwrap(), "secret").unwrap(),
+            UpstreamLimits {
+                max_events,
+                ..UpstreamLimits::default()
+            },
+        )
+    };
+
+    assert_eq!(
+        adapter(1)
+            .decode_response(RequestId::new("req_gemini_empty"), br#"{"candidates":[]}"#)
+            .unwrap_err()
+            .code(),
+        "invalid_request"
+    );
+    let boundary = adapter(2)
+        .decode_response(
+            RequestId::new("req_gemini_boundary"),
+            br#"{"candidates":[]}"#,
+        )
+        .unwrap();
+    assert_eq!(boundary.len(), 2);
+    assert!(matches!(
+        boundary.first(),
+        Some(CanonicalEvent::Created { .. })
+    ));
+    assert_eq!(boundary.last(), Some(&CanonicalEvent::Completed));
+
+    for body in [
+        br#"{"candidates":[{"content":{"parts":[{"text":"x"}]}}]}"#.as_slice(),
+        br#"{"candidates":[],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1}}"#
+            .as_slice(),
+    ] {
+        assert_eq!(
+            adapter(2)
+                .decode_response(RequestId::new("req_gemini_extra"), body)
+                .unwrap_err()
+                .code(),
+            "invalid_request"
+        );
+    }
+}
+
+#[test]
+fn azure_non_stream_event_limit_is_aggregate_across_decode_and_finish() {
+    let adapter = |max_events| {
+        AzureAdapter::new(
+            AzureConfig::new(
+                Url::parse("https://example.test/").unwrap(),
+                "deployment",
+                "2024-10-21",
+                "secret",
+            )
+            .unwrap(),
+            UpstreamLimits {
+                max_events,
+                ..UpstreamLimits::default()
+            },
+        )
+    };
+
+    assert_eq!(
+        adapter(1)
+            .decode_response(RequestId::new("req_azure_empty"), br#"{"choices":[]}"#)
+            .unwrap_err()
+            .code(),
+        "invalid_request"
+    );
+    let boundary = adapter(2)
+        .decode_response(RequestId::new("req_azure_boundary"), br#"{"choices":[]}"#)
+        .unwrap();
+    assert_eq!(boundary.len(), 2);
+    assert!(matches!(
+        boundary.first(),
+        Some(CanonicalEvent::Created { .. })
+    ));
+    assert_eq!(boundary.last(), Some(&CanonicalEvent::Completed));
+
+    for body in [
+        br#"{"choices":[{"message":{"content":"x"}}]}"#.as_slice(),
+        br#"{"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#.as_slice(),
+    ] {
+        assert_eq!(
+            adapter(2)
+                .decode_response(RequestId::new("req_azure_extra"), body)
+                .unwrap_err()
+                .code(),
+            "invalid_request"
+        );
+    }
+}
+
+#[test]
 fn gemini_usage_top_level_extensions_have_an_independent_collection_limit() {
     let limits = UpstreamLimits {
         max_collection_items: 1,
@@ -1006,6 +1102,56 @@ fn base_urls_must_have_explicit_directory_semantics() {
             "invalid_request"
         );
     }
+}
+
+#[test]
+fn gemini_stream_bounds_sse_frames_before_adapter_aggregation() {
+    let adapter = GeminiAdapter::new(
+        GeminiConfig::new(Url::parse("https://example.test/").unwrap(), "secret").unwrap(),
+        UpstreamLimits {
+            max_events: 1,
+            ..UpstreamLimits::default()
+        },
+    );
+    let mut decoder = adapter.stream_decoder(RequestId::new("req_frame_bound"));
+    let chunk = b"data: {\"candidates\":[]}\n\ndata: {\"candidates\":[]}\n\n";
+
+    assert_eq!(decoder.push(chunk).unwrap_err().code(), "invalid_request");
+    assert_eq!(
+        decoder
+            .push(b"data: {\"candidates\":[]}\n\n")
+            .unwrap_err()
+            .code(),
+        "invalid_request"
+    );
+}
+
+#[test]
+fn azure_stream_bounds_sse_frames_before_adapter_aggregation() {
+    let adapter = AzureAdapter::new(
+        AzureConfig::new(
+            Url::parse("https://example.test/").unwrap(),
+            "deployment",
+            "2024-10-21",
+            "secret",
+        )
+        .unwrap(),
+        UpstreamLimits {
+            max_events: 1,
+            ..UpstreamLimits::default()
+        },
+    );
+    let mut decoder = adapter.stream_decoder(RequestId::new("req_frame_bound"));
+    let chunk = b"data: {\"id\":\"az\",\"choices\":[]}\n\ndata: {\"choices\":[]}\n\n";
+
+    assert_eq!(decoder.push(chunk).unwrap_err().code(), "invalid_request");
+    assert_eq!(
+        decoder
+            .push(b"data: {\"choices\":[]}\n\n")
+            .unwrap_err()
+            .code(),
+        "invalid_request"
+    );
 }
 
 #[test]
