@@ -26,14 +26,45 @@ impl AppPaths {
     pub fn resolve(environment: EnvironmentSnapshot) -> Result<Self, PlatformError> {
         let config_dir = environment.config_dir()?;
         let state_dir = environment.state_dir()?;
-        let runtime_dir = environment.runtime_dir(&state_dir);
+        let runtime_dir = environment.runtime_dir(&state_dir)?;
+        let config_file = append_components(environment.platform, config_dir, &["config.toml"])
+            .ok_or(PlatformError::MissingPlatformData {
+                name: "configuration directory",
+            })?;
+        let state_db =
+            append_components(environment.platform, state_dir.clone(), &["state.sqlite3"]).ok_or(
+                PlatformError::MissingPlatformData {
+                    name: "state directory",
+                },
+            )?;
+        let log_dir = append_components(environment.platform, state_dir, &["logs"]).ok_or(
+            PlatformError::MissingPlatformData {
+                name: "state directory",
+            },
+        )?;
+        let discovery_file = append_components(
+            environment.platform,
+            runtime_dir.clone(),
+            &["discovery.json"],
+        )
+        .ok_or(PlatformError::MissingPlatformData {
+            name: "runtime directory",
+        })?;
+        let instance_lock = append_components(
+            environment.platform,
+            runtime_dir.clone(),
+            &["instance.lock"],
+        )
+        .ok_or(PlatformError::MissingPlatformData {
+            name: "runtime directory",
+        })?;
 
         Ok(Self {
-            config_file: config_dir.join("config.toml"),
-            state_db: state_dir.join("state.sqlite3"),
-            log_dir: state_dir.join("logs"),
-            discovery_file: runtime_dir.join("discovery.json"),
-            instance_lock: runtime_dir.join("instance.lock"),
+            config_file,
+            state_db,
+            log_dir,
+            discovery_file,
+            instance_lock,
             runtime_dir,
         })
     }
@@ -99,11 +130,14 @@ impl EnvironmentSnapshot {
     fn config_dir(&self) -> Result<PathBuf, PlatformError> {
         match self.platform {
             Platform::Windows => Ok(self.windows_data_dir("APPDATA", &["AppData", "Roaming"])?),
-            Platform::Macos => Ok(self
-                .home_dir()?
-                .join("Library")
-                .join("Application Support")
-                .join(APPLICATION_NAME)),
+            Platform::Macos => append_components(
+                self.platform,
+                self.home_dir()?,
+                &["Library", "Application Support", APPLICATION_NAME],
+            )
+            .ok_or(PlatformError::MissingPlatformData {
+                name: "home directory",
+            }),
             Platform::Linux => Ok(self.xdg_directory("XDG_CONFIG_HOME", &[".config"])?),
         }
     }
@@ -116,14 +150,20 @@ impl EnvironmentSnapshot {
         }
     }
 
-    fn runtime_dir(&self, state_dir: &Path) -> PathBuf {
-        match self.platform {
-            Platform::Linux => self
-                .environment_path("XDG_RUNTIME_DIR")
-                .map(|path| path.join(APPLICATION_NAME))
-                .unwrap_or_else(|| state_dir.join("runtime")),
-            Platform::Windows | Platform::Macos => state_dir.join("runtime"),
-        }
+    fn runtime_dir(&self, state_dir: &Path) -> Result<PathBuf, PlatformError> {
+        let (runtime_root, component) = match self.platform {
+            Platform::Linux => match self.environment_path("XDG_RUNTIME_DIR") {
+                Some(runtime_root) => (runtime_root, APPLICATION_NAME),
+                None => (state_dir.to_path_buf(), "runtime"),
+            },
+            Platform::Windows | Platform::Macos => (state_dir.to_path_buf(), "runtime"),
+        };
+
+        append_components(self.platform, runtime_root, &[component]).ok_or(
+            PlatformError::MissingPlatformData {
+                name: "runtime directory",
+            },
+        )
     }
 
     fn windows_data_dir(
@@ -131,29 +171,41 @@ impl EnvironmentSnapshot {
         variable: &str,
         fallback: &[&str],
     ) -> Result<PathBuf, PlatformError> {
-        self.environment_path(variable)
+        let directory = self
+            .environment_path(variable)
             .or_else(|| {
                 self.home_dir()
                     .ok()
-                    .map(|home| append_components(home, fallback))
+                    .and_then(|home| append_components(self.platform, home, fallback))
             })
             .ok_or(PlatformError::MissingPlatformData {
                 name: "application data directory",
-            })
-            .map(|path| path.join(APPLICATION_NAME))
+            })?;
+
+        append_components(self.platform, directory, &[APPLICATION_NAME]).ok_or(
+            PlatformError::MissingPlatformData {
+                name: "application data directory",
+            },
+        )
     }
 
     fn xdg_directory(&self, variable: &str, fallback: &[&str]) -> Result<PathBuf, PlatformError> {
-        self.environment_path(variable)
+        let directory = self
+            .environment_path(variable)
             .or_else(|| {
                 self.home_dir()
                     .ok()
-                    .map(|home| append_components(home, fallback))
+                    .and_then(|home| append_components(self.platform, home, fallback))
             })
             .ok_or(PlatformError::MissingPlatformData {
                 name: "home directory",
-            })
-            .map(|path| path.join(APPLICATION_NAME))
+            })?;
+
+        append_components(self.platform, directory, &[APPLICATION_NAME]).ok_or(
+            PlatformError::MissingPlatformData {
+                name: "home directory",
+            },
+        )
     }
 
     fn home_dir(&self) -> Result<PathBuf, PlatformError> {
@@ -168,15 +220,35 @@ impl EnvironmentSnapshot {
         self.values
             .get(variable)
             .filter(|path| is_absolute(self.platform, path))
+            .filter(|path| self.platform.uses_native_paths() || path.to_str().is_some())
             .cloned()
     }
 }
 
-fn append_components(mut path: PathBuf, components: &[&str]) -> PathBuf {
-    for component in components {
-        path.push(component);
+fn append_components(
+    platform: Platform,
+    mut path: PathBuf,
+    components: &[&str],
+) -> Option<PathBuf> {
+    if platform.uses_native_paths() {
+        for component in components {
+            path.push(component);
+        }
+        return Some(path);
     }
-    path
+
+    let separator = platform.separator();
+    let mut value = path.to_str()?.to_owned();
+    if matches!(platform, Platform::Windows) {
+        value = value.replace('/', "\\");
+    }
+    for component in components {
+        if !value.ends_with(separator) {
+            value.push(separator);
+        }
+        value.push_str(component);
+    }
+    Some(PathBuf::from(value))
 }
 
 fn is_absolute(platform: Platform, path: &Path) -> bool {
@@ -191,5 +263,22 @@ fn is_absolute(platform: Platform, path: &Path) -> bool {
                     .is_some_and(|prefix| prefix[0] == b':' && matches!(prefix[1], b'\\' | b'/'))
         }
         Platform::Macos | Platform::Linux => value.starts_with('/'),
+    }
+}
+
+impl Platform {
+    fn uses_native_paths(self) -> bool {
+        match self {
+            Platform::Windows => cfg!(windows),
+            Platform::Macos => cfg!(target_os = "macos"),
+            Platform::Linux => cfg!(target_os = "linux"),
+        }
+    }
+
+    fn separator(self) -> char {
+        match self {
+            Platform::Windows => '\\',
+            Platform::Macos | Platform::Linux => '/',
+        }
     }
 }
