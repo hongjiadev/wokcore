@@ -193,3 +193,18 @@ The private pre-rewrite recovery bundle is stored in WokDocs, not this public re
   - `cargo +1.97.1 test -p wokcore-platform --test runtime_ownership`
   - `cargo +1.97.1 test -p wokcore-platform --test discovery`
   - `cargo +1.97.1 test -p wokcore-platform --all-features`
+
+## Runtime foundation 8: split-scope authentication metadata and token registry
+
+- The runtime authentication implementation is original WokCore code rather than migrated WokRouter source.
+- SQLite schema 2 adds only stable runtime secret references, binding revisions, 32-byte client-token digests, client/token identifiers, and issue/revoke timestamps. Schema 1 and schema 2 are applied in order with one immediate transaction per missing migration; incompatible migration histories fail closed.
+- `ClientId` is a distinct opaque type that reuses the existing lowercase, path-safe, 128-byte identifier rules without aliasing `AccountId`.
+- Management and proxy token material uses 32 bytes from an injected entropy boundary; production provides the operating-system CSPRNG implementation. Raw material is held in `secrecy::SecretString`, has redacted debug output, and is exposed only by a consuming response conversion.
+- Management bootstrap writes the secret backend before binding its reference. A binding failure records the unbound reference in existing orphan metadata and returns no secret material.
+- The active proxy-token set is an immutable `arc-swap` snapshot. Validation hashes and reads memory only; issue commits digest metadata before returning material, and revoke commits the matching client/token row before replacing the snapshot.
+- SQLite metadata calls are serialized only for low-frequency management mutations and run through `spawn_blocking`. Token validation has no SQLite/keyring call, background task, periodic refresh, semaphore, or configured concurrency limit.
+- The pre-existing state-store integration tests originally asserted schema version/count 1. Their three version/count literals were updated to 2 as the minimum compatibility change required by the ordered schema bump; no unrelated legacy test behavior was changed.
+- Verification:
+  - `cargo +1.97.1 test --offline -p wokcore-storage --test runtime_auth_store --locked`
+  - `cargo +1.97.1 test --offline -p wokcore-server --test auth_registry --locked`
+  - `cargo +1.97.1 clippy --offline -p wokcore-storage -p wokcore-server --all-targets --all-features --locked -- -D warnings`

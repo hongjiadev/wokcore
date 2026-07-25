@@ -36,7 +36,7 @@ fn first_open_applies_initial_schema_and_disables_automatic_checkpointing() {
     let directory = tempfile::tempdir().unwrap();
     let store = StateStore::open(directory.path().join("state.db")).unwrap();
 
-    assert_eq!(store.health().unwrap().schema_version, 1);
+    assert_eq!(store.health().unwrap().schema_version, 2);
     assert_eq!(store.pragma_foreign_keys().unwrap(), 1);
     assert_eq!(store.pragma_journal_mode().unwrap(), "wal");
     assert_eq!(store.pragma_busy_timeout().unwrap(), 5_000);
@@ -62,7 +62,7 @@ fn concurrent_first_opens_commit_exactly_one_valid_initial_migration() {
         .collect::<Vec<_>>();
 
     for handle in handles {
-        assert_eq!(handle.join().unwrap().schema_version, 1);
+        assert_eq!(handle.join().unwrap().schema_version, 2);
     }
 
     let connection = rusqlite::Connection::open(path).unwrap();
@@ -79,7 +79,7 @@ fn concurrent_first_opens_commit_exactly_one_valid_initial_migration() {
         )
         .unwrap();
 
-    assert_eq!(versions, 1);
+    assert_eq!(versions, 2);
     assert_eq!(tables, 5);
 }
 

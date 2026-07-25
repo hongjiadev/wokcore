@@ -1,6 +1,8 @@
 pub mod id;
 pub mod secret;
 
+pub use id::ClientId;
+
 pub mod build {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub struct BuildInfo {

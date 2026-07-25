@@ -1,5 +1,6 @@
 mod store;
 
 pub use store::{
-    CheckpointResult, RequestMetric, StateHealth, StateStore, WAL_CHECKPOINT_THRESHOLD_BYTES,
+    CheckpointResult, ClientTokenMetadata, RequestMetric, RuntimeSecretBinding, StateHealth,
+    StateStore, WAL_CHECKPOINT_THRESHOLD_BYTES,
 };

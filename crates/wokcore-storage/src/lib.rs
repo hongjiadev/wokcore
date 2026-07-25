@@ -10,7 +10,8 @@ pub use secrets::{
     MemorySecretStore, NativeSecretStore, PermissionedFileSecretStore, SecretStore,
 };
 pub use state::{
-    CheckpointResult, RequestMetric, StateHealth, StateStore, WAL_CHECKPOINT_THRESHOLD_BYTES,
+    CheckpointResult, ClientTokenMetadata, RequestMetric, RuntimeSecretBinding, StateHealth,
+    StateStore, WAL_CHECKPOINT_THRESHOLD_BYTES,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -33,6 +34,8 @@ pub enum StorageError {
         #[source]
         source: rusqlite::Error,
     },
+    #[error("runtime secret binding already exists at revision {actual}")]
+    RuntimeSecretBindingConflict { actual: u64 },
     #[error("secret was not found")]
     SecretNotFound,
     #[error("the secret backend failed without exposing secret material")]

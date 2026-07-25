@@ -4,12 +4,14 @@ use std::{
 };
 
 use fs4::fs_std::FileExt;
-use rusqlite::{Connection, ErrorCode, TransactionBehavior, params};
-use wokcore_core::secret::SecretRef;
+use rusqlite::{Connection, ErrorCode, OptionalExtension, TransactionBehavior, params};
+use wokcore_core::{id::ClientId, secret::SecretRef};
 
 use crate::StorageError;
 
 const INITIAL_MIGRATION: &str = include_str!("../../migrations/0001_initial.sql");
+const RUNTIME_AUTH_MIGRATION: &str = include_str!("../../migrations/0002_runtime_auth.sql");
+const LATEST_SCHEMA_VERSION: i64 = 2;
 
 pub const WAL_CHECKPOINT_THRESHOLD_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -36,6 +38,22 @@ pub struct CheckpointResult {
     pub busy: bool,
     pub log_frames: i64,
     pub checkpointed_frames: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeSecretBinding {
+    pub name: String,
+    pub secret_ref: SecretRef,
+    pub revision: u64,
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClientTokenMetadata {
+    pub token_id: String,
+    pub client_id: ClientId,
+    pub digest: [u8; 32],
+    pub issued_at: String,
 }
 
 #[derive(Debug)]
@@ -79,26 +97,7 @@ impl StateStore {
             )
             .map_err(map_database_error)?;
 
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(map_database_error)?;
-        transaction
-            .execute_batch(
-                "CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);",
-            )
-            .map_err(map_database_error)?;
-        let schema_version = transaction
-            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
-                row.get::<_, Option<i64>>(0)
-            })
-            .map_err(map_database_error)?
-            .unwrap_or_default();
-        if schema_version < 1 {
-            transaction
-                .execute_batch(INITIAL_MIGRATION)
-                .map_err(map_database_error)?;
-        }
-        transaction.commit().map_err(map_database_error)?;
+        apply_ordered_migrations(&mut connection)?;
 
         Ok(Self {
             connection,
@@ -181,6 +180,178 @@ impl StateStore {
         Ok(())
     }
 
+    pub fn runtime_secret_binding(
+        &self,
+        name: &str,
+    ) -> Result<Option<RuntimeSecretBinding>, StorageError> {
+        let result = self.connection.query_row(
+            "SELECT binding_name, secret_ref, revision, created_at
+             FROM runtime_secret_bindings
+             WHERE binding_name = ?1",
+            [name],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        );
+        let (name, secret_ref, revision, created_at) = match result {
+            Ok(binding) => binding,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+            Err(error) => return Err(map_database_error(error)),
+        };
+        let secret_ref =
+            SecretRef::parse(secret_ref).map_err(|_| StorageError::StateDatabaseCorrupt {
+                message: "runtime secret binding contains an invalid reference".to_owned(),
+            })?;
+        let revision = u64::try_from(revision).map_err(|_| StorageError::StateDatabaseCorrupt {
+            message: "runtime secret binding contains an invalid revision".to_owned(),
+        })?;
+
+        Ok(Some(RuntimeSecretBinding {
+            name,
+            secret_ref,
+            revision,
+            created_at,
+        }))
+    }
+
+    pub fn bind_runtime_secret_if_absent(
+        &mut self,
+        name: &str,
+        secret_ref: &SecretRef,
+        created_at: &str,
+    ) -> Result<RuntimeSecretBinding, StorageError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_database_error)?;
+        let existing_revision = transaction
+            .query_row(
+                "SELECT revision FROM runtime_secret_bindings WHERE binding_name = ?1",
+                [name],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(map_database_error)?;
+        if let Some(existing_revision) = existing_revision {
+            let actual = u64::try_from(existing_revision).map_err(|_| {
+                StorageError::StateDatabaseCorrupt {
+                    message: "runtime secret binding contains an invalid revision".to_owned(),
+                }
+            })?;
+            return Err(StorageError::RuntimeSecretBindingConflict { actual });
+        }
+
+        transaction
+            .execute(
+                "INSERT INTO runtime_secret_bindings(binding_name, secret_ref, revision, created_at)
+                 VALUES (?1, ?2, 1, ?3)",
+                params![name, secret_ref.as_str(), created_at],
+            )
+            .map_err(map_database_error)?;
+        transaction.commit().map_err(map_database_error)?;
+
+        Ok(RuntimeSecretBinding {
+            name: name.to_owned(),
+            secret_ref: secret_ref.clone(),
+            revision: 1,
+            created_at: created_at.to_owned(),
+        })
+    }
+
+    pub fn issue_client_token(&mut self, token: &ClientTokenMetadata) -> Result<(), StorageError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_database_error)?;
+        transaction
+            .execute(
+                "INSERT INTO client_tokens(token_id, client_id, token_digest, issued_at, revoked_at)
+                 VALUES (?1, ?2, ?3, ?4, NULL)",
+                params![
+                    token.token_id,
+                    token.client_id.as_str(),
+                    token.digest.as_slice(),
+                    token.issued_at,
+                ],
+            )
+            .map_err(map_database_error)?;
+        transaction.commit().map_err(map_database_error)?;
+        Ok(())
+    }
+
+    pub fn revoke_client_token(
+        &mut self,
+        client_id: &ClientId,
+        token_id: &str,
+        revoked_at: &str,
+    ) -> Result<bool, StorageError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_database_error)?;
+        let changed = transaction
+            .execute(
+                "UPDATE client_tokens
+                 SET revoked_at = ?3
+                 WHERE token_id = ?1 AND client_id = ?2 AND revoked_at IS NULL",
+                params![token_id, client_id.as_str(), revoked_at],
+            )
+            .map_err(map_database_error)?
+            != 0;
+        transaction.commit().map_err(map_database_error)?;
+        Ok(changed)
+    }
+
+    pub fn load_active_client_tokens(&self) -> Result<Vec<ClientTokenMetadata>, StorageError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT token_id, client_id, token_digest, issued_at
+                 FROM client_tokens
+                 WHERE revoked_at IS NULL
+                 ORDER BY token_id",
+            )
+            .map_err(map_database_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(map_database_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_database_error)?;
+
+        rows.into_iter()
+            .map(|(token_id, client_id, digest, issued_at)| {
+                let client_id =
+                    ClientId::new(client_id).map_err(|_| StorageError::StateDatabaseCorrupt {
+                        message: "client token metadata contains an invalid client identifier"
+                            .to_owned(),
+                    })?;
+                let digest = digest
+                    .try_into()
+                    .map_err(|_| StorageError::StateDatabaseCorrupt {
+                        message: "client token metadata contains an invalid digest".to_owned(),
+                    })?;
+                Ok(ClientTokenMetadata {
+                    token_id,
+                    client_id,
+                    digest,
+                    issued_at,
+                })
+            })
+            .collect()
+    }
+
     pub fn orphan_secret_refs(&self) -> Result<Vec<SecretRef>, StorageError> {
         let mut statement = self
             .connection
@@ -261,6 +432,74 @@ impl StateStore {
             .query_row(&format!("PRAGMA {name}"), [], |row| row.get(0))
             .map_err(map_database_error)
     }
+}
+
+fn apply_ordered_migrations(connection: &mut Connection) -> Result<(), StorageError> {
+    let versions = schema_versions(connection)?;
+    if versions
+        .iter()
+        .enumerate()
+        .any(|(index, version)| *version != (index as i64) + 1)
+        || versions
+            .last()
+            .is_some_and(|version| *version > LATEST_SCHEMA_VERSION)
+    {
+        return Err(StorageError::StateDatabaseCorrupt {
+            message: "state database has an incompatible migration history".to_owned(),
+        });
+    }
+
+    for (version, migration) in [(1, INITIAL_MIGRATION), (2, RUNTIME_AUTH_MIGRATION)] {
+        if versions.contains(&version) {
+            continue;
+        }
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_database_error)?;
+        transaction
+            .execute_batch(migration)
+            .map_err(map_database_error)?;
+        transaction.commit().map_err(map_database_error)?;
+    }
+    Ok(())
+}
+
+fn schema_versions(connection: &Connection) -> Result<Vec<i64>, StorageError> {
+    let has_migration_table = connection
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'schema_migrations'
+             )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(map_database_error)?;
+    if !has_migration_table {
+        let existing_tables = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(map_database_error)?;
+        if existing_tables != 0 {
+            return Err(StorageError::StateDatabaseCorrupt {
+                message: "state database has tables without migration metadata".to_owned(),
+            });
+        }
+        return Ok(Vec::new());
+    }
+
+    let mut statement = connection
+        .prepare("SELECT version FROM schema_migrations ORDER BY version")
+        .map_err(map_database_error)?;
+    statement
+        .query_map([], |row| row.get::<_, i64>(0))
+        .map_err(map_database_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(map_database_error)
 }
 
 fn map_database_error(error: rusqlite::Error) -> StorageError {

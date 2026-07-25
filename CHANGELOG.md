@@ -14,6 +14,7 @@ All notable WokCore changes are documented in this file.
 - Explicit WAL byte measurement, threshold-gated passive checkpointing at the architecture constant of 16 MiB, and idle-time truncate checkpoint primitives with automatic checkpointing disabled.
 - Internal `wokcore-platform` path discovery with deterministic environment snapshots, WokCore-owned OS directories, and discovery/instance-lock path values that have no filesystem side effects.
 - Secure per-user runtime ownership with a lease-scoped operating-system lock and bounded, token-free, atomically published loopback discovery.
+- Ordered SQLite schema 2 authentication metadata, distinct client identifiers, redacted split-scope token primitives, fail-closed management bootstrap, and immutable in-memory proxy-token validation.
 
 ### Fixed
 

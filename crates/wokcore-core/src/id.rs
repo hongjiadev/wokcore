@@ -10,6 +10,10 @@ pub struct ProviderId(String);
 #[serde(transparent)]
 pub struct AccountId(String);
 
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct ClientId(String);
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 #[error(
     "identifier must contain an ASCII letter or digit and use only lowercase ASCII letters, digits, '.', '_' or '-'"
@@ -52,6 +56,7 @@ macro_rules! identifier {
 
 identifier!(ProviderId);
 identifier!(AccountId);
+identifier!(ClientId);
 
 fn is_valid_identifier(value: &str) -> bool {
     !value.is_empty()
@@ -66,16 +71,18 @@ fn is_valid_identifier(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{AccountId, ProviderId};
+    use super::{AccountId, ClientId, ProviderId};
 
     #[test]
     fn identifiers_reject_path_segments_and_separator_only_values() {
         for invalid in [".", "..", "-", "_", "-_.", "...---___"] {
             assert!(ProviderId::new(invalid).is_err());
             assert!(AccountId::new(invalid).is_err());
+            assert!(ClientId::new(invalid).is_err());
         }
 
         assert!(ProviderId::new("openai-compatible.v1").is_ok());
         assert!(AccountId::new("primary-account_01").is_ok());
+        assert!(ClientId::new("wokrouter").is_ok());
     }
 }

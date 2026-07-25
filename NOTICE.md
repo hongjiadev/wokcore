@@ -24,6 +24,8 @@ The initial WokCore platform path discovery was adapted from WokRouter commit `2
 
 The WokCore secure runtime ownership and discovery implementation adapts the atomic-file and opened-handle permission-verification patterns from WokRouter commit `226a40e08ad6c783e996ceed77b8e6dfe2640fb4`. Exact source paths and blobs, retained behavior, and deliberate omissions are recorded in `MIGRATION.md`.
 
+The WokCore split-scope token, authentication metadata, management bootstrap, and immutable in-memory registry implementation is original WokCore code. Its security boundaries and the distinction from migrated WokRouter source are recorded in `MIGRATION.md`.
+
 The migrated WokRouter domain types, protocol source, and fixture files, configuration storage, secret storage, durable state storage, platform path discovery, and secure runtime filesystem patterns retain the source MIT notice:
 
 Copyright (c) 2026 WokRouter contributors
