@@ -8,6 +8,7 @@ use proc_macro2::{TokenStream, TokenTree};
 use syn::{
     Attribute, Expr, ForeignItem, ImplItem, Item, ItemImpl, ItemMod, ItemStruct, ItemUse, Local,
     Macro, Meta, PathArguments, StmtMacro, TraitItem, Type, UseTree, Visibility,
+    ext::IdentExt,
     parse::Parser,
     punctuated::Punctuated,
     visit::{self, Visit},
@@ -230,19 +231,19 @@ fn flatten_use_tree(
 ) {
     match tree {
         UseTree::Path(path) => {
-            prefix.push(path.ident.to_string());
+            prefix.push(unraw_identifier(&path.ident).to_string());
             flatten_use_tree(&path.tree, prefix, leaves);
             prefix.pop();
         }
         UseTree::Name(name) => {
             let mut path = prefix.clone();
-            path.push(name.ident.to_string());
+            path.push(unraw_identifier(&name.ident).to_string());
             leaves.push((path, None));
         }
         UseTree::Rename(rename) => {
             let mut path = prefix.clone();
-            path.push(rename.ident.to_string());
-            leaves.push((path, Some(rename.rename.to_string())));
+            path.push(unraw_identifier(&rename.ident).to_string());
+            leaves.push((path, Some(unraw_identifier(&rename.rename).to_string())));
         }
         UseTree::Group(group) => {
             for tree in &group.items {
@@ -255,6 +256,10 @@ fn flatten_use_tree(
             leaves.push((path, None));
         }
     }
+}
+
+fn unraw_identifier(identifier: &syn::Ident) -> syn::Ident {
+    identifier.unraw()
 }
 
 fn is_exact_native_store_struct(item: &ItemStruct) -> bool {
@@ -552,7 +557,11 @@ impl<'syntax> Visit<'syntax> for IncludeVisitor {
         {
             self.errors
                 .push("macro_rules! may not generate an include! invocation".to_owned());
-        } else if item.path.is_ident("include") {
+        } else if item
+            .path
+            .get_ident()
+            .is_some_and(|identifier| unraw_identifier(identifier) == "include")
+        {
             match syn::parse2::<syn::LitStr>(item.tokens.clone()) {
                 Ok(path) => self.directives.push(IncludeDirective {
                     path: PathBuf::from(path.value()),
@@ -566,7 +575,7 @@ impl<'syntax> Visit<'syntax> for IncludeVisitor {
             .path
             .segments
             .last()
-            .is_some_and(|segment| segment.ident == "include")
+            .is_some_and(|segment| unraw_identifier(&segment.ident) == "include")
         {
             self.errors
                 .push("qualified include! macros are not supported".to_owned());
@@ -578,7 +587,7 @@ impl<'syntax> Visit<'syntax> for IncludeVisitor {
 fn token_stream_contains_include_invocation(tokens: &TokenStream) -> bool {
     let tokens = tokens.clone().into_iter().collect::<Vec<_>>();
     tokens.iter().enumerate().any(|(index, token)| match token {
-        TokenTree::Ident(identifier) if identifier == "include" => matches!(
+        TokenTree::Ident(identifier) if unraw_identifier(identifier) == "include" => matches!(
             tokens.get(index + 1),
             Some(TokenTree::Punct(punctuation)) if punctuation.as_char() == '!'
         ),
@@ -1683,6 +1692,32 @@ fn scanner_follows_literal_include_files_recursively() {
 }
 
 #[test]
+fn scanner_follows_raw_identifier_direct_include_macros() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir_all(directory.path().join("src")).unwrap();
+    fs::create_dir_all(directory.path().join("shared")).unwrap();
+    fs::write(
+        directory.path().join("src/lib.rs"),
+        r#"r#include!("../shared/helper.inc");"#,
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("shared/helper.inc"),
+        r#"fn included_helper() { keyring::Entry::new("service", "account"); }"#,
+    )
+    .unwrap();
+
+    let violations = scan_crate_test_sources(directory.path()).unwrap();
+
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("helper.inc") && violation.ends_with("Entry")),
+        "raw direct include graph was missed: {violations:?}"
+    );
+}
+
+#[test]
 fn scanner_rejects_nonliteral_missing_and_ambiguous_includes() {
     let directory = tempfile::tempdir().unwrap();
     fs::create_dir_all(directory.path().join("src")).unwrap();
@@ -1736,6 +1771,28 @@ fn scanner_rejects_qualified_include_macros() {
 }
 
 #[test]
+fn scanner_rejects_raw_identifier_qualified_include_macros() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir_all(directory.path().join("src")).unwrap();
+    fs::create_dir_all(directory.path().join("shared")).unwrap();
+    fs::write(
+        directory.path().join("src/lib.rs"),
+        r#"std::r#include!("../shared/helper.inc");"#,
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("shared/helper.inc"),
+        "fn included_helper() {}",
+    )
+    .unwrap();
+
+    let error = scan_crate_test_sources(directory.path()).unwrap_err();
+
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("qualified include"));
+}
+
+#[test]
 fn scanner_rejects_imported_and_aliased_include_macros() {
     let directory = tempfile::tempdir().unwrap();
     fs::create_dir_all(directory.path().join("src")).unwrap();
@@ -1762,6 +1819,31 @@ fn scanner_rejects_imported_and_aliased_include_macros() {
 }
 
 #[test]
+fn scanner_rejects_raw_identifier_imported_and_aliased_include_macros() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir_all(directory.path().join("src")).unwrap();
+    fs::create_dir_all(directory.path().join("shared")).unwrap();
+    fs::write(
+        directory.path().join("src/lib.rs"),
+        r#"
+            use std::r#include as load;
+            load!("../shared/helper.inc");
+        "#,
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("shared/helper.inc"),
+        "fn included_helper() {}",
+    )
+    .unwrap();
+
+    let error = scan_crate_test_sources(directory.path()).unwrap_err();
+
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("include import"));
+}
+
+#[test]
 fn scanner_rejects_macro_rules_that_can_generate_include_invocations() {
     let directory = tempfile::tempdir().unwrap();
     fs::create_dir_all(directory.path().join("src")).unwrap();
@@ -1779,6 +1861,22 @@ fn scanner_rejects_macro_rules_that_can_generate_include_invocations() {
             "unexpected macro_rules result for {source}: {error}"
         );
     }
+}
+
+#[test]
+fn scanner_rejects_macro_rules_with_raw_identifier_include_invocations() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir_all(directory.path().join("src")).unwrap();
+    fs::write(
+        directory.path().join("src/lib.rs"),
+        r#"macro_rules! load { () => { r#include!("helper.inc"); } }"#,
+    )
+    .unwrap();
+
+    let error = scan_crate_test_sources(directory.path()).unwrap_err();
+
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("macro_rules") && error.to_string().contains("include"));
 }
 
 #[test]
