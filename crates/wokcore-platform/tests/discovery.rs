@@ -132,6 +132,74 @@ fn only_explicit_nonzero_ipv4_loopback_http_base_urls_are_accepted() {
 }
 
 #[test]
+fn signed_noncanonical_and_out_of_range_ports_fail_closed() {
+    for base_url in [
+        "http://127.0.0.1:+80",
+        "http://127.0.0.1:-1",
+        "http://127.0.0.1: 80",
+        "http://127.0.0.1:65536",
+    ] {
+        let fixture = Fixture::new();
+        let mut record = sample_record();
+        record.base_url = base_url.to_owned();
+
+        assert!(
+            matches!(
+                fixture.store.publish(&record),
+                Err(PlatformError::InvalidDiscovery)
+            ),
+            "base URL {base_url:?} must not be accepted"
+        );
+        assert!(!fixture.paths.discovery_file.exists());
+    }
+}
+
+#[test]
+fn valid_semver_prerelease_and_build_corpus_is_accepted() {
+    for version in [
+        "1.0.0-alpha-beta",
+        "1.0.0-alpha-beta.1+build-5.sha",
+        "1.0.0-0.3.7",
+        "1.0.0-x.7.z.92",
+        "18446744073709551616.0.0",
+    ] {
+        let fixture = Fixture::new();
+        let mut record = sample_record();
+        record.wokcore_version = version.to_owned();
+
+        fixture.store.publish(&record).unwrap();
+        assert_eq!(fixture.store.read().unwrap(), record);
+    }
+}
+
+#[test]
+fn invalid_semver_corpus_fails_closed() {
+    for version in [
+        "1.0",
+        "1.0.0-",
+        "1.0.0+",
+        "1.0.0-alpha..beta",
+        "1.0.0-01",
+        "1.0.0+build+again",
+        "01.0.0",
+        "1.0.0-α",
+    ] {
+        let fixture = Fixture::new();
+        let mut record = sample_record();
+        record.wokcore_version = version.to_owned();
+
+        assert!(
+            matches!(
+                fixture.store.publish(&record),
+                Err(PlatformError::InvalidDiscovery)
+            ),
+            "SemVer {version:?} must not be accepted"
+        );
+        assert!(!fixture.paths.discovery_file.exists());
+    }
+}
+
+#[test]
 fn invalid_records_are_rejected_before_publish_mutates_discovery() {
     let fixture = Fixture::new();
     let original = sample_record();

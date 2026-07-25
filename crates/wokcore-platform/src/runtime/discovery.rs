@@ -1,17 +1,12 @@
-use std::{
-    fs::{self, File},
-    io::{Read, Write},
-    path::{Path, PathBuf},
-};
+use std::{fs::File, io::Read, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
-use tempfile::NamedTempFile;
 use uuid::Uuid;
 
 use crate::{AppPaths, PlatformError};
 
 use super::permissions::{
-    harden_secure_file, open_existing_runtime_directory, open_existing_secure_file,
+    open_existing_runtime_directory, open_existing_secure_file, publish_secure_file,
     remove_open_secure_file, sync_parent_directory,
 };
 
@@ -48,9 +43,8 @@ impl DiscoveryStore {
 
     pub fn read(&self) -> Result<DiscoveryRecord, PlatformError> {
         let runtime_dir = open_existing_runtime_directory(&self.runtime_dir)?;
-        let file = open_existing_secure_file(&self.path)?;
+        let file = open_existing_secure_file(&runtime_dir, &self.path)?;
         let record = read_record(file)?;
-        drop(runtime_dir);
         Ok(record)
     }
 
@@ -62,26 +56,20 @@ impl DiscoveryStore {
         }
 
         let runtime_dir = open_existing_runtime_directory(&self.runtime_dir)?;
-        match open_existing_secure_file(&self.path) {
+        match open_existing_secure_file(&runtime_dir, &self.path) {
             Ok(existing) => drop(existing),
             Err(PlatformError::Io { source }) if source.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
 
-        let mut temporary = NamedTempFile::new_in(&self.runtime_dir)?;
-        harden_secure_file(temporary.as_file(), temporary.path())?;
-        temporary.write_all(&document)?;
-        temporary.as_file().sync_all()?;
-
-        let temporary_path = temporary.into_temp_path();
-        replace_file(temporary_path.as_ref(), &self.path)?;
+        publish_secure_file(&runtime_dir, &self.path, &document)?;
         sync_parent_directory(&runtime_dir)?;
         Ok(())
     }
 
     pub fn remove_if_owned(&self, instance_id: Uuid) -> Result<bool, PlatformError> {
         let runtime_dir = open_existing_runtime_directory(&self.runtime_dir)?;
-        let file = match open_existing_secure_file(&self.path) {
+        let file = match open_existing_secure_file(&runtime_dir, &self.path) {
             Ok(file) => file,
             Err(PlatformError::Io { source }) if source.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(false);
@@ -93,7 +81,7 @@ impl DiscoveryStore {
             return Ok(false);
         }
 
-        remove_open_secure_file(file, &self.path)?;
+        remove_open_secure_file(&runtime_dir, file, &self.path)?;
         sync_parent_directory(&runtime_dir)?;
         Ok(true)
     }
@@ -131,6 +119,7 @@ fn validate_record(record: &DiscoveryRecord) -> Result<(), PlatformError> {
 fn valid_base_url(value: &str) -> bool {
     value
         .strip_prefix("http://127.0.0.1:")
+        .filter(|port| !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()))
         .and_then(|port| port.parse::<u16>().ok())
         .is_some_and(|port| port != 0)
 }
@@ -142,8 +131,10 @@ fn valid_semver(value: &str) -> bool {
     if build.is_some_and(|identifiers| !valid_semver_identifiers(identifiers, false)) {
         return false;
     }
-    let Some((core, pre_release)) = split_optional_once(core_and_pre, '-') else {
-        return false;
+    let (core, pre_release) = match core_and_pre.split_once('-') {
+        Some((_core, "")) => return false,
+        Some((core, pre_release)) => (core, Some(pre_release)),
+        None => (core_and_pre, None),
     };
     if pre_release.is_some_and(|identifiers| !valid_semver_identifiers(identifiers, true)) {
         return false;
@@ -171,7 +162,6 @@ fn valid_numeric_identifier(value: &str) -> bool {
     !value.is_empty()
         && value.bytes().all(|byte| byte.is_ascii_digit())
         && (value == "0" || !value.starts_with('0'))
-        && value.parse::<u64>().is_ok()
 }
 
 fn valid_semver_identifiers(value: &str, reject_numeric_leading_zero: bool) -> bool {
@@ -184,48 +174,4 @@ fn valid_semver_identifiers(value: &str, reject_numeric_leading_zero: bool) -> b
                 || !identifier.bytes().all(|byte| byte.is_ascii_digit())
                 || valid_numeric_identifier(identifier))
     })
-}
-
-#[cfg(windows)]
-fn replace_file(source: &Path, destination: &Path) -> Result<(), PlatformError> {
-    use std::os::windows::ffi::OsStrExt;
-
-    use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
-
-    if !destination.exists() {
-        return fs::rename(source, destination).map_err(PlatformError::from);
-    }
-
-    let source = source
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let destination = destination
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    if unsafe {
-        ReplaceFileW(
-            destination.as_ptr(),
-            source.as_ptr(),
-            std::ptr::null(),
-            0,
-            std::ptr::null(),
-            std::ptr::null(),
-        )
-    } == 0
-    {
-        return Err(PlatformError::Io {
-            source: std::io::Error::last_os_error(),
-        });
-    }
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn replace_file(source: &Path, destination: &Path) -> Result<(), PlatformError> {
-    fs::rename(source, destination)?;
-    Ok(())
 }

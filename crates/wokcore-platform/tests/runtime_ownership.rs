@@ -1,8 +1,10 @@
 use std::{
-    fs,
+    env, fs,
     path::Path,
+    process::Command,
     sync::{Arc, Barrier, mpsc},
     thread,
+    time::{Duration, Instant},
 };
 
 use tempfile::tempdir;
@@ -44,6 +46,47 @@ fn simultaneous_acquisitions_produce_one_owner_and_one_already_running() {
 }
 
 #[test]
+fn separate_processes_contend_for_the_same_operating_system_lock() {
+    let directory = tempdir().unwrap();
+    let paths = test_paths(directory.path());
+    let ready = directory.path().join("holder-ready");
+    let release = directory.path().join("release-holder");
+    let mut holder = Command::new(env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "cross_process_lease_holder_helper",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("WOKCORE_TEST_RUNTIME_ROOT", directory.path())
+        .env("WOKCORE_TEST_HOLDER_READY", &ready)
+        .env("WOKCORE_TEST_HOLDER_RELEASE", &release)
+        .spawn()
+        .unwrap();
+
+    wait_until_exists(&ready, Duration::from_secs(10));
+    let contender = RuntimeLease::acquire(&paths);
+    fs::write(&release, b"release").unwrap();
+    assert!(holder.wait().unwrap().success());
+    assert!(matches!(contender, Err(PlatformError::AlreadyRunning)));
+    drop(RuntimeLease::acquire(&paths).unwrap());
+}
+
+#[test]
+#[ignore = "spawned only by separate_processes_contend_for_the_same_operating_system_lock"]
+fn cross_process_lease_holder_helper() {
+    let Some(root) = env::var_os("WOKCORE_TEST_RUNTIME_ROOT") else {
+        return;
+    };
+    let ready = env::var_os("WOKCORE_TEST_HOLDER_READY").unwrap();
+    let release = env::var_os("WOKCORE_TEST_HOLDER_RELEASE").unwrap();
+    let lease = RuntimeLease::acquire(&test_paths(Path::new(&root))).unwrap();
+    fs::write(&ready, b"ready").unwrap();
+    wait_until_exists(Path::new(&release), Duration::from_secs(10));
+    drop(lease);
+}
+
+#[test]
 fn dropping_the_owner_releases_the_operating_system_lock() {
     let directory = tempdir().unwrap();
     let paths = test_paths(directory.path());
@@ -78,6 +121,21 @@ fn stale_lock_file_contents_do_not_claim_or_grant_ownership() {
         fs::read(&paths.instance_lock).unwrap(),
         b"stale-pid-that-is-not-ownership"
     );
+}
+
+#[test]
+fn existing_lock_symlink_or_reparse_target_fails_closed() {
+    let directory = tempdir().unwrap();
+    let paths = test_paths(directory.path());
+    drop(RuntimeLease::acquire(&paths).unwrap());
+    let moved_lock = paths.runtime_dir.join("moved-instance.lock");
+    fs::rename(&paths.instance_lock, &moved_lock).unwrap();
+    create_file_symlink(&moved_lock, &paths.instance_lock);
+
+    assert!(matches!(
+        RuntimeLease::acquire(&paths),
+        Err(PlatformError::UnsafeRuntimePath)
+    ));
 }
 
 #[test]
@@ -186,6 +244,18 @@ fn directory_entries(path: &Path) -> Vec<std::ffi::OsString> {
     entries
 }
 
+fn wait_until_exists(path: &Path, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while !path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {}",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[cfg(unix)]
 fn create_directory_symlink(target: &Path, link: &Path) {
     std::os::unix::fs::symlink(target, link).unwrap();
@@ -194,6 +264,16 @@ fn create_directory_symlink(target: &Path, link: &Path) {
 #[cfg(windows)]
 fn create_directory_symlink(target: &Path, link: &Path) {
     std::os::windows::fs::symlink_dir(target, link).unwrap();
+}
+
+#[cfg(unix)]
+fn create_file_symlink(target: &Path, link: &Path) {
+    std::os::unix::fs::symlink(target, link).unwrap();
+}
+
+#[cfg(windows)]
+fn create_file_symlink(target: &Path, link: &Path) {
+    std::os::windows::fs::symlink_file(target, link).unwrap();
 }
 
 #[cfg(windows)]
