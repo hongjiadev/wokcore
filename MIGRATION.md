@@ -121,3 +121,30 @@ The private pre-rewrite recovery bundle is stored in WokDocs, not this public re
 - The actual invalid-UTF-8 decode path exposes a test-only post-zeroization observer; mutation evidence proves the assertion fails when the production zeroization statement is removed.
 - Windows tests replace inherited temporary-file permissions with an explicit protected DACL, verify successful access with only the current-user allow ACE, then verify fail-closed behavior after adding an Everyone allow ACE.
 - Native `BadDataFormat` mapping separately proves that neither its byte payload nor backend diagnostic reaches the generic rendered error.
+
+## Runtime import 5: durable state storage
+
+- Source repository: `https://github.com/hongjiadev/wokrouter`
+- Source commit: `226a40e08ad6c783e996ceed77b8e6dfe2640fb4`
+- Imported paths:
+  - `crates/wokrouter-storage/migrations/0001_initial.sql` (blob `05f782b2276cee06aebdaef2b408adf74f07c55a`) → `crates/wokcore-storage/migrations/0001_initial.sql`
+  - `crates/wokrouter-storage/src/state/mod.rs` (blob `9e40ad8e4c926d50926f1bc67a48f2a2c6da0d34`) → `crates/wokcore-storage/src/state/mod.rs`
+  - `crates/wokrouter-storage/src/state/store.rs` (blob `83a9639a174451d7bb55bc8938aafc2137867ff7`) → `crates/wokcore-storage/src/state/store.rs`
+  - state-storage portions of `crates/wokrouter-storage/src/lib.rs` (blob `9617147ff895b56284ed9ec210624ef1044b7fe3`) → `crates/wokcore-storage/src/lib.rs`
+  - `crates/wokrouter-storage/tests/state_store.rs` (blob `0fe818645f8078dea6a0a0990c886138f4b3e925`) → `crates/wokcore-storage/tests/state_store.rs`
+- Renames:
+  - Cargo package `wokrouter-storage` → internal, unpublished `wokcore-storage`
+  - Rust crate path `wokrouter_storage` → `wokcore_storage`
+  - domain crate path `wokrouter_core` → `wokcore_core`
+- Deliberate adaptation:
+  - request persistence is batch-only: an empty slice returns without a transaction, while a non-empty slice uses one immediate transaction and one prepared statement, with any row failure rolling back the whole batch;
+  - request state retains only identifiers, provider/model metadata, timing/status/error metadata, and input/output token totals; no request or response bodies, tool payloads, stream chunks, credentials, cookies, or session bodies are represented;
+  - SQLite enables foreign keys and WAL, uses a 5000 ms busy timeout, and disables automatic WAL checkpointing;
+  - the state API exposes WAL byte measurement, a passive checkpoint gated by an injected threshold, the architecture threshold constant of 16 MiB, and an explicit truncate checkpoint, without timers, watchers, background workers, or per-request checkpoints;
+  - setup locking, initial migration 1, orphan-secret recovery metadata, and corruption mapping are retained; corrupt database bytes are never deleted, overwritten, or rebuilt, and this import adds no future migration or backup policy.
+- License: migrated state-storage source and tests remain available under `MIT OR Apache-2.0`; the direct WokRouter source MIT notice remains retained in `NOTICE.md` and `LICENSE-MIT`.
+- Verification:
+  - `cargo +1.97.1 fmt --all -- --check`
+  - `cargo +1.97.1 clippy -p wokcore-storage --all-targets --all-features -- -D warnings`
+  - `cargo +1.97.1 test -p wokcore-storage --test state_store`
+  - `cargo +1.97.1 test -p wokcore-storage --all-features`

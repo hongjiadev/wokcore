@@ -1,12 +1,16 @@
-//! Durable configuration and secret storage for WokCore.
+//! Durable configuration, secret, and state storage for WokCore.
 
 pub mod config;
 pub mod secrets;
+pub mod state;
 
 pub use config::{AppConfig, ConfigStore, ServerConfig, VersionedConfig};
 pub use secrets::{
     EnvironmentSecretStore, HeadlessSecretStoreConfig, MAX_HEADLESS_SECRET_BYTES,
     MemorySecretStore, NativeSecretStore, PermissionedFileSecretStore, SecretStore,
+};
+pub use state::{
+    CheckpointResult, RequestMetric, StateHealth, StateStore, WAL_CHECKPOINT_THRESHOLD_BYTES,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -21,6 +25,13 @@ pub enum StorageError {
     Io {
         #[source]
         source: std::io::Error,
+    },
+    #[error("state database is corrupt: {message}")]
+    StateDatabaseCorrupt { message: String },
+    #[error("state database error: {source}")]
+    StateDatabase {
+        #[source]
+        source: rusqlite::Error,
     },
     #[error("secret was not found")]
     SecretNotFound,

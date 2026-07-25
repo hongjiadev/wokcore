@@ -10,6 +10,8 @@ All notable WokCore changes are documented in this file.
 - Internal canonical IR, bounded SSE primitives, Provider protocol codecs, and offline fixtures migrated from the recorded WokRouter source revision.
 - Internal `wokcore-storage` configuration storage with a loopback-only, non-zero port contract and revision-checked atomic commits.
 - Internal memory, native credential, environment, and permissioned-file secret stores with explicit read-only headless configuration and a 64 KiB input limit.
+- Internal SQLite durable state storage with batch-only request metrics, metadata and token totals only, corruption-preserving initial migration, and orphan-secret recovery metadata.
+- Explicit WAL byte measurement, threshold-gated passive checkpointing at the architecture constant of 16 MiB, and idle-time truncate checkpoint primitives with automatic checkpointing disabled.
 
 ### Fixed
 
