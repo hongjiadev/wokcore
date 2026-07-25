@@ -5,8 +5,8 @@ use std::{
 
 use crate::PlatformError;
 
-const TOMBSTONE_PREFIX: &str = ".wokcore-tombstone-";
 const PUBLISH_STAGING_NAME: &str = ".wokcore-publish-staging";
+const RETIRED_DISCOVERY_NAME: &str = ".wokcore-retired-discovery";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct RuntimeDirectoryIdentity([u64; 2]);
@@ -253,14 +253,8 @@ pub(super) fn prepare_secure_publish(
     directory: &File,
     _runtime_path: &Path,
 ) -> Result<(), PlatformError> {
-    cleanup_unix_internal_entry(directory, PUBLISH_STAGING_NAME, None)?;
-    for name in list_unix_tombstones(directory)? {
-        let expected =
-            parse_unix_tombstone_identity(&name).ok_or(PlatformError::UnsafeRuntimePath)?;
-        let name = name
-            .to_str()
-            .map_err(|_| PlatformError::UnsafeRuntimePath)?;
-        cleanup_unix_internal_entry(directory, name, Some(expected))?;
+    for name in [PUBLISH_STAGING_NAME, RETIRED_DISCOVERY_NAME] {
+        cleanup_unix_internal_entry(directory, name, None)?;
     }
     Ok(())
 }
@@ -303,109 +297,6 @@ fn unix_file_identity(metadata: &fs::Metadata) -> (u64, u64) {
 }
 
 #[cfg(unix)]
-fn unix_tombstone_name(metadata: &fs::Metadata) -> std::ffi::CString {
-    let (device, inode) = unix_file_identity(metadata);
-    std::ffi::CString::new(format!("{TOMBSTONE_PREFIX}u-{device:016x}-{inode:016x}"))
-        .expect("generated tombstone name contains no NUL")
-}
-
-#[cfg(unix)]
-fn parse_unix_tombstone_identity(name: &std::ffi::CStr) -> Option<(u64, u64)> {
-    let value = std::str::from_utf8(name.to_bytes()).ok()?;
-    let identity = value.strip_prefix(&format!("{TOMBSTONE_PREFIX}u-"))?;
-    let (device, inode) = identity.split_once('-')?;
-    if device.len() != 16 || inode.len() != 16 || inode.contains('-') {
-        return None;
-    }
-    Some((
-        u64::from_str_radix(device, 16).ok()?,
-        u64::from_str_radix(inode, 16).ok()?,
-    ))
-}
-
-#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
-fn list_unix_tombstones(directory: &File) -> Result<Vec<std::ffi::CString>, PlatformError> {
-    use std::os::fd::AsRawFd;
-
-    struct DirectoryStream(*mut libc::DIR);
-
-    impl Drop for DirectoryStream {
-        fn drop(&mut self) {
-            unsafe {
-                libc::closedir(self.0);
-            }
-        }
-    }
-
-    let duplicated = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
-    if duplicated < 0 {
-        return Err(PlatformError::Io {
-            source: std::io::Error::last_os_error(),
-        });
-    }
-    let stream = unsafe { libc::fdopendir(duplicated) };
-    if stream.is_null() {
-        unsafe {
-            libc::close(duplicated);
-        }
-        return Err(PlatformError::Io {
-            source: std::io::Error::last_os_error(),
-        });
-    }
-    let stream = DirectoryStream(stream);
-    let mut names = Vec::new();
-    loop {
-        set_unix_errno(0);
-        let entry = unsafe { libc::readdir(stream.0) };
-        if entry.is_null() {
-            let error = unix_errno();
-            if error != 0 {
-                return Err(PlatformError::Io {
-                    source: std::io::Error::from_raw_os_error(error),
-                });
-            }
-            break;
-        }
-        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
-        if name.to_bytes().starts_with(TOMBSTONE_PREFIX.as_bytes()) {
-            names.push(name.to_owned());
-        }
-    }
-    Ok(names)
-}
-
-#[cfg(all(
-    unix,
-    not(any(target_os = "linux", target_os = "android", target_vendor = "apple"))
-))]
-fn list_unix_tombstones(_directory: &File) -> Result<Vec<std::ffi::CString>, PlatformError> {
-    Err(PlatformError::UnsafeRuntimePath)
-}
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn unix_errno() -> i32 {
-    unsafe { *libc::__errno_location() }
-}
-
-#[cfg(target_vendor = "apple")]
-fn unix_errno() -> i32 {
-    unsafe { *libc::__error() }
-}
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn set_unix_errno(value: i32) {
-    unsafe {
-        *libc::__errno_location() = value;
-    }
-}
-
-#[cfg(target_vendor = "apple")]
-fn set_unix_errno(value: i32) {
-    unsafe {
-        *libc::__error() = value;
-    }
-}
-
 #[cfg(unix)]
 pub(super) fn publish_secure_file(
     directory: &File,
@@ -471,7 +362,8 @@ pub(super) fn remove_open_secure_file(
 
     prepare_secure_publish(directory, Path::new(""))?;
     let canonical = unix_child_name(path)?;
-    let tombstone = unix_tombstone_name(&opened);
+    let tombstone = std::ffi::CString::new(RETIRED_DISCOVERY_NAME)
+        .expect("fixed retired discovery name contains no NUL");
     unix_rename_noreplace(directory, &canonical, &tombstone)?;
     let tombstone_file = unix_openat(directory, &tombstone, libc::O_RDONLY | libc::O_NOFOLLOW, 0)?;
     let matches_opened = tombstone_file.metadata().is_ok_and(|metadata| {
@@ -1113,19 +1005,8 @@ pub(super) fn prepare_secure_publish(
     _directory: &File,
     runtime_path: &Path,
 ) -> Result<(), PlatformError> {
-    cleanup_windows_fixed_internal_entry(&runtime_path.join(PUBLISH_STAGING_NAME))?;
-    for entry in fs::read_dir(runtime_path)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            return Err(PlatformError::UnsafeRuntimePath);
-        };
-        if !name.starts_with(TOMBSTONE_PREFIX) {
-            continue;
-        }
-        let expected =
-            parse_windows_tombstone_identity(name).ok_or(PlatformError::UnsafeRuntimePath)?;
-        cleanup_windows_internal_entry(&entry.path(), expected)?;
+    for name in [PUBLISH_STAGING_NAME, RETIRED_DISCOVERY_NAME] {
+        cleanup_windows_fixed_internal_entry(&runtime_path.join(name))?;
     }
     Ok(())
 }
@@ -1175,30 +1056,6 @@ fn windows_file_identity(file: &File) -> Result<(u32, u32, u32), PlatformError> 
 }
 
 #[cfg(windows)]
-fn windows_tombstone_name(file: &File) -> Result<String, PlatformError> {
-    let (volume, high, low) = windows_file_identity(file)?;
-    Ok(format!(
-        "{TOMBSTONE_PREFIX}w-{volume:08x}-{high:08x}-{low:08x}"
-    ))
-}
-
-#[cfg(windows)]
-fn parse_windows_tombstone_identity(name: &str) -> Option<(u32, u32, u32)> {
-    let identity = name.strip_prefix(&format!("{TOMBSTONE_PREFIX}w-"))?;
-    let mut fields = identity.split('-');
-    let volume = fields.next()?;
-    let high = fields.next()?;
-    let low = fields.next()?;
-    if fields.next().is_some() || volume.len() != 8 || high.len() != 8 || low.len() != 8 {
-        return None;
-    }
-    Some((
-        u32::from_str_radix(volume, 16).ok()?,
-        u32::from_str_radix(high, 16).ok()?,
-        u32::from_str_radix(low, 16).ok()?,
-    ))
-}
-
 #[cfg(windows)]
 pub(super) fn publish_secure_file(
     _directory: &File,
@@ -1220,7 +1077,7 @@ pub(super) fn publish_secure_file(
 
     if let Some(existing) = existing {
         let expected = windows_file_identity(&existing)?;
-        let retired = parent.join(windows_tombstone_name(&existing)?);
+        let retired = parent.join(RETIRED_DISCOVERY_NAME);
         drop(existing);
         let (temporary_file, temporary_path) = temporary.into_parts();
         drop(temporary_file);
@@ -1641,6 +1498,16 @@ mod publish_tests {
         open_or_create_runtime_directory, prepare_secure_publish, publish_secure_file,
         with_publish_after_existing_commit_hook, with_publish_after_temp_creation_hook,
     };
+
+    #[test]
+    fn publish_preparation_does_not_enumerate_or_collect_runtime_directory_entries() {
+        let source = include_str!("permissions.rs");
+        let production = &source[..source.find("mod publish_tests").unwrap()];
+
+        assert!(!production.contains("fs::read_dir"));
+        assert!(!production.contains("libc::readdir"));
+        assert!(!production.contains("list_unix_tombstones"));
+    }
 
     #[test]
     fn failed_publish_after_temporary_creation_is_cleaned_at_next_safe_preparation() {
@@ -2195,18 +2062,8 @@ mod tests {
 
         assert!(matches!(result, Err(PlatformError::UnsafeRuntimePath)));
         assert!(!path.exists());
-        let tombstones = fs::read_dir(directory.path())
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .filter(|path| {
-                path.file_name()
-                    .unwrap()
-                    .to_string_lossy()
-                    .starts_with(super::TOMBSTONE_PREFIX)
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(tombstones.len(), 1);
-        assert_eq!(fs::read(&tombstones[0]).unwrap(), b"replacement");
+        let retired = directory.path().join(super::RETIRED_DISCOVERY_NAME);
+        assert_eq!(fs::read(retired).unwrap(), b"replacement");
         assert_eq!(fs::read(moved).unwrap(), b"owned");
     }
 }

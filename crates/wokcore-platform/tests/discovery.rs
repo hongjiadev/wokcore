@@ -320,7 +320,7 @@ fn runtime_directory_path_replacement_fails_discovery_publish_closed() {
 }
 
 #[test]
-fn repeated_publish_remove_lifecycles_keep_internal_tombstones_bounded() {
+fn repeated_publish_remove_lifecycles_keep_fixed_internal_residue_bounded() {
     let fixture = Fixture::new();
 
     for pid in 5000..5008 {
@@ -338,32 +338,80 @@ fn repeated_publish_remove_lifecycles_keep_internal_tombstones_bounded() {
 }
 
 #[test]
-fn malformed_reserved_tombstone_fails_publish_closed() {
-    let fixture = Fixture::new();
-    let malformed = fixture.paths.runtime_dir.join(".wokcore-tombstone-invalid");
-    fs::create_dir(&malformed).unwrap();
+fn wrong_type_fixed_internal_entries_fail_publish_closed() {
+    for name in [".wokcore-retired-discovery", ".wokcore-publish-staging"] {
+        let fixture = Fixture::new();
+        let original = sample_record();
+        fixture.store.publish(&original).unwrap();
+        let internal = fixture.paths.runtime_dir.join(name);
+        fs::create_dir(&internal).unwrap();
+        let mut replacement = original.clone();
+        replacement.pid += 1;
+        replacement.instance_id = Uuid::new_v4();
 
-    assert!(matches!(
-        fixture.store.publish(&sample_record()),
-        Err(PlatformError::UnsafeRuntimePath)
-    ));
-    assert!(!fixture.paths.discovery_file.exists());
-    assert!(malformed.is_dir());
+        assert!(matches!(
+            fixture.store.publish(&replacement),
+            Err(PlatformError::UnsafeRuntimePath)
+        ));
+        assert_eq!(fixture.store.read().unwrap(), original);
+        assert!(internal.is_dir());
+    }
 }
 
 #[test]
-fn identity_mismatched_reserved_tombstone_is_preserved_and_fails_closed() {
-    let fixture = Fixture::new();
-    let mismatched = fixture.paths.runtime_dir.join(mismatched_tombstone_name());
-    fs::write(&mismatched, b"competing internal entry").unwrap();
-    harden_test_tombstone(&mismatched);
+fn fixed_internal_entries_never_follow_external_links() {
+    for name in [".wokcore-retired-discovery", ".wokcore-publish-staging"] {
+        let fixture = Fixture::new();
+        let original = sample_record();
+        fixture.store.publish(&original).unwrap();
+        let external = fixture._directory.path().join(format!("external-{name}"));
+        fs::write(&external, b"must remain external").unwrap();
+        let internal = fixture.paths.runtime_dir.join(name);
+        create_file_symlink(&external, &internal);
+        let mut replacement = original.clone();
+        replacement.pid += 1;
+        replacement.instance_id = Uuid::new_v4();
 
-    assert!(matches!(
-        fixture.store.publish(&sample_record()),
-        Err(PlatformError::UnsafeRuntimePath)
-    ));
-    assert_eq!(fs::read(mismatched).unwrap(), b"competing internal entry");
-    assert!(!fixture.paths.discovery_file.exists());
+        assert!(matches!(
+            fixture.store.publish(&replacement),
+            Err(PlatformError::UnsafeRuntimePath)
+        ));
+        assert_eq!(fixture.store.read().unwrap(), original);
+        assert_eq!(fs::read(external).unwrap(), b"must remain external");
+        assert!(
+            fs::symlink_metadata(internal)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+}
+
+#[test]
+fn many_unrelated_runtime_decoys_do_not_affect_publish_semantics() {
+    let fixture = Fixture::new();
+    let original = sample_record();
+    fixture.store.publish(&original).unwrap();
+    for index in 0..2048 {
+        fs::write(
+            fixture.paths.runtime_dir.join(format!("decoy-{index:04}")),
+            b"unrelated",
+        )
+        .unwrap();
+    }
+    let mut replacement = original;
+    replacement.pid += 1;
+    replacement.instance_id = Uuid::new_v4();
+
+    fixture.store.publish(&replacement).unwrap();
+
+    assert_eq!(fixture.store.read().unwrap(), replacement);
+    for index in 0..2048 {
+        assert_eq!(
+            fs::read(fixture.paths.runtime_dir.join(format!("decoy-{index:04}"))).unwrap(),
+            b"unrelated"
+        );
+    }
 }
 
 #[test]
@@ -500,25 +548,6 @@ fn internal_runtime_entries(path: &Path) -> Vec<std::ffi::OsString> {
 }
 
 #[cfg(unix)]
-fn mismatched_tombstone_name() -> &'static str {
-    ".wokcore-tombstone-u-0000000000000000-0000000000000000"
-}
-
-#[cfg(windows)]
-fn mismatched_tombstone_name() -> &'static str {
-    ".wokcore-tombstone-w-00000000-00000000-00000000"
-}
-
-#[cfg(unix)]
-fn harden_test_tombstone(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
-}
-
-#[cfg(windows)]
-fn harden_test_tombstone(_path: &Path) {}
-
 #[cfg(unix)]
 fn create_file_symlink(target: &Path, link: &Path) {
     std::os::unix::fs::symlink(target, link).unwrap();

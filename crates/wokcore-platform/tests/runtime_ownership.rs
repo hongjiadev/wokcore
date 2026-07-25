@@ -137,7 +137,39 @@ fn replacing_the_runtime_directory_path_does_not_create_a_second_lock_domain() {
 
 #[cfg(unix)]
 #[test]
-fn different_runtime_paths_have_independent_lock_domains() {
+fn namespace_lock_is_a_fixed_owner_only_file_in_the_secure_runtime_parent() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempdir().unwrap();
+    let paths = test_paths(directory.path());
+    let namespace_lock = directory.path().join(".wokcore-runtime-namespace.lock");
+    let owner = RuntimeLease::acquire(&paths).unwrap();
+
+    let metadata = fs::symlink_metadata(&namespace_lock).unwrap();
+    assert!(metadata.is_file());
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+    drop(owner);
+    assert!(namespace_lock.is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_parent_must_be_private_to_the_current_user() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempdir().unwrap();
+    let paths = test_paths(directory.path());
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert!(matches!(
+        RuntimeLease::acquire(&paths),
+        Err(PlatformError::UnsafeRuntimePath)
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn different_runtime_parents_have_independent_lock_domains() {
     let directory = tempdir().unwrap();
     let first = RuntimeLease::acquire(&test_paths(&directory.path().join("first"))).unwrap();
     let second = RuntimeLease::acquire(&test_paths(&directory.path().join("second"))).unwrap();
@@ -245,9 +277,18 @@ fn runtime_acquisition_touches_only_the_runtime_directory_and_lock() {
     assert!(!paths.state_db.exists());
     assert!(!paths.log_dir.exists());
     assert!(!paths.discovery_file.exists());
+    #[cfg(not(unix))]
     assert_eq!(
         directory_entries(directory.path()),
         vec![paths.runtime_dir.file_name().unwrap().to_owned()]
+    );
+    #[cfg(unix)]
+    assert_eq!(
+        directory_entries(directory.path()),
+        vec![
+            ".wokcore-runtime-namespace.lock".into(),
+            paths.runtime_dir.file_name().unwrap().to_owned(),
+        ]
     );
     drop(owner);
 }

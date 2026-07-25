@@ -1,10 +1,7 @@
 use std::{
     ffi::CString,
     fs::{self, File},
-    os::{
-        fd::FromRawFd,
-        unix::{ffi::OsStrExt, fs::MetadataExt},
-    },
+    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Component, Path},
 };
 
@@ -12,87 +9,103 @@ use fs4::fs_std::FileExt;
 
 use crate::PlatformError;
 
-pub(super) fn acquire(path: &Path) -> Result<File, PlatformError> {
-    let name = namespace_name(path)?;
-    let (descriptor, created) = open_namespace_object(&name)?;
-    let file = unsafe { File::from_raw_fd(descriptor) };
-    if created {
-        use std::os::unix::fs::PermissionsExt;
+const NAMESPACE_LOCK_NAME: &str = ".wokcore-runtime-namespace.lock";
 
-        file.set_permissions(fs::Permissions::from_mode(0o600))?;
-    }
-    verify_namespace_object(&file)?;
-    match file.try_lock_exclusive() {
-        Ok(true) => Ok(file),
+pub(super) fn acquire(runtime_path: &Path) -> Result<File, PlatformError> {
+    validate_runtime_path(runtime_path)?;
+    let parent_path = runtime_path
+        .parent()
+        .ok_or(PlatformError::UnsafeRuntimePath)?;
+    let parent = open_or_create_private_parent(parent_path)?;
+    let lock = open_or_create_lock_file(&parent)?;
+    match lock.try_lock_exclusive() {
+        Ok(true) => Ok(lock),
         Ok(false) => Err(PlatformError::AlreadyRunning),
         Err(source) => Err(PlatformError::Io { source }),
     }
 }
 
-fn namespace_name(path: &Path) -> Result<CString, PlatformError> {
+fn validate_runtime_path(path: &Path) -> Result<(), PlatformError> {
     if !path.is_absolute() {
         return Err(PlatformError::UnsafeRuntimePath);
     }
+    if path.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::Prefix(_) | Component::CurDir
+        )
+    }) {
+        return Err(PlatformError::UnsafeRuntimePath);
+    }
+    Ok(())
+}
 
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    hash_bytes(&mut hash, b"/");
-    for component in path.components() {
-        match component {
-            Component::RootDir => {}
-            Component::Normal(component) => {
-                let bytes = component.as_bytes();
-                hash_bytes(&mut hash, &(bytes.len() as u64).to_le_bytes());
-                hash_bytes(&mut hash, bytes);
-            }
-            Component::CurDir => {}
-            Component::ParentDir | Component::Prefix(_) => {
-                return Err(PlatformError::UnsafeRuntimePath);
+fn open_or_create_private_parent(path: &Path) -> Result<File, PlatformError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut builder = fs::DirBuilder::new();
+            builder.recursive(true).mode(0o700);
+            match builder.create(path) {
+                Ok(()) => fs::set_permissions(path, fs::Permissions::from_mode(0o700))?,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(source) => return Err(PlatformError::Io { source }),
             }
         }
+        Err(source) => return Err(PlatformError::Io { source }),
     }
 
-    CString::new(format!("/wc-{:08x}-{hash:016x}", unsafe {
-        libc::geteuid()
-    }))
-    .map_err(|_| PlatformError::UnsafeRuntimePath)
-}
-
-fn hash_bytes(hash: &mut u64, bytes: &[u8]) {
-    for byte in bytes {
-        *hash ^= u64::from(*byte);
-        *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    let parent = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(map_unsafe_open_error)?;
+    let metadata = parent.metadata()?;
+    if !metadata.is_dir()
+        || !directory_is_private_to(metadata.mode(), metadata.uid(), unsafe { libc::geteuid() })
+    {
+        return Err(PlatformError::UnsafeRuntimePath);
     }
+    Ok(parent)
 }
 
-fn open_namespace_object(name: &std::ffi::CStr) -> Result<(libc::c_int, bool), PlatformError> {
+fn open_or_create_lock_file(parent: &File) -> Result<File, PlatformError> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let name =
+        CString::new(NAMESPACE_LOCK_NAME).expect("fixed namespace lock name contains no NUL");
     let descriptor = unsafe {
-        libc::shm_open(
+        libc::openat(
+            parent.as_raw_fd(),
             name.as_ptr(),
-            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             0o600,
         )
     };
-    if descriptor >= 0 {
-        return Ok((descriptor, true));
-    }
-
-    let source = std::io::Error::last_os_error();
-    if source.raw_os_error() != Some(libc::EEXIST) {
-        return Err(PlatformError::Io { source });
-    }
-    let descriptor =
-        unsafe { libc::shm_open(name.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC, 0o600) };
-    if descriptor < 0 {
+    let (descriptor, created) = if descriptor >= 0 {
+        (descriptor, true)
+    } else {
         let source = std::io::Error::last_os_error();
-        return Err(match source.raw_os_error() {
-            Some(libc::EACCES) => PlatformError::UnsafeRuntimePath,
-            _ => PlatformError::Io { source },
-        });
+        if source.raw_os_error() != Some(libc::EEXIST) {
+            return Err(map_unsafe_open_error(source));
+        }
+        let descriptor = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0,
+            )
+        };
+        if descriptor < 0 {
+            return Err(map_unsafe_open_error(std::io::Error::last_os_error()));
+        }
+        (descriptor, false)
+    };
+    let file = unsafe { File::from_raw_fd(descriptor) };
+    if created {
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
     }
-    Ok((descriptor, false))
-}
-
-fn verify_namespace_object(file: &File) -> Result<(), PlatformError> {
     let metadata = file.metadata()?;
     if !metadata.is_file()
         || metadata.uid() != unsafe { libc::geteuid() }
@@ -100,5 +113,32 @@ fn verify_namespace_object(file: &File) -> Result<(), PlatformError> {
     {
         return Err(PlatformError::UnsafeRuntimePath);
     }
-    Ok(())
+    Ok(file)
+}
+
+fn map_unsafe_open_error(source: std::io::Error) -> PlatformError {
+    match source.raw_os_error() {
+        Some(libc::ELOOP | libc::EISDIR | libc::ENOTDIR) => PlatformError::UnsafeRuntimePath,
+        _ => PlatformError::Io { source },
+    }
+}
+
+fn directory_is_private_to(mode: u32, owner: u32, user: u32) -> bool {
+    owner == user && mode & 0o7777 == 0o700
+}
+
+#[cfg(test)]
+mod tests {
+    use super::directory_is_private_to;
+
+    #[test]
+    fn owner_only_parent_excludes_another_nonprivileged_uid() {
+        let owner = 1000;
+        let other_user = 1001;
+
+        assert!(directory_is_private_to(0o700, owner, owner));
+        assert!(!directory_is_private_to(0o700, owner, other_user));
+        assert!(!directory_is_private_to(0o770, owner, owner));
+        assert!(!directory_is_private_to(0o707, owner, owner));
+    }
 }
