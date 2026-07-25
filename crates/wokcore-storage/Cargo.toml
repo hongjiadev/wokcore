@@ -20,7 +20,7 @@ tokio.workspace = true
 toml_edit.workspace = true
 windows-sys.workspace = true
 zeroize.workspace = true
-wokcore-core = { path = "../wokcore-core" }
+wokcore-core = { version = "0.1.0", path = "../wokcore-core" }
 
 [dev-dependencies]
 proc-macro2 = "1"
