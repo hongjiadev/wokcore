@@ -6,9 +6,9 @@ use uuid::Uuid;
 use crate::{AppPaths, PlatformError};
 
 use super::permissions::{
-    open_existing_runtime_directory, open_existing_secure_file,
+    RuntimeDirectoryIdentity, open_existing_runtime_directory, open_existing_secure_file,
     open_existing_secure_file_for_update, prepare_secure_publish, publish_secure_file,
-    remove_open_secure_file, sync_parent_directory,
+    remove_open_secure_file, runtime_directory_identity, sync_parent_directory,
 };
 
 pub const MAX_DISCOVERY_BYTES: usize = 16 * 1024;
@@ -26,6 +26,7 @@ pub struct DiscoveryRecord {
 #[derive(Clone, Debug)]
 pub struct DiscoveryStore {
     runtime_dir: PathBuf,
+    runtime_identity: RuntimeDirectoryIdentity,
     path: PathBuf,
 }
 
@@ -35,15 +36,16 @@ impl DiscoveryStore {
             return Err(PlatformError::UnsafeRuntimePath);
         }
         let runtime_dir = open_existing_runtime_directory(&paths.runtime_dir)?;
-        drop(runtime_dir);
+        let runtime_identity = runtime_directory_identity(&runtime_dir)?;
         Ok(Self {
             runtime_dir: paths.runtime_dir.clone(),
+            runtime_identity,
             path: paths.discovery_file.clone(),
         })
     }
 
     pub fn read(&self) -> Result<DiscoveryRecord, PlatformError> {
-        let runtime_dir = open_existing_runtime_directory(&self.runtime_dir)?;
+        let runtime_dir = self.open_runtime_directory()?;
         let file = open_existing_secure_file(&runtime_dir, &self.path)?;
         let record = read_record(file)?;
         Ok(record)
@@ -56,7 +58,7 @@ impl DiscoveryStore {
             return Err(PlatformError::DiscoveryTooLarge);
         }
 
-        let runtime_dir = open_existing_runtime_directory(&self.runtime_dir)?;
+        let runtime_dir = self.open_runtime_directory()?;
         prepare_secure_publish(&runtime_dir, &self.runtime_dir)?;
         let existing = match open_existing_secure_file_for_update(&runtime_dir, &self.path) {
             Ok(existing) => Some(existing),
@@ -72,7 +74,7 @@ impl DiscoveryStore {
     }
 
     pub fn remove_if_owned(&self, instance_id: Uuid) -> Result<bool, PlatformError> {
-        let runtime_dir = open_existing_runtime_directory(&self.runtime_dir)?;
+        let runtime_dir = self.open_runtime_directory()?;
         let file = match open_existing_secure_file(&runtime_dir, &self.path) {
             Ok(file) => file,
             Err(PlatformError::Io { source }) if source.kind() == std::io::ErrorKind::NotFound => {
@@ -88,6 +90,14 @@ impl DiscoveryStore {
         remove_open_secure_file(&runtime_dir, file, &self.path)?;
         sync_parent_directory(&runtime_dir)?;
         Ok(true)
+    }
+
+    fn open_runtime_directory(&self) -> Result<File, PlatformError> {
+        let directory = open_existing_runtime_directory(&self.runtime_dir)?;
+        if runtime_directory_identity(&directory)? != self.runtime_identity {
+            return Err(PlatformError::UnsafeRuntimePath);
+        }
+        Ok(directory)
     }
 }
 

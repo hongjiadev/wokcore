@@ -290,6 +290,35 @@ fn owned_removal_preserves_a_replacement_instance() {
     assert_eq!(fixture.store.read().unwrap(), replacement);
 }
 
+#[cfg(unix)]
+#[test]
+fn runtime_directory_path_replacement_fails_discovery_publish_closed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::new();
+    let original = sample_record();
+    let moved_runtime = fixture._directory.path().join("original-runtime");
+    fixture.store.publish(&original).unwrap();
+
+    fs::rename(&fixture.paths.runtime_dir, &moved_runtime).unwrap();
+    fs::create_dir(&fixture.paths.runtime_dir).unwrap();
+    fs::set_permissions(
+        &fixture.paths.runtime_dir,
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    let mut replacement = original;
+    replacement.pid += 1;
+    replacement.instance_id = Uuid::new_v4();
+
+    assert!(matches!(
+        fixture.store.publish(&replacement),
+        Err(PlatformError::UnsafeRuntimePath)
+    ));
+    assert!(!fixture.paths.discovery_file.exists());
+    assert!(moved_runtime.join("discovery.json").is_file());
+}
+
 #[test]
 fn repeated_publish_remove_lifecycles_keep_internal_tombstones_bounded() {
     let fixture = Fixture::new();

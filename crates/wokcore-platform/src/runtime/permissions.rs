@@ -9,6 +9,9 @@ const TOMBSTONE_PREFIX: &str = ".wokcore-tombstone-";
 #[cfg(unix)]
 const PUBLISH_STAGING_NAME: &str = ".wokcore-publish-staging";
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct RuntimeDirectoryIdentity([u64; 2]);
+
 #[cfg(unix)]
 pub(super) fn open_or_create_runtime_directory(path: &Path) -> Result<File, PlatformError> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -52,6 +55,16 @@ pub(super) fn open_existing_runtime_directory(path: &Path) -> Result<File, Platf
     }
     verify_unix_owner(&metadata)?;
     Ok(file)
+}
+
+#[cfg(unix)]
+pub(super) fn runtime_directory_identity(
+    directory: &File,
+) -> Result<RuntimeDirectoryIdentity, PlatformError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = directory.metadata()?;
+    Ok(RuntimeDirectoryIdentity([metadata.dev(), metadata.ino()]))
 }
 
 #[cfg(unix)]
@@ -171,6 +184,46 @@ fn unix_rename_noreplace(
         return Err(match source.raw_os_error() {
             Some(libc::EEXIST) => PlatformError::UnsafeRuntimePath,
             _ => PlatformError::Io { source },
+        });
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn unix_exchange(
+    directory: &File,
+    first: &std::ffi::CStr,
+    second: &std::ffi::CStr,
+) -> Result<(), PlatformError> {
+    use std::os::fd::AsRawFd;
+
+    let descriptor = directory.as_raw_fd();
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let result = unsafe {
+        libc::renameat2(
+            descriptor,
+            first.as_ptr(),
+            descriptor,
+            second.as_ptr(),
+            libc::RENAME_EXCHANGE,
+        )
+    };
+    #[cfg(target_vendor = "apple")]
+    let result = unsafe {
+        libc::renameatx_np(
+            descriptor,
+            first.as_ptr(),
+            descriptor,
+            second.as_ptr(),
+            libc::RENAME_SWAP,
+        )
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+    return Err(PlatformError::UnsafeRuntimePath);
+
+    if result != 0 {
+        return Err(PlatformError::Io {
+            source: std::io::Error::last_os_error(),
         });
     }
     Ok(())
@@ -361,7 +414,7 @@ pub(super) fn publish_secure_file(
     document: &[u8],
     existing: Option<File>,
 ) -> Result<(), PlatformError> {
-    use std::{io::Write, os::unix::fs::MetadataExt};
+    use std::io::Write;
 
     let destination = unix_child_name(destination)?;
     let staging_name = std::ffi::CString::new(PUBLISH_STAGING_NAME)
@@ -373,8 +426,6 @@ pub(super) fn publish_secure_file(
         0o600,
     )?;
     harden_secure_file(&temporary, Path::new(""))?;
-    let temporary_name = unix_tombstone_name(&temporary.metadata()?);
-    unix_rename_noreplace(directory, &staging_name, &temporary_name)?;
     temporary.write_all(document)?;
     temporary.sync_all()?;
     #[cfg(test)]
@@ -382,24 +433,29 @@ pub(super) fn publish_secure_file(
 
     if let Some(existing) = existing {
         let expected = existing.metadata()?;
-        let retired_name = unix_tombstone_name(&expected);
-        unix_rename_noreplace(directory, &destination, &retired_name)?;
-        let retired = unix_openat(
+        let current = unix_openat(
             directory,
-            &retired_name,
+            &destination,
             libc::O_RDONLY | libc::O_NOFOLLOW,
             0,
         )?;
-        let retired_metadata = retired.metadata()?;
-        if !retired_metadata.is_file()
-            || retired_metadata.dev() != expected.dev()
-            || retired_metadata.ino() != expected.ino()
-        {
+        verify_unix_file(&current)?;
+        if unix_file_identity(&current.metadata()?) != unix_file_identity(&expected) {
             return Err(PlatformError::UnsafeRuntimePath);
         }
+
+        unix_exchange(directory, &staging_name, &destination)?;
+        #[cfg(test)]
+        run_publish_after_existing_commit_hook()?;
+        cleanup_unix_internal_entry(
+            directory,
+            PUBLISH_STAGING_NAME,
+            Some(unix_file_identity(&expected)),
+        )?;
+        return Ok(());
     }
 
-    unix_rename_noreplace(directory, &temporary_name, &destination)
+    unix_rename_noreplace(directory, &staging_name, &destination)
 }
 
 #[cfg(unix)]
@@ -559,6 +615,48 @@ fn with_publish_after_temp_creation_hook<T>(
     operation()
 }
 
+#[cfg(test)]
+type PublishAfterExistingCommitHook = Box<dyn FnOnce() -> Result<(), PlatformError>>;
+
+#[cfg(test)]
+thread_local! {
+    static PUBLISH_AFTER_EXISTING_COMMIT_HOOK:
+        std::cell::RefCell<Option<PublishAfterExistingCommitHook>> =
+            const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_publish_after_existing_commit_hook() -> Result<(), PlatformError> {
+    PUBLISH_AFTER_EXISTING_COMMIT_HOOK.with(|slot| match slot.borrow_mut().take() {
+        Some(hook) => hook(),
+        None => Ok(()),
+    })
+}
+
+#[cfg(test)]
+fn with_publish_after_existing_commit_hook<T>(
+    hook: impl FnOnce() -> Result<(), PlatformError> + 'static,
+    operation: impl FnOnce() -> T,
+) -> T {
+    PUBLISH_AFTER_EXISTING_COMMIT_HOOK.with(|slot| {
+        assert!(slot.borrow().is_none());
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+
+    struct ResetHook;
+
+    impl Drop for ResetHook {
+        fn drop(&mut self) {
+            PUBLISH_AFTER_EXISTING_COMMIT_HOOK.with(|slot| {
+                slot.borrow_mut().take();
+            });
+        }
+    }
+
+    let _reset = ResetHook;
+    operation()
+}
+
 #[cfg(unix)]
 pub(super) fn sync_parent_directory(directory: &File) -> Result<(), PlatformError> {
     directory.sync_all()?;
@@ -602,6 +700,17 @@ pub(super) fn open_or_create_runtime_directory(path: &Path) -> Result<File, Plat
 #[cfg(windows)]
 pub(super) fn open_existing_runtime_directory(path: &Path) -> Result<File, PlatformError> {
     open_windows_file(path, WindowsFileKind::Directory)
+}
+
+#[cfg(windows)]
+pub(super) fn runtime_directory_identity(
+    directory: &File,
+) -> Result<RuntimeDirectoryIdentity, PlatformError> {
+    let (volume, high, low) = windows_file_identity(directory)?;
+    Ok(RuntimeDirectoryIdentity([
+        u64::from(volume),
+        u64::from(high) << 32 | u64::from(low),
+    ]))
 }
 
 #[cfg(windows)]
@@ -1066,16 +1175,25 @@ pub(super) fn publish_secure_file(
     let parent = destination
         .parent()
         .ok_or(PlatformError::UnsafeRuntimePath)?;
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    let mut temporary = create_windows_publish_temporary(parent)?;
     harden_secure_file(temporary.as_file(), temporary.path())?;
     temporary.write_all(document)?;
     temporary.as_file().sync_all()?;
     #[cfg(test)]
     run_publish_after_temp_creation_hook()?;
 
-    if let Some(existing) = existing.as_ref() {
-        let retired = parent.join(windows_tombstone_name(existing)?);
-        rename_windows_file_noreplace(existing, &retired)?;
+    if let Some(existing) = existing {
+        let expected = windows_file_identity(&existing)?;
+        let retired = parent.join(windows_tombstone_name(&existing)?);
+        drop(existing);
+        let (temporary_file, temporary_path) = temporary.into_parts();
+        drop(temporary_file);
+        replace_windows_file(destination, &temporary_path, &retired)?;
+        #[cfg(test)]
+        run_publish_after_existing_commit_hook()?;
+        drop(open_windows_existing_file(destination, false)?);
+        cleanup_windows_internal_entry(&retired, expected)?;
+        return Ok(());
     }
 
     let persisted =
@@ -1088,52 +1206,70 @@ pub(super) fn publish_secure_file(
                 },
             })?;
     persisted.sync_all()?;
-    if let Some(existing) = existing {
-        delete_windows_file(existing)?;
-    }
     Ok(())
 }
 
 #[cfg(windows)]
-fn rename_windows_file_noreplace(file: &File, destination: &Path) -> Result<(), PlatformError> {
-    use std::{
-        mem::{offset_of, size_of},
-        os::windows::io::AsRawHandle,
-    };
+fn create_windows_publish_temporary(
+    parent: &Path,
+) -> Result<tempfile::NamedTempFile, PlatformError> {
+    use std::os::windows::fs::OpenOptionsExt;
 
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_RENAME_INFO, FileRenameInfo, SetFileInformationByHandle,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
 
+    tempfile::Builder::new()
+        .prefix(".wokcore-publish-")
+        .make_in(parent, |path| {
+            fs::OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .write(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .open(path)
+        })
+        .map_err(PlatformError::from)
+}
+
+#[cfg(windows)]
+fn replace_windows_file(
+    destination: &Path,
+    replacement: &Path,
+    retired: &Path,
+) -> Result<(), PlatformError> {
     use std::os::windows::ffi::OsStrExt;
 
-    let destination = destination.as_os_str().encode_wide().collect::<Vec<_>>();
-    let buffer_size = offset_of!(FILE_RENAME_INFO, FileName) + size_of_val(destination.as_slice());
-    let mut buffer = vec![0_usize; buffer_size.div_ceil(size_of::<usize>())];
-    let information = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
-    unsafe {
-        (*information).Anonymous.ReplaceIfExists = false;
-        (*information).RootDirectory = std::ptr::null_mut();
-        (*information).FileNameLength = size_of_val(destination.as_slice()) as u32;
-        std::ptr::copy_nonoverlapping(
-            destination.as_ptr(),
-            (&raw mut (*information).FileName).cast::<u16>(),
-            destination.len(),
-        );
-    }
+    use windows_sys::Win32::Storage::FileSystem::{REPLACEFILE_WRITE_THROUGH, ReplaceFileW};
+
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let replacement = replacement
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let retired = retired
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
     if unsafe {
-        SetFileInformationByHandle(
-            file.as_raw_handle(),
-            FileRenameInfo,
-            information.cast(),
-            buffer_size as u32,
+        ReplaceFileW(
+            destination.as_ptr(),
+            replacement.as_ptr(),
+            retired.as_ptr(),
+            REPLACEFILE_WRITE_THROUGH,
+            std::ptr::null(),
+            std::ptr::null(),
         )
     } == 0
     {
-        let source = std::io::Error::last_os_error();
-        return Err(match source.kind() {
-            std::io::ErrorKind::AlreadyExists => PlatformError::UnsafeRuntimePath,
-            _ => PlatformError::Io { source },
+        return Err(PlatformError::Io {
+            source: std::io::Error::last_os_error(),
         });
     }
     Ok(())
@@ -1351,6 +1487,13 @@ pub(super) fn open_or_create_runtime_directory(_path: &Path) -> Result<File, Pla
 }
 
 #[cfg(not(any(unix, windows)))]
+pub(super) fn runtime_directory_identity(
+    _directory: &File,
+) -> Result<RuntimeDirectoryIdentity, PlatformError> {
+    Err(PlatformError::UnsafeRuntimePath)
+}
+
+#[cfg(not(any(unix, windows)))]
 pub(super) fn open_existing_secure_file_for_update(
     _directory: &File,
     _path: &Path,
@@ -1426,7 +1569,7 @@ mod publish_tests {
     use super::open_existing_secure_file_for_update;
     use super::{
         open_or_create_runtime_directory, prepare_secure_publish, publish_secure_file,
-        with_publish_after_temp_creation_hook,
+        with_publish_after_existing_commit_hook, with_publish_after_temp_creation_hook,
     };
 
     #[test]
@@ -1472,6 +1615,79 @@ mod publish_tests {
         assert_eq!(fs::read(discovery).unwrap(), b"replacement");
     }
 
+    #[test]
+    fn interrupted_existing_publish_never_exposes_a_missing_canonical_entry() {
+        use std::sync::{Arc, Mutex};
+
+        let root = tempfile::tempdir().unwrap();
+        let runtime_path = root.path().join("runtime");
+        let runtime = open_or_create_runtime_directory(&runtime_path).unwrap();
+        let discovery = runtime_path.join("discovery.json");
+        publish_secure_file(&runtime, &discovery, b"old document", None).unwrap();
+        let existing = open_existing_secure_file_for_update(&runtime, &discovery).unwrap();
+        let observed = Arc::new(Mutex::new(None));
+        let observed_during_commit = Arc::clone(&observed);
+        let discovery_during_commit = discovery.clone();
+
+        let result = with_publish_after_existing_commit_hook(
+            move || {
+                let read = fs::read(&discovery_during_commit);
+                *observed_during_commit.lock().unwrap() = read.ok();
+                Err(PlatformError::Io {
+                    source: io::Error::other("injected interruption at the commit boundary"),
+                })
+            },
+            || publish_secure_file(&runtime, &discovery, b"new document", Some(existing)),
+        );
+
+        assert!(
+            matches!(
+                &result,
+                Err(PlatformError::Io { source })
+                    if source.kind() == std::io::ErrorKind::Other
+            ),
+            "the commit hook must be the observed failure, got {result:?}"
+        );
+        assert_eq!(
+            observed.lock().unwrap().take(),
+            Some(b"new document".to_vec())
+        );
+        assert_eq!(fs::read(discovery).unwrap(), b"new document");
+        let retained = fs::read_dir(&runtime_path)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .find(|entry| entry.file_name().to_string_lossy().starts_with(".wokcore-"))
+            .expect("the interrupted commit must retain the old object");
+        assert_eq!(fs::read(retained.path()).unwrap(), b"old document");
+    }
+
+    #[test]
+    fn failed_existing_publish_before_commit_preserves_the_old_canonical_entry() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime_path = root.path().join("runtime");
+        let runtime = open_or_create_runtime_directory(&runtime_path).unwrap();
+        let discovery = runtime_path.join("discovery.json");
+        publish_secure_file(&runtime, &discovery, b"old document", None).unwrap();
+        let existing = open_existing_secure_file_for_update(&runtime, &discovery).unwrap();
+
+        let result = with_publish_after_temp_creation_hook(
+            || {
+                Err(PlatformError::Io {
+                    source: io::Error::other("injected failure before the atomic commit"),
+                })
+            },
+            || publish_secure_file(&runtime, &discovery, b"new document", Some(existing)),
+        );
+
+        assert!(matches!(result, Err(PlatformError::Io { .. })));
+        assert_eq!(fs::read(&discovery).unwrap(), b"old document");
+        prepare_secure_publish(&runtime, &runtime_path).unwrap();
+        assert_eq!(
+            directory_entries(&runtime_path),
+            vec![discovery.file_name().unwrap().to_owned()]
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn unix_publish_retains_an_existing_destination_swapped_after_precheck() {
@@ -1497,24 +1713,15 @@ mod publish_tests {
         );
 
         assert!(matches!(result, Err(PlatformError::UnsafeRuntimePath)));
-        assert!(!discovery.exists());
+        assert_eq!(fs::read(discovery).unwrap(), b"replacement");
         assert_eq!(fs::read(original).unwrap(), b"original");
-        let mut retained = fs::read_dir(&runtime_path)
+        let retained = fs::read_dir(&runtime_path)
             .unwrap()
             .map(|entry| entry.unwrap())
-            .filter(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(super::TOMBSTONE_PREFIX)
-            })
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(".wokcore-"))
             .map(|entry| fs::read(entry.path()).unwrap())
             .collect::<Vec<_>>();
-        retained.sort();
-        assert_eq!(
-            retained,
-            vec![b"new document".to_vec(), b"replacement".to_vec()]
-        );
+        assert_eq!(retained, vec![b"new document".to_vec()]);
     }
 
     #[cfg(windows)]
@@ -1559,11 +1766,7 @@ mod publish_tests {
     #[cfg(unix)]
     fn assert_post_failure_entries(entries: &[std::ffi::OsString]) {
         assert_eq!(entries.len(), 1);
-        assert!(
-            entries[0]
-                .to_string_lossy()
-                .starts_with(super::TOMBSTONE_PREFIX)
-        );
+        assert_eq!(entries[0], super::PUBLISH_STAGING_NAME);
     }
 
     #[cfg(windows)]

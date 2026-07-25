@@ -116,6 +116,37 @@ fn exec_child_does_not_extend_the_runtime_lease_lifetime() {
 
 #[cfg(unix)]
 #[test]
+fn replacing_the_runtime_directory_path_does_not_create_a_second_lock_domain() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempdir().unwrap();
+    let paths = test_paths(directory.path());
+    let moved_runtime = directory.path().join("original-runtime");
+    let owner = RuntimeLease::acquire(&paths).unwrap();
+
+    fs::rename(&paths.runtime_dir, &moved_runtime).unwrap();
+    fs::create_dir(&paths.runtime_dir).unwrap();
+    fs::set_permissions(&paths.runtime_dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert!(matches!(
+        RuntimeLease::acquire(&paths),
+        Err(PlatformError::AlreadyRunning)
+    ));
+    drop(owner);
+}
+
+#[cfg(unix)]
+#[test]
+fn different_runtime_paths_have_independent_lock_domains() {
+    let directory = tempdir().unwrap();
+    let first = RuntimeLease::acquire(&test_paths(&directory.path().join("first"))).unwrap();
+    let second = RuntimeLease::acquire(&test_paths(&directory.path().join("second"))).unwrap();
+
+    drop((first, second));
+}
+
+#[cfg(unix)]
+#[test]
 #[ignore = "spawned only by exec_child_does_not_extend_the_runtime_lease_lifetime"]
 fn exec_waiting_child_helper() {
     let ready = env::var_os("WOKCORE_TEST_EXEC_CHILD_READY").unwrap();
