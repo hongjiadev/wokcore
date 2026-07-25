@@ -61,6 +61,11 @@ jobs:
         with:
           toolchain: 1.97.1
           target: ${{ matrix.target }}
+      - name: Install Linux ARM64 cross compiler
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes gcc-aarch64-linux-gnu
       - name: Check target
         run: cargo check --workspace --all-features --locked --target ${{ matrix.target }}
 
