@@ -115,7 +115,8 @@ The private pre-rewrite recovery bundle is stored in WokDocs, not this public re
 
 ## Runtime import 4 review hardening
 
-- Test-only `syn` and `proc-macro2` parsing structurally rejects native credential entry/store access from every integration test, every `#[cfg(test)]`/test item, and every `*_tests.rs` unit-test file; detector fixtures cover whitespace, UFCS/function paths, aliases, macros, and newly added test files without treating string literals as calls.
+- Test-only `syn` and `proc-macro2` parsing scans every Rust source file and recursively follows test-reachable external modules, including unannotated helpers and `#[path]` modules; unresolved or unknown test module shapes fail closed.
+- Direct keyring entry operations and `NativeSecretStore` references are structurally limited to the exact native backend definition, its designated `SecretStore` implementation, and the two exact public re-exports. The gate covers item, statement, expression, local, `cfg`/`cfg_attr`, alias, UFCS, and macro-token shapes without treating string literals as calls; it is a source-structure guarantee rather than whole-program call-graph proof.
 - The bounded file reader now accepts a `Read` source and capacity hint, reads through `take(limit + 1)`, and has paired exact-64-KiB/one-byte-over tests plus a cursor-position assertion proving that it does not consume beyond the bound.
 - The actual invalid-UTF-8 decode path exposes a test-only post-zeroization observer; mutation evidence proves the assertion fails when the production zeroization statement is removed.
 - Windows tests replace inherited temporary-file permissions with an explicit protected DACL, verify successful access with only the current-user allow ACE, then verify fail-closed behavior after adding an Everyone allow ACE.

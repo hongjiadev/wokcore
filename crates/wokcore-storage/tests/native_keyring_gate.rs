@@ -1,11 +1,15 @@
 use std::{
+    collections::HashSet,
     fs, io,
     path::{Path, PathBuf},
 };
 
 use proc_macro2::{TokenStream, TokenTree};
 use syn::{
-    Attribute, ForeignItem, ImplItem, Item, Macro, Meta, Path as SyntaxPath, TraitItem, UseTree,
+    Attribute, Expr, ForeignItem, ImplItem, Item, ItemImpl, ItemMod, ItemStruct, ItemUse, Local,
+    Macro, Meta, PathArguments, StmtMacro, TraitItem, Type, UseTree, Visibility,
+    parse::Parser,
+    punctuated::Punctuated,
     visit::{self, Visit},
 };
 
@@ -26,33 +30,81 @@ fn detect_forbidden_native_access(
 }
 
 fn scan_crate_test_sources(manifest_dir: &Path) -> io::Result<Vec<String>> {
-    let mut sources = Vec::new();
-    collect_rust_files(&manifest_dir.join("tests"), &mut sources)?;
-    collect_rust_files(&manifest_dir.join("src"), &mut sources)?;
-
+    let src_dir = manifest_dir.join("src");
     let tests_dir = manifest_dir.join("tests");
+    let mut source_files = Vec::new();
+    let mut test_files = Vec::new();
+    collect_rust_files(&src_dir, &mut source_files)?;
+    collect_rust_files(&tests_dir, &mut test_files)?;
+
     let mut violations = Vec::new();
-    for path in sources {
-        let source = fs::read_to_string(&path)?;
-        let scan_entire_file = path.starts_with(&tests_dir)
-            || path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.ends_with("_tests.rs"));
-        let detected =
-            detect_forbidden_native_access(&source, scan_entire_file).map_err(|error| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("failed to parse {}: {error}", path.display()),
-                )
-            })?;
-        violations.extend(
-            detected
-                .into_iter()
-                .map(|violation| format!("{}: {violation}", path.display())),
+    let mut scanned_entirely = HashSet::new();
+    for path in &source_files {
+        let source = fs::read_to_string(path)?;
+        let syntax = parse_source(path, &source)?;
+        let relative = path.strip_prefix(&src_dir).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("failed to relativize {}: {error}", path.display()),
+            )
+        })?;
+        append_violations(
+            path,
+            detect_forbidden_production_access(relative, &syntax),
+            &mut violations,
         );
+        scanned_entirely.insert(canonical_path(path)?);
+    }
+    for path in &test_files {
+        let source = fs::read_to_string(path)?;
+        let detected = detect_forbidden_native_access(&source, true)
+            .map_err(|error| parse_error(path, error))?;
+        append_violations(path, detected, &mut violations);
+        scanned_entirely.insert(canonical_path(path)?);
+    }
+
+    let mut module_files = source_files;
+    module_files.extend(test_files);
+    let mut visited_modules = HashSet::new();
+    for path in module_files {
+        let path_is_test = path.starts_with(&tests_dir);
+        scan_test_modules(
+            &path,
+            path_is_test,
+            &scanned_entirely,
+            &mut visited_modules,
+            &mut violations,
+        )?;
     }
     Ok(violations)
+}
+
+fn parse_source(path: &Path, source: &str) -> io::Result<syn::File> {
+    syn::parse_file(source).map_err(|error| parse_error(path, error))
+}
+
+fn parse_error(path: &Path, error: syn::Error) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("failed to parse {}: {error}", path.display()),
+    )
+}
+
+fn append_violations(path: &Path, detected: Vec<String>, violations: &mut Vec<String>) {
+    violations.extend(
+        detected
+            .into_iter()
+            .map(|violation| format!("{}: {violation}", path.display())),
+    );
+}
+
+fn canonical_path(path: &Path) -> io::Result<PathBuf> {
+    path.canonicalize().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("failed to resolve {}: {error}", path.display()),
+        )
+    })
 }
 
 fn collect_rust_files(directory: &Path, paths: &mut Vec<PathBuf>) -> io::Result<()> {
@@ -70,14 +122,355 @@ fn collect_rust_files(directory: &Path, paths: &mut Vec<PathBuf>) -> io::Result<
     Ok(())
 }
 
+fn detect_forbidden_production_access(relative: &Path, syntax: &syn::File) -> Vec<String> {
+    let relative = relative.to_string_lossy().replace('\\', "/");
+    let allowed_reexport = match relative.as_str() {
+        "lib.rs" => Some(&["secrets", "NativeSecretStore"][..]),
+        "secrets/mod.rs" => Some(&["native", "NativeSecretStore"][..]),
+        _ => None,
+    };
+    if relative == "secrets/native.rs" {
+        return detect_native_boundary_violations(syntax);
+    }
+
+    let mut violations = Vec::new();
+    for item in &syntax.items {
+        let allow_native_reexport = match (allowed_reexport, item) {
+            (Some(expected), Item::Use(item_use)) => is_exact_public_reexport(item_use, expected),
+            _ => false,
+        };
+        let mut visitor = ForbiddenNativeAccess::with_native_store_allowed(allow_native_reexport);
+        visitor.visit_item(item);
+        violations.extend(visitor.violations);
+    }
+    violations
+}
+
+fn detect_native_boundary_violations(syntax: &syn::File) -> Vec<String> {
+    let mut violations = Vec::new();
+    for item in &syntax.items {
+        match item {
+            Item::Use(item_use) if is_exact_keyring_import(item_use) => {}
+            Item::Struct(item_struct) if is_exact_native_store_struct(item_struct) => {}
+            Item::Impl(item_impl) if is_native_store_inherent_impl(item_impl) => {
+                let mut visitor = ForbiddenNativeAccess::default();
+                for impl_item in &item_impl.items {
+                    visitor.visit_impl_item(impl_item);
+                }
+                violations.extend(visitor.violations);
+            }
+            Item::Impl(item_impl) if is_native_store_trait_impl(item_impl) => {}
+            _ => {
+                let mut visitor = ForbiddenNativeAccess::default();
+                visitor.visit_item(item);
+                violations.extend(visitor.violations);
+            }
+        }
+    }
+    violations
+}
+
+fn is_exact_keyring_import(item: &ItemUse) -> bool {
+    if !matches!(item.vis, Visibility::Inherited) || item.leading_colon.is_some() {
+        return false;
+    }
+    let mut leaves = Vec::new();
+    flatten_use_tree(&item.tree, &mut Vec::new(), &mut leaves);
+    leaves.sort();
+    leaves
+        == [
+            (
+                vec!["keyring".to_owned(), "Entry".to_owned()],
+                None::<String>,
+            ),
+            (
+                vec!["keyring".to_owned(), "Error".to_owned()],
+                Some("KeyringError".to_owned()),
+            ),
+        ]
+}
+
+fn is_exact_public_reexport(item: &ItemUse, expected: &[&str]) -> bool {
+    if !matches!(item.vis, Visibility::Public(_)) || item.leading_colon.is_some() {
+        return false;
+    }
+    let mut leaves = Vec::new();
+    flatten_use_tree(&item.tree, &mut Vec::new(), &mut leaves);
+    let native_leaves = leaves
+        .iter()
+        .filter(|(path, _)| path.last().is_some_and(|name| name == "NativeSecretStore"))
+        .collect::<Vec<_>>();
+    native_leaves.len() == 1
+        && native_leaves[0]
+            .0
+            .iter()
+            .map(String::as_str)
+            .eq(expected.iter().copied())
+        && native_leaves[0].1.is_none()
+}
+
+fn flatten_use_tree(
+    tree: &UseTree,
+    prefix: &mut Vec<String>,
+    leaves: &mut Vec<(Vec<String>, Option<String>)>,
+) {
+    match tree {
+        UseTree::Path(path) => {
+            prefix.push(path.ident.to_string());
+            flatten_use_tree(&path.tree, prefix, leaves);
+            prefix.pop();
+        }
+        UseTree::Name(name) => {
+            let mut path = prefix.clone();
+            path.push(name.ident.to_string());
+            leaves.push((path, None));
+        }
+        UseTree::Rename(rename) => {
+            let mut path = prefix.clone();
+            path.push(rename.ident.to_string());
+            leaves.push((path, Some(rename.rename.to_string())));
+        }
+        UseTree::Group(group) => {
+            for tree in &group.items {
+                flatten_use_tree(tree, prefix, leaves);
+            }
+        }
+        UseTree::Glob(_) => {
+            let mut path = prefix.clone();
+            path.push("*".to_owned());
+            leaves.push((path, None));
+        }
+    }
+}
+
+fn is_exact_native_store_struct(item: &ItemStruct) -> bool {
+    item.ident == "NativeSecretStore"
+        && matches!(item.vis, Visibility::Public(_))
+        && matches!(item.fields, syn::Fields::Unit)
+        && item.generics.params.is_empty()
+        && item.generics.where_clause.is_none()
+}
+
+fn is_native_store_inherent_impl(item: &ItemImpl) -> bool {
+    is_plain_impl(item)
+        && item.trait_.is_none()
+        && type_is_named(&item.self_ty, "NativeSecretStore")
+}
+
+fn is_native_store_trait_impl(item: &ItemImpl) -> bool {
+    is_plain_impl(item)
+        && item.trait_.as_ref().is_some_and(|(_, path, _)| {
+            path.leading_colon.is_none()
+                && path.segments.len() == 1
+                && path.segments[0].ident == "SecretStore"
+                && matches!(path.segments[0].arguments, PathArguments::None)
+        })
+        && type_is_named(&item.self_ty, "NativeSecretStore")
+}
+
+fn is_plain_impl(item: &ItemImpl) -> bool {
+    item.defaultness.is_none()
+        && item.unsafety.is_none()
+        && item.generics.params.is_empty()
+        && item.generics.where_clause.is_none()
+}
+
+fn type_is_named(ty: &Type, expected: &str) -> bool {
+    matches!(
+        ty,
+        Type::Path(path)
+            if path.qself.is_none()
+                && path.path.segments.len() == 1
+                && path.path.segments[0].ident == expected
+                && matches!(path.path.segments[0].arguments, PathArguments::None)
+    )
+}
+
+fn scan_test_modules(
+    path: &Path,
+    test_mode: bool,
+    scanned_entirely: &HashSet<PathBuf>,
+    visited: &mut HashSet<(PathBuf, bool)>,
+    violations: &mut Vec<String>,
+) -> io::Result<()> {
+    let canonical = canonical_path(path)?;
+    if !visited.insert((canonical.clone(), test_mode)) {
+        return Ok(());
+    }
+
+    let source = fs::read_to_string(&canonical)?;
+    let syntax = parse_source(&canonical, &source)?;
+    if test_mode && !scanned_entirely.contains(&canonical) {
+        let detected = detect_forbidden_native_access(&source, true)
+            .map_err(|error| parse_error(&canonical, error))?;
+        append_violations(&canonical, detected, violations);
+    }
+
+    let module_dir = module_directory(&canonical);
+    scan_item_modules(
+        &syntax.items,
+        &canonical,
+        &module_dir,
+        test_mode,
+        scanned_entirely,
+        visited,
+        violations,
+    )
+}
+
+fn scan_item_modules(
+    items: &[Item],
+    source_path: &Path,
+    module_dir: &Path,
+    inherited_test_mode: bool,
+    scanned_entirely: &HashSet<PathBuf>,
+    visited: &mut HashSet<(PathBuf, bool)>,
+    violations: &mut Vec<String>,
+) -> io::Result<()> {
+    for item in items {
+        let Item::Mod(item_mod) = item else {
+            continue;
+        };
+        let module_test_mode =
+            inherited_test_mode || item_mod.attrs.iter().any(attribute_marks_test_code);
+
+        if let Some((_, items)) = &item_mod.content {
+            let child_module_dir = module_dir.join(item_mod.ident.to_string());
+            scan_item_modules(
+                items,
+                source_path,
+                &child_module_dir,
+                module_test_mode,
+                scanned_entirely,
+                visited,
+                violations,
+            )?;
+        } else if module_test_mode {
+            let module_path = resolve_external_module(item_mod, source_path, module_dir)?;
+            scan_test_modules(&module_path, true, scanned_entirely, visited, violations)?;
+        }
+    }
+    Ok(())
+}
+
+fn module_directory(path: &Path) -> PathBuf {
+    let parent = path.parent().unwrap_or_else(|| Path::new(""));
+    match path.file_name().and_then(|name| name.to_str()) {
+        Some("lib.rs" | "main.rs" | "mod.rs") => parent.to_path_buf(),
+        _ => path
+            .file_stem()
+            .map_or_else(|| parent.to_path_buf(), |stem| parent.join(stem)),
+    }
+}
+
+fn resolve_external_module(
+    item: &ItemMod,
+    source_path: &Path,
+    module_dir: &Path,
+) -> io::Result<PathBuf> {
+    if let Some(path) = module_path_attribute(item)? {
+        let parent = source_path.parent().unwrap_or_else(|| Path::new(""));
+        let candidate = parent.join(path);
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "test module {} declared in {} resolves to missing path {}",
+                item.ident,
+                source_path.display(),
+                candidate.display()
+            ),
+        ));
+    }
+
+    let name = item.ident.to_string();
+    let candidates = [
+        module_dir.join(format!("{name}.rs")),
+        module_dir.join(&name).join("mod.rs"),
+    ];
+    let existing = candidates
+        .iter()
+        .filter(|candidate| candidate.is_file())
+        .collect::<Vec<_>>();
+    match existing.as_slice() {
+        [path] => Ok((*path).to_path_buf()),
+        [] => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "test module {} declared in {} could not be resolved",
+                item.ident,
+                source_path.display()
+            ),
+        )),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "test module {} declared in {} is ambiguous: {} and {}",
+                item.ident,
+                source_path.display(),
+                candidates[0].display(),
+                candidates[1].display()
+            ),
+        )),
+    }
+}
+
+fn module_path_attribute(item: &ItemMod) -> io::Result<Option<PathBuf>> {
+    let mut result = None;
+    for attribute in item
+        .attrs
+        .iter()
+        .filter(|attribute| attribute.path().is_ident("path"))
+    {
+        let Meta::NameValue(name_value) = &attribute.meta else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("module {} has an invalid path attribute", item.ident),
+            ));
+        };
+        let Expr::Lit(expression) = &name_value.value else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("module {} has a non-literal path attribute", item.ident),
+            ));
+        };
+        let syn::Lit::Str(path) = &expression.lit else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("module {} has a non-string path attribute", item.ident),
+            ));
+        };
+        if result.replace(PathBuf::from(path.value())).is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("module {} has multiple path attributes", item.ident),
+            ));
+        }
+    }
+    Ok(result)
+}
+
 #[derive(Default)]
 struct ForbiddenNativeAccess {
     violations: Vec<String>,
+    allow_native_store: bool,
 }
 
 impl ForbiddenNativeAccess {
+    fn with_native_store_allowed(allow_native_store: bool) -> Self {
+        Self {
+            violations: Vec::new(),
+            allow_native_store,
+        }
+    }
+
     fn check_identifier(&mut self, identifier: &syn::Ident) {
         let identifier = identifier.to_string();
+        if self.allow_native_store && identifier == "NativeSecretStore" {
+            return;
+        }
         if matches!(
             identifier.as_str(),
             "Entry" | "NativeSecretStore" | "set_password" | "get_password" | "delete_credential"
@@ -98,40 +491,12 @@ impl ForbiddenNativeAccess {
 }
 
 impl<'syntax> Visit<'syntax> for ForbiddenNativeAccess {
-    fn visit_expr_method_call(&mut self, expression: &'syntax syn::ExprMethodCall) {
-        self.check_identifier(&expression.method);
-        visit::visit_expr_method_call(self, expression);
-    }
-
-    fn visit_path(&mut self, path: &'syntax SyntaxPath) {
-        for segment in &path.segments {
-            self.check_identifier(&segment.ident);
-        }
-        visit::visit_path(self, path);
-    }
-
-    fn visit_use_tree(&mut self, tree: &'syntax UseTree) {
-        match tree {
-            UseTree::Path(path) => {
-                self.check_identifier(&path.ident);
-                self.visit_use_tree(&path.tree);
-            }
-            UseTree::Name(name) => self.check_identifier(&name.ident),
-            UseTree::Rename(rename) => {
-                self.check_identifier(&rename.ident);
-                self.check_identifier(&rename.rename);
-            }
-            UseTree::Group(group) => {
-                for item in &group.items {
-                    self.visit_use_tree(item);
-                }
-            }
-            UseTree::Glob(_) => {}
-        }
+    fn visit_ident(&mut self, identifier: &'syntax syn::Ident) {
+        self.check_identifier(identifier);
     }
 
     fn visit_macro(&mut self, item: &'syntax Macro) {
-        self.visit_path(&item.path);
+        visit::visit_macro(self, item);
         self.check_tokens(item.tokens.clone());
     }
 }
@@ -190,6 +555,39 @@ impl<'syntax> Visit<'syntax> for TestItemVisitor {
             visit::visit_foreign_item(self, item);
         }
     }
+
+    fn visit_local(&mut self, local: &'syntax Local) {
+        if local.attrs.iter().any(attribute_marks_test_code) {
+            let mut visitor = ForbiddenNativeAccess::default();
+            visitor.visit_local(local);
+            self.violations.extend(visitor.violations);
+        } else {
+            visit::visit_local(self, local);
+        }
+    }
+
+    fn visit_expr(&mut self, expression: &'syntax Expr) {
+        if expression_attributes(expression)
+            .iter()
+            .any(attribute_marks_test_code)
+        {
+            let mut visitor = ForbiddenNativeAccess::default();
+            visitor.visit_expr(expression);
+            self.violations.extend(visitor.violations);
+        } else {
+            visit::visit_expr(self, expression);
+        }
+    }
+
+    fn visit_stmt_macro(&mut self, statement: &'syntax StmtMacro) {
+        if statement.attrs.iter().any(attribute_marks_test_code) {
+            let mut visitor = ForbiddenNativeAccess::default();
+            visitor.visit_stmt_macro(statement);
+            self.violations.extend(visitor.violations);
+        } else {
+            visit::visit_stmt_macro(self, statement);
+        }
+    }
 }
 
 fn item_attributes(item: &Item) -> &[Attribute] {
@@ -243,6 +641,51 @@ fn foreign_item_attributes(item: &ForeignItem) -> &[Attribute] {
     }
 }
 
+fn expression_attributes(expression: &Expr) -> &[Attribute] {
+    match expression {
+        Expr::Array(expression) => &expression.attrs,
+        Expr::Assign(expression) => &expression.attrs,
+        Expr::Async(expression) => &expression.attrs,
+        Expr::Await(expression) => &expression.attrs,
+        Expr::Binary(expression) => &expression.attrs,
+        Expr::Block(expression) => &expression.attrs,
+        Expr::Break(expression) => &expression.attrs,
+        Expr::Call(expression) => &expression.attrs,
+        Expr::Cast(expression) => &expression.attrs,
+        Expr::Closure(expression) => &expression.attrs,
+        Expr::Const(expression) => &expression.attrs,
+        Expr::Continue(expression) => &expression.attrs,
+        Expr::Field(expression) => &expression.attrs,
+        Expr::ForLoop(expression) => &expression.attrs,
+        Expr::Group(expression) => &expression.attrs,
+        Expr::If(expression) => &expression.attrs,
+        Expr::Index(expression) => &expression.attrs,
+        Expr::Infer(expression) => &expression.attrs,
+        Expr::Let(expression) => &expression.attrs,
+        Expr::Lit(expression) => &expression.attrs,
+        Expr::Loop(expression) => &expression.attrs,
+        Expr::Macro(expression) => &expression.attrs,
+        Expr::Match(expression) => &expression.attrs,
+        Expr::MethodCall(expression) => &expression.attrs,
+        Expr::Paren(expression) => &expression.attrs,
+        Expr::Path(expression) => &expression.attrs,
+        Expr::Range(expression) => &expression.attrs,
+        Expr::RawAddr(expression) => &expression.attrs,
+        Expr::Reference(expression) => &expression.attrs,
+        Expr::Repeat(expression) => &expression.attrs,
+        Expr::Return(expression) => &expression.attrs,
+        Expr::Struct(expression) => &expression.attrs,
+        Expr::Try(expression) => &expression.attrs,
+        Expr::TryBlock(expression) => &expression.attrs,
+        Expr::Tuple(expression) => &expression.attrs,
+        Expr::Unary(expression) => &expression.attrs,
+        Expr::Unsafe(expression) => &expression.attrs,
+        Expr::While(expression) => &expression.attrs,
+        Expr::Yield(expression) => &expression.attrs,
+        _ => &[],
+    }
+}
+
 fn attribute_marks_test_code(attribute: &Attribute) -> bool {
     if attribute
         .path()
@@ -254,18 +697,97 @@ fn attribute_marks_test_code(attribute: &Attribute) -> bool {
     }
     match &attribute.meta {
         Meta::List(list) if list.path.is_ident("cfg") => {
-            tokens_contain_identifier(list.tokens.clone(), "test")
+            matches!(
+                parse_cfg_predicate(list),
+                TestCfgRelation::Positive | TestCfgRelation::Unknown
+            )
+        }
+        Meta::List(list) if list.path.is_ident("cfg_attr") => {
+            matches!(
+                parse_cfg_attr_predicate(list),
+                TestCfgRelation::Positive | TestCfgRelation::Unknown
+            )
         }
         _ => false,
     }
 }
 
-fn tokens_contain_identifier(tokens: TokenStream, expected: &str) -> bool {
-    tokens.into_iter().any(|token| match token {
-        TokenTree::Ident(identifier) => identifier == expected,
-        TokenTree::Group(group) => tokens_contain_identifier(group.stream(), expected),
-        TokenTree::Punct(_) | TokenTree::Literal(_) => false,
-    })
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TestCfgRelation {
+    Positive,
+    Negative,
+    Unrelated,
+    Unknown,
+}
+
+fn parse_cfg_predicate(list: &syn::MetaList) -> TestCfgRelation {
+    match parse_meta_arguments(list) {
+        Ok(arguments) if arguments.len() == 1 => cfg_relation(&arguments[0]),
+        _ => TestCfgRelation::Unknown,
+    }
+}
+
+fn parse_cfg_attr_predicate(list: &syn::MetaList) -> TestCfgRelation {
+    match parse_meta_arguments(list) {
+        Ok(arguments) if arguments.len() >= 2 => cfg_relation(&arguments[0]),
+        _ => TestCfgRelation::Unknown,
+    }
+}
+
+fn parse_meta_arguments(list: &syn::MetaList) -> syn::Result<Punctuated<Meta, syn::Token![,]>> {
+    Punctuated::<Meta, syn::Token![,]>::parse_terminated.parse2(list.tokens.clone())
+}
+
+fn cfg_relation(meta: &Meta) -> TestCfgRelation {
+    match meta {
+        Meta::Path(path) if path.is_ident("test") => TestCfgRelation::Positive,
+        Meta::Path(_) | Meta::NameValue(_) => TestCfgRelation::Unrelated,
+        Meta::List(list) if list.path.is_ident("not") => match parse_cfg_predicate(list) {
+            TestCfgRelation::Positive => TestCfgRelation::Negative,
+            TestCfgRelation::Negative => TestCfgRelation::Positive,
+            TestCfgRelation::Unrelated => TestCfgRelation::Unrelated,
+            TestCfgRelation::Unknown => TestCfgRelation::Unknown,
+        },
+        Meta::List(list) if list.path.is_ident("any") => combine_any(parse_meta_arguments(list)),
+        Meta::List(list) if list.path.is_ident("all") => combine_all(parse_meta_arguments(list)),
+        Meta::List(_) => TestCfgRelation::Unknown,
+    }
+}
+
+fn combine_any(arguments: syn::Result<Punctuated<Meta, syn::Token![,]>>) -> TestCfgRelation {
+    let Ok(arguments) = arguments else {
+        return TestCfgRelation::Unknown;
+    };
+    let relations = arguments.iter().map(cfg_relation).collect::<Vec<_>>();
+    if relations.contains(&TestCfgRelation::Positive) {
+        TestCfgRelation::Positive
+    } else if relations.contains(&TestCfgRelation::Unknown) {
+        TestCfgRelation::Unknown
+    } else if !relations.is_empty()
+        && relations
+            .iter()
+            .all(|relation| *relation == TestCfgRelation::Negative)
+    {
+        TestCfgRelation::Negative
+    } else {
+        TestCfgRelation::Unrelated
+    }
+}
+
+fn combine_all(arguments: syn::Result<Punctuated<Meta, syn::Token![,]>>) -> TestCfgRelation {
+    let Ok(arguments) = arguments else {
+        return TestCfgRelation::Unknown;
+    };
+    let relations = arguments.iter().map(cfg_relation).collect::<Vec<_>>();
+    if relations.contains(&TestCfgRelation::Negative) {
+        TestCfgRelation::Negative
+    } else if relations.contains(&TestCfgRelation::Positive) {
+        TestCfgRelation::Positive
+    } else if relations.contains(&TestCfgRelation::Unknown) {
+        TestCfgRelation::Unknown
+    } else {
+        TestCfgRelation::Unrelated
+    }
 }
 
 #[test]
@@ -323,7 +845,7 @@ fn detector_ignores_fixture_strings_containing_forbidden_spellings() {
 }
 
 #[test]
-fn scanner_covers_integration_cfg_test_and_tests_suffix_files_only() {
+fn scanner_covers_integration_cfg_test_tests_suffix_and_production_files() {
     let directory = tempfile::tempdir().unwrap();
     fs::create_dir_all(directory.path().join("tests/nested")).unwrap();
     fs::create_dir_all(directory.path().join("src")).unwrap();
@@ -335,7 +857,7 @@ fn scanner_covers_integration_cfg_test_and_tests_suffix_files_only() {
     fs::write(
         directory.path().join("src/inline.rs"),
         r#"
-            fn production_is_not_tested() { keyring::Entry::new("s", "a"); }
+            fn production_is_scanned() { keyring::Entry::new("s", "a"); }
             #[cfg(test)]
             mod tests {
                 #[test]
@@ -365,7 +887,7 @@ fn scanner_covers_integration_cfg_test_and_tests_suffix_files_only() {
             "scanner missed {expected_file}: {violations:?}"
         );
     }
-    assert_eq!(violations.len(), 4);
+    assert_eq!(violations.len(), 5);
 }
 
 #[test]
@@ -377,5 +899,268 @@ fn crate_tests_never_access_real_native_credentials() {
         violations.is_empty(),
         "test code accesses native credentials:\n{}",
         violations.join("\n")
+    );
+}
+
+#[test]
+fn scanner_follows_external_test_modules_recursive_helpers_and_path_modules() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir_all(directory.path().join("src")).unwrap();
+    fs::create_dir_all(directory.path().join("shared")).unwrap();
+    fs::create_dir_all(directory.path().join("tests")).unwrap();
+    fs::write(
+        directory.path().join("src/lib.rs"),
+        r#"
+            #[cfg(test)]
+            mod external;
+            #[cfg(test)]
+            #[path = "../shared/helper.rs"]
+            mod custom;
+        "#,
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("src/external.rs"),
+        r#"
+            fn unmarked_helper() { credential.set_password("secret"); }
+            #[path = "../shared/nested.rs"]
+            mod nested;
+        "#,
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("shared/nested.rs"),
+        r#"fn recursive_helper() { keyring::Entry::new("service", "account"); }"#,
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("shared/helper.rs"),
+        r#"fn path_helper() { native.delete_credential(); }"#,
+    )
+    .unwrap();
+
+    let violations = scan_crate_test_sources(directory.path()).unwrap();
+
+    for expected_file in ["external.rs", "nested.rs", "helper.rs"] {
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(expected_file)),
+            "module graph missed {expected_file}: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn detector_covers_cfg_test_locals_statements_expressions_and_cfg_attr() {
+    let source = r#"
+        fn production_container() {
+            #[cfg(test)]
+            let credential = keyring::Entry::new("service", "account");
+            #[cfg(test)]
+            {
+                credential.set_password("secret");
+            }
+            #[cfg_attr(test, allow(unused_variables))]
+            let store = wokcore_storage::NativeSecretStore::new();
+        }
+    "#;
+
+    let violations = detect_forbidden_native_access(source, false).unwrap();
+
+    for expected in ["Entry", "set_password", "NativeSecretStore"] {
+        assert!(
+            violations.iter().any(|violation| violation == expected),
+            "cfg detector missed {expected}: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn cfg_not_test_is_not_classified_as_test_code() {
+    let source = r#"
+        #[cfg(not(test))]
+        fn production_only() {
+            keyring::Entry::new("service", "account");
+        }
+    "#;
+
+    assert!(
+        detect_forbidden_native_access(source, false)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn cfg_any_all_and_unknown_predicates_fail_closed_for_test_reachable_code() {
+    let source = r#"
+        #[cfg(any(test, windows))]
+        fn any_test_path() { keyring::Entry::new("service", "account"); }
+
+        #[cfg(all(unix, test))]
+        fn all_test_path() { credential.set_password("secret"); }
+
+        #[cfg(custom_predicate(test))]
+        fn unknown_test_predicate() {
+            wokcore_storage::NativeSecretStore::new();
+        }
+    "#;
+
+    let violations = detect_forbidden_native_access(source, false).unwrap();
+
+    for expected in ["Entry", "set_password", "NativeSecretStore"] {
+        assert!(
+            violations.iter().any(|violation| violation == expected),
+            "cfg predicate handling missed {expected}: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn scanner_fails_closed_when_a_test_reachable_module_cannot_be_resolved() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir_all(directory.path().join("src")).unwrap();
+    fs::write(
+        directory.path().join("src/lib.rs"),
+        "#[cfg(not(test))] mod production_only;",
+    )
+    .unwrap();
+
+    assert!(
+        scan_crate_test_sources(directory.path())
+            .unwrap()
+            .is_empty()
+    );
+
+    fs::write(
+        directory.path().join("src/lib.rs"),
+        "#[cfg(any(test, windows))] mod missing;",
+    )
+    .unwrap();
+    let error = scan_crate_test_sources(directory.path()).unwrap_err();
+
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("could not be resolved"));
+}
+
+#[test]
+fn source_policy_allows_only_exact_native_shapes_and_reexports() {
+    let exact_reexport = syn::parse_file("pub use secrets::NativeSecretStore;").unwrap();
+    assert!(detect_forbidden_production_access(Path::new("lib.rs"), &exact_reexport).is_empty());
+
+    for mutated_reexport in [
+        "pub(crate) use secrets::NativeSecretStore;",
+        "pub use secrets::NativeSecretStore as NativeSecretStore;",
+        "pub use other::NativeSecretStore;",
+    ] {
+        let syntax = syn::parse_file(mutated_reexport).unwrap();
+        assert!(
+            !detect_forbidden_production_access(Path::new("lib.rs"), &syntax).is_empty(),
+            "source policy allowed mutated reexport: {mutated_reexport}"
+        );
+    }
+
+    let exact_boundary = syn::parse_file(
+        r#"
+            use keyring::{Entry, Error as KeyringError};
+            pub struct NativeSecretStore;
+            impl NativeSecretStore {
+                pub const fn new() -> Self { Self }
+            }
+            impl SecretStore for NativeSecretStore {
+                fn get() {
+                    let entry = Entry::new("service", "account").unwrap();
+                    entry.get_password();
+                }
+            }
+        "#,
+    )
+    .unwrap();
+    assert!(
+        detect_forbidden_production_access(Path::new("secrets/native.rs"), &exact_boundary)
+            .is_empty()
+    );
+
+    let mutated_boundary = syn::parse_file(
+        r#"
+            use keyring::{Entry, Error as KeyringError};
+            pub struct NativeSecretStore { private: () }
+            impl NativeSecretStore {
+                pub const fn new() -> Self { Self { private: () } }
+            }
+            impl SecretStore for NativeSecretStore {}
+        "#,
+    )
+    .unwrap();
+    assert!(
+        !detect_forbidden_production_access(Path::new("secrets/native.rs"), &mutated_boundary)
+            .is_empty()
+    );
+}
+
+#[test]
+fn source_policy_rejects_production_wrappers_and_hidden_native_factories() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir_all(directory.path().join("src/secrets")).unwrap();
+    fs::create_dir_all(directory.path().join("tests")).unwrap();
+    fs::write(
+        directory.path().join("src/lib.rs"),
+        "pub use secrets::NativeSecretStore;",
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("src/secrets/mod.rs"),
+        "pub use native::NativeSecretStore;",
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("src/secrets/native.rs"),
+        r#"
+            use keyring::{Entry, Error as KeyringError};
+            pub struct NativeSecretStore;
+            impl NativeSecretStore {
+                pub const fn new() -> Self { Self }
+            }
+            impl SecretStore for NativeSecretStore {
+                fn allowed_boundary() {
+                    let entry = Entry::new("service", "account").unwrap();
+                    entry.get_password();
+                }
+            }
+            fn hidden_factory() -> NativeSecretStore {
+                NativeSecretStore::new()
+            }
+            macro_rules! hidden_native_wrapper {
+                () => { keyring::Entry::new("service", "account") };
+            }
+        "#,
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("src/wrapper.rs"),
+        "fn production_wrapper() { credential.delete_credential(); }",
+    )
+    .unwrap();
+
+    let violations = scan_crate_test_sources(directory.path()).unwrap();
+
+    for expected_file in ["native.rs", "wrapper.rs"] {
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(expected_file)),
+            "source policy missed {expected_file}: {violations:?}"
+        );
+    }
+    assert!(
+        !violations
+            .iter()
+            .any(|violation| violation.contains("lib.rs"))
+    );
+    assert!(
+        !violations
+            .iter()
+            .any(|violation| violation.contains("secrets\\mod.rs"))
     );
 }
