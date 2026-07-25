@@ -225,24 +225,6 @@ async fn concurrent_cancel_and_stop_cannot_roll_stopping_back_to_running() {
     assert_eq!(lifecycle.snapshot().phase, LifecyclePhase::Stopping);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn zero_active_notification_is_lost_wakeup_safe() {
-    let lifecycle = Arc::new(running_lifecycle());
-    let admission = lifecycle.admission_controller();
-
-    for _ in 0..1_000 {
-        let guard = admission.try_enter().unwrap();
-        let lifecycle_for_wait = Arc::clone(&lifecycle);
-        let waiter = tokio::spawn(async move {
-            lifecycle_for_wait.wait_for_zero_active().await;
-        });
-        yield_now().await;
-        drop(guard);
-        timeout(TEST_TIMEOUT, waiter).await.unwrap().unwrap();
-        assert_eq!(lifecycle.snapshot().active_requests, 0);
-    }
-}
-
 #[test]
 fn snapshots_are_immutable_values_and_starting_rejects_admission() {
     let lifecycle = ServiceLifecycle::new();

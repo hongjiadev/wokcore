@@ -156,14 +156,13 @@ impl SharedLifecycle {
 
     pub(crate) async fn wait_for_zero_active(&self) {
         loop {
+            // `notify_waiters` advances a generation captured when this future is created.
             let notified = self.zero_active.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            #[cfg(test)]
-            self.checkpoint(AdmissionTestPoint::NotifyRegistrationBeforeZeroCheck);
             if self.active_requests() == 0 {
                 return;
             }
+            #[cfg(test)]
+            self.checkpoint(AdmissionTestPoint::NonzeroCheckBeforeAwait);
             notified.await;
         }
     }
@@ -196,8 +195,8 @@ impl SharedLifecycle {
                 &self.test_hooks.after_increment_before_phase_recheck
             }
             AdmissionTestPoint::RunningPhaseRecheck => &self.test_hooks.after_running_phase_recheck,
-            AdmissionTestPoint::NotifyRegistrationBeforeZeroCheck => {
-                &self.test_hooks.after_notify_registration_before_zero_check
+            AdmissionTestPoint::NonzeroCheckBeforeAwait => {
+                &self.test_hooks.after_nonzero_check_before_await
             }
         };
         *slot.lock().unwrap() = Some(gate);
@@ -210,8 +209,8 @@ impl SharedLifecycle {
                 &self.test_hooks.after_increment_before_phase_recheck
             }
             AdmissionTestPoint::RunningPhaseRecheck => &self.test_hooks.after_running_phase_recheck,
-            AdmissionTestPoint::NotifyRegistrationBeforeZeroCheck => {
-                &self.test_hooks.after_notify_registration_before_zero_check
+            AdmissionTestPoint::NonzeroCheckBeforeAwait => {
+                &self.test_hooks.after_nonzero_check_before_await
             }
         };
         let gate = slot.lock().unwrap().take();
@@ -239,7 +238,7 @@ enum DecrementOutcome {
 enum AdmissionTestPoint {
     IncrementBeforePhaseRecheck,
     RunningPhaseRecheck,
-    NotifyRegistrationBeforeZeroCheck,
+    NonzeroCheckBeforeAwait,
 }
 
 #[cfg(test)]
@@ -247,7 +246,7 @@ enum AdmissionTestPoint {
 struct AdmissionTestHooks {
     after_increment_before_phase_recheck: std::sync::Mutex<Option<Arc<TestGate>>>,
     after_running_phase_recheck: std::sync::Mutex<Option<Arc<TestGate>>>,
-    after_notify_registration_before_zero_check: std::sync::Mutex<Option<Arc<TestGate>>>,
+    after_nonzero_check_before_await: std::sync::Mutex<Option<Arc<TestGate>>>,
     decrement_attempts: AtomicUsize,
 }
 
@@ -352,14 +351,14 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn zero_wait_registers_notification_before_the_active_check_window() {
+    async fn zero_wait_consumes_notification_delivered_after_a_nonzero_check() {
         let lifecycle = Arc::new(ServiceLifecycle::new());
         lifecycle.mark_running().unwrap();
         let admission = lifecycle.admission_controller();
         let guard = admission.try_enter().unwrap();
         let gate = Arc::new(TestGate::new());
         admission.shared.install_test_gate(
-            AdmissionTestPoint::NotifyRegistrationBeforeZeroCheck,
+            AdmissionTestPoint::NonzeroCheckBeforeAwait,
             Arc::clone(&gate),
         );
         let lifecycle_for_wait = Arc::clone(&lifecycle);
