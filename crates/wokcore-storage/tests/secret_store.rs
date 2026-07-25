@@ -227,6 +227,54 @@ async fn permissioned_file_store_rejects_modes_broader_than_owner_read_write() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn permissioned_file_store_rejects_a_fifo_without_blocking() {
+    use std::{
+        ffi::CString,
+        os::unix::ffi::OsStrExt,
+        time::{Duration, Instant},
+    };
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("secret.fifo");
+    let encoded_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(encoded_path.as_ptr(), 0o600) }, 0);
+    let writer_path = path.clone();
+    let delayed_writer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(250));
+        let encoded_path = CString::new(writer_path.as_os_str().as_bytes()).unwrap();
+        let descriptor =
+            unsafe { libc::open(encoded_path.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
+        if descriptor >= 0 {
+            unsafe {
+                libc::close(descriptor);
+            }
+        }
+    });
+    let secret_ref = SecretRef::new();
+    let store =
+        PermissionedFileSecretStore::from_config(HeadlessSecretStoreConfig::PermissionedFile {
+            secret_ref: secret_ref.clone(),
+            path,
+        })
+        .unwrap();
+
+    let started = Instant::now();
+    let result = store.get(&secret_ref).await;
+    let elapsed = started.elapsed();
+    delayed_writer.join().unwrap();
+
+    assert!(matches!(
+        result,
+        Err(StorageError::InsecureSecretFilePermissions)
+    ));
+    assert!(
+        elapsed < Duration::from_millis(200),
+        "FIFO open blocked for {elapsed:?}"
+    );
+}
+
 #[cfg(windows)]
 #[tokio::test]
 async fn permissioned_file_store_accepts_a_protected_user_dacl_and_rejects_other_principals() {

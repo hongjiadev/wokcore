@@ -1865,6 +1865,7 @@ dependencies = [
  "async-trait",
  "fs4",
  "keyring",
+ "libc",
  "proc-macro2",
  "rusqlite",
  "secrecy",

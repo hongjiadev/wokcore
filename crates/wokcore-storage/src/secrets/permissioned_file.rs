@@ -1,4 +1,8 @@
-use std::{fs::File, io::Read, path::PathBuf};
+use std::{
+    fs::{File, Metadata, OpenOptions},
+    io::Read,
+    path::{Path, PathBuf},
+};
 
 use secrecy::SecretString;
 use wokcore_core::secret::{SecretRef, SecretScope};
@@ -38,9 +42,8 @@ impl SecretStore for PermissionedFileSecretStore {
         if secret_ref != &self.secret_ref {
             return Err(StorageError::SecretNotFound);
         }
-        let mut file = File::open(&self.path).map_err(|source| StorageError::Io { source })?;
-        verify_permissions(&file)?;
-        let value = read_file_contents(&mut file)?;
+        let path = self.path.clone();
+        let value = run_blocking_secret_read(move || read_secret_file(&path)).await?;
         Ok(SecretString::from(value))
     }
 
@@ -52,14 +55,87 @@ impl SecretStore for PermissionedFileSecretStore {
     }
 }
 
+async fn run_blocking_secret_read(
+    operation: impl FnOnce() -> Result<String, StorageError> + Send + 'static,
+) -> Result<String, StorageError> {
+    tokio::task::spawn_blocking(operation)
+        .await
+        .map_err(|_| StorageError::SecretBackendFailure)?
+}
+
+fn read_secret_file(path: &Path) -> Result<String, StorageError> {
+    let mut file = open_secret_file(path)?;
+    let metadata = file
+        .metadata()
+        .map_err(|source| StorageError::Io { source })?;
+    verify_regular_file_type(&metadata)?;
+    verify_platform_file_type(&file)?;
+    verify_permissions(&file, &metadata)?;
+    read_regular_file_contents(&mut file, &metadata)
+}
+
+fn open_secret_file(path: &Path) -> Result<File, StorageError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    options
+        .open(path)
+        .map_err(|source| StorageError::Io { source })
+}
+
+#[cfg(test)]
 fn read_file_contents(file: &mut File) -> Result<String, StorageError> {
     let metadata = file
         .metadata()
         .map_err(|source| StorageError::Io { source })?;
+    verify_regular_file_type(&metadata)?;
+    read_regular_file_contents(file, &metadata)
+}
+
+fn read_regular_file_contents(
+    file: &mut File,
+    metadata: &Metadata,
+) -> Result<String, StorageError> {
     if metadata.len() > MAX_HEADLESS_SECRET_BYTES as u64 {
         return Err(StorageError::SecretTooLarge);
     }
     read_bounded_secret(file, metadata.len() as usize)
+}
+
+fn verify_regular_file_type(metadata: &Metadata) -> Result<(), StorageError> {
+    if !metadata.file_type().is_file() {
+        return Err(StorageError::InsecureSecretFilePermissions);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn verify_platform_file_type(file: &File) -> Result<(), StorageError> {
+    use std::os::windows::io::AsRawHandle;
+
+    verify_windows_disk_file_type(file.as_raw_handle())
+}
+
+#[cfg(windows)]
+fn verify_windows_disk_file_type(
+    handle: std::os::windows::io::RawHandle,
+) -> Result<(), StorageError> {
+    use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_DISK, GetFileType};
+
+    if unsafe { GetFileType(handle) } != FILE_TYPE_DISK {
+        return Err(StorageError::InsecureSecretFilePermissions);
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn verify_platform_file_type(_file: &File) -> Result<(), StorageError> {
+    Ok(())
 }
 
 fn read_bounded_secret(reader: impl Read, capacity_hint: usize) -> Result<String, StorageError> {
@@ -128,20 +204,22 @@ fn with_invalid_utf8_zeroize_observer<T>(
 }
 
 #[cfg(unix)]
-fn verify_permissions(file: &File) -> Result<(), StorageError> {
-    use std::os::unix::fs::PermissionsExt;
+fn verify_permissions(_file: &File, metadata: &Metadata) -> Result<(), StorageError> {
+    verify_unix_metadata(metadata, unsafe { libc::geteuid() })
+}
 
-    let metadata = file
-        .metadata()
-        .map_err(|source| StorageError::Io { source })?;
-    if metadata.permissions().mode() & 0o7177 != 0 {
+#[cfg(unix)]
+fn verify_unix_metadata(metadata: &Metadata, effective_uid: u32) -> Result<(), StorageError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    if metadata.uid() != effective_uid || metadata.permissions().mode() & 0o7177 != 0 {
         return Err(StorageError::InsecureSecretFilePermissions);
     }
     Ok(())
 }
 
 #[cfg(windows)]
-fn verify_permissions(file: &File) -> Result<(), StorageError> {
+fn verify_permissions(file: &File, _metadata: &Metadata) -> Result<(), StorageError> {
     use std::{ffi::c_void, mem::size_of, os::windows::io::AsRawHandle, ptr};
 
     use windows_sys::Win32::{
@@ -325,7 +403,7 @@ fn ace_type_is_non_granting(ace_type: u32) -> bool {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn verify_permissions(_file: &File) -> Result<(), StorageError> {
+fn verify_permissions(_file: &File, _metadata: &Metadata) -> Result<(), StorageError> {
     Err(StorageError::InsecureSecretFilePermissions)
 }
 
@@ -337,9 +415,17 @@ mod tests {
         fs::File,
         io::{Cursor, Seek},
         rc::Rc,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        time::{Duration, Instant},
     };
 
-    use super::{read_bounded_secret, read_file_contents, with_invalid_utf8_zeroize_observer};
+    use super::{
+        read_bounded_secret, read_file_contents, run_blocking_secret_read,
+        verify_regular_file_type, with_invalid_utf8_zeroize_observer,
+    };
     use crate::{MAX_HEADLESS_SECRET_BYTES, StorageError};
 
     #[test]
@@ -411,6 +497,78 @@ mod tests {
         fs::write(&path, ["replacement", "value"].join("-")).unwrap();
 
         assert_eq!(read_file_contents(&mut file).unwrap(), original);
+    }
+
+    #[test]
+    fn non_regular_file_type_fails_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let metadata = fs::metadata(directory.path()).unwrap();
+
+        assert!(matches!(
+            verify_regular_file_type(&metadata),
+            Err(StorageError::InsecureSecretFilePermissions)
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocking_secret_read_does_not_occupy_the_async_executor() {
+        let executor_progressed = Arc::new(AtomicBool::new(false));
+        let blocking_observer = Arc::clone(&executor_progressed);
+        let (started_sender, started_receiver) = tokio::sync::oneshot::channel();
+        let read = tokio::spawn(run_blocking_secret_read(move || {
+            started_sender.send(()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while !blocking_observer.load(Ordering::SeqCst) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Ok(blocking_observer.load(Ordering::SeqCst).to_string())
+        }));
+
+        started_receiver.await.unwrap();
+        executor_progressed.store(true, Ordering::SeqCst);
+
+        assert_eq!(read.await.unwrap().unwrap(), "true");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_metadata_rejects_a_foreign_effective_owner() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("secret");
+        fs::write(&path, "secret").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let metadata = File::open(path).unwrap().metadata().unwrap();
+        let foreign_uid = metadata.uid().wrapping_add(1);
+
+        assert!(super::verify_unix_metadata(&metadata, metadata.uid()).is_ok());
+        assert!(matches!(
+            super::verify_unix_metadata(&metadata, foreign_uid),
+            Err(StorageError::InsecureSecretFilePermissions)
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_pipe_handle_is_not_a_disk_file() {
+        use std::{
+            os::windows::io::AsRawHandle,
+            process::{Command, Stdio},
+        };
+
+        let mut child = Command::new("cmd.exe")
+            .args(["/d", "/c", "echo"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let output = child.stdout.take().unwrap();
+
+        assert!(matches!(
+            super::verify_windows_disk_file_type(output.as_raw_handle()),
+            Err(StorageError::InsecureSecretFilePermissions)
+        ));
+        child.wait().unwrap();
     }
 
     #[cfg(windows)]

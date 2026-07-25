@@ -7,6 +7,9 @@ license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 
+[lib]
+doctest = false
+
 [dependencies]
 async-trait.workspace = true
 fs4.workspace = true
@@ -21,6 +24,9 @@ toml_edit.workspace = true
 windows-sys.workspace = true
 zeroize.workspace = true
 wokcore-core = { version = "0.1.0", path = "../wokcore-core" }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.189"
 
 [dev-dependencies]
 proc-macro2 = "1"

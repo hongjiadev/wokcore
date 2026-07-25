@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs, io,
     path::{Path, PathBuf},
 };
@@ -30,6 +30,7 @@ fn detect_forbidden_native_access(
 }
 
 fn scan_crate_test_sources(manifest_dir: &Path) -> io::Result<Vec<String>> {
+    let crate_root = canonical_path(manifest_dir)?;
     let src_dir = manifest_dir.join("src");
     let tests_dir = manifest_dir.join("tests");
     let mut source_files = Vec::new();
@@ -68,16 +69,19 @@ fn scan_crate_test_sources(manifest_dir: &Path) -> io::Result<Vec<String>> {
         .filter(|path| is_source_crate_root(path, &src_dir))
         .collect::<Vec<_>>();
     module_files.extend(test_files);
-    let mut visited_modules = HashSet::new();
-    for path in module_files {
-        let path_is_test = path.starts_with(&tests_dir);
-        scan_test_modules(
-            &path,
-            path_is_test,
-            &scanned_entirely,
-            &mut visited_modules,
-            &mut violations,
-        )?;
+    {
+        let mut scan = SourceGraphScan {
+            crate_root: &crate_root,
+            scanned_entirely: &scanned_entirely,
+            visited: HashSet::new(),
+            active_sources: Vec::new(),
+            included_modes: HashMap::new(),
+            violations: &mut violations,
+        };
+        for path in module_files {
+            let path_is_test = path.starts_with(&tests_dir);
+            scan_test_modules(&path, path_is_test, &mut scan)?;
+        }
     }
     Ok(violations)
 }
@@ -296,40 +300,253 @@ fn type_is_named(ty: &Type, expected: &str) -> bool {
     )
 }
 
+struct SourceGraphScan<'scan> {
+    crate_root: &'scan Path,
+    scanned_entirely: &'scan HashSet<PathBuf>,
+    visited: HashSet<(PathBuf, bool)>,
+    active_sources: Vec<PathBuf>,
+    included_modes: HashMap<PathBuf, bool>,
+    violations: &'scan mut Vec<String>,
+}
+
 fn scan_test_modules(
     path: &Path,
     test_mode: bool,
-    scanned_entirely: &HashSet<PathBuf>,
-    visited: &mut HashSet<(PathBuf, bool)>,
-    violations: &mut Vec<String>,
+    scan: &mut SourceGraphScan<'_>,
 ) -> io::Result<()> {
     let canonical = canonical_path(path)?;
-    if !visited.insert((canonical.clone(), test_mode)) {
+    if !scan.visited.insert((canonical.clone(), test_mode)) {
         return Ok(());
     }
 
-    let source = fs::read_to_string(&canonical)?;
-    let syntax = parse_source(&canonical, &source)?;
-    if !scanned_entirely.contains(&canonical) {
-        let detected = if test_mode {
-            detect_forbidden_native_access(&source, true)
-                .map_err(|error| parse_error(&canonical, error))?
-        } else {
-            detect_forbidden_production_access(Path::new("__external_module.rs"), &syntax)
-        };
-        append_violations(&canonical, detected, violations);
+    scan.active_sources.push(canonical.clone());
+    let result = (|| {
+        let source = fs::read_to_string(&canonical)?;
+        let syntax = parse_source(&canonical, &source)?;
+        if !scan.scanned_entirely.contains(&canonical) {
+            let detected = if test_mode {
+                detect_forbidden_native_access(&source, true)
+                    .map_err(|error| parse_error(&canonical, error))?
+            } else {
+                detect_forbidden_production_access(Path::new("__included_source.rs"), &syntax)
+            };
+            append_violations(&canonical, detected, scan.violations);
+        }
+
+        scan_include_macros(&syntax, &canonical, test_mode, scan)?;
+
+        let module_dir = module_directory(&canonical);
+        scan_item_modules(&syntax.items, &canonical, &module_dir, test_mode, scan)
+    })();
+    scan.active_sources.pop();
+    result
+}
+
+fn scan_include_macros(
+    syntax: &syn::File,
+    source_path: &Path,
+    inherited_test_mode: bool,
+    scan: &mut SourceGraphScan<'_>,
+) -> io::Result<()> {
+    let mut visitor = IncludeVisitor::new(inherited_test_mode);
+    visitor.visit_file(syntax);
+    if let Some(error) = visitor.errors.into_iter().next() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid include! in {}: {error}", source_path.display()),
+        ));
     }
 
-    let module_dir = module_directory(&canonical);
-    scan_item_modules(
-        &syntax.items,
-        &canonical,
-        &module_dir,
-        test_mode,
-        scanned_entirely,
-        visited,
-        violations,
-    )
+    for directive in visitor.directives {
+        let parent = source_path.parent().unwrap_or_else(|| Path::new(""));
+        let candidate = parent.join(&directive.path);
+        let included = candidate.canonicalize().map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "failed to resolve include! {} declared in {}: {error}",
+                    directive.path.display(),
+                    source_path.display()
+                ),
+            )
+        })?;
+        if !included.starts_with(scan.crate_root) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "include! {} declared in {} resolves outside crate root {}",
+                    directive.path.display(),
+                    source_path.display(),
+                    scan.crate_root.display()
+                ),
+            ));
+        }
+        if !included
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| matches!(extension, "rs" | "inc"))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "include! {} declared in {} must reference a .rs or .inc file",
+                    directive.path.display(),
+                    source_path.display()
+                ),
+            ));
+        }
+        if scan.active_sources.contains(&included) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("include cycle reaches {}", included.display()),
+            ));
+        }
+        if scan
+            .included_modes
+            .insert(included.clone(), directive.test_mode)
+            .is_some_and(|existing| existing != directive.test_mode)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "included source {} is reachable in both production and test modes",
+                    included.display()
+                ),
+            ));
+        }
+
+        scan_test_modules(&included, directive.test_mode, scan)?;
+    }
+    Ok(())
+}
+
+struct IncludeDirective {
+    path: PathBuf,
+    test_mode: bool,
+}
+
+struct IncludeVisitor {
+    directives: Vec<IncludeDirective>,
+    errors: Vec<String>,
+    test_mode: bool,
+}
+
+impl IncludeVisitor {
+    fn new(test_mode: bool) -> Self {
+        Self {
+            directives: Vec::new(),
+            errors: Vec::new(),
+            test_mode,
+        }
+    }
+
+    fn append(&mut self, nested: IncludeVisitor) {
+        self.directives.extend(nested.directives);
+        self.errors.extend(nested.errors);
+    }
+}
+
+impl<'syntax> Visit<'syntax> for IncludeVisitor {
+    fn visit_item(&mut self, item: &'syntax Item) {
+        if !self.test_mode && item_attributes(item).iter().any(attribute_marks_test_code) {
+            let mut nested = IncludeVisitor::new(true);
+            visit::visit_item(&mut nested, item);
+            self.append(nested);
+        } else {
+            visit::visit_item(self, item);
+        }
+    }
+
+    fn visit_impl_item(&mut self, item: &'syntax ImplItem) {
+        if !self.test_mode
+            && impl_item_attributes(item)
+                .iter()
+                .any(attribute_marks_test_code)
+        {
+            let mut nested = IncludeVisitor::new(true);
+            visit::visit_impl_item(&mut nested, item);
+            self.append(nested);
+        } else {
+            visit::visit_impl_item(self, item);
+        }
+    }
+
+    fn visit_trait_item(&mut self, item: &'syntax TraitItem) {
+        if !self.test_mode
+            && trait_item_attributes(item)
+                .iter()
+                .any(attribute_marks_test_code)
+        {
+            let mut nested = IncludeVisitor::new(true);
+            visit::visit_trait_item(&mut nested, item);
+            self.append(nested);
+        } else {
+            visit::visit_trait_item(self, item);
+        }
+    }
+
+    fn visit_foreign_item(&mut self, item: &'syntax ForeignItem) {
+        if !self.test_mode
+            && foreign_item_attributes(item)
+                .iter()
+                .any(attribute_marks_test_code)
+        {
+            let mut nested = IncludeVisitor::new(true);
+            visit::visit_foreign_item(&mut nested, item);
+            self.append(nested);
+        } else {
+            visit::visit_foreign_item(self, item);
+        }
+    }
+
+    fn visit_local(&mut self, local: &'syntax Local) {
+        if !self.test_mode && local.attrs.iter().any(attribute_marks_test_code) {
+            let mut nested = IncludeVisitor::new(true);
+            visit::visit_local(&mut nested, local);
+            self.append(nested);
+        } else {
+            visit::visit_local(self, local);
+        }
+    }
+
+    fn visit_expr(&mut self, expression: &'syntax Expr) {
+        if !self.test_mode
+            && expression_attributes(expression)
+                .iter()
+                .any(attribute_marks_test_code)
+        {
+            let mut nested = IncludeVisitor::new(true);
+            visit::visit_expr(&mut nested, expression);
+            self.append(nested);
+        } else {
+            visit::visit_expr(self, expression);
+        }
+    }
+
+    fn visit_stmt_macro(&mut self, statement: &'syntax StmtMacro) {
+        if !self.test_mode && statement.attrs.iter().any(attribute_marks_test_code) {
+            let mut nested = IncludeVisitor::new(true);
+            visit::visit_stmt_macro(&mut nested, statement);
+            self.append(nested);
+        } else {
+            visit::visit_stmt_macro(self, statement);
+        }
+    }
+
+    fn visit_macro(&mut self, item: &'syntax Macro) {
+        if item.path.is_ident("include") {
+            match syn::parse2::<syn::LitStr>(item.tokens.clone()) {
+                Ok(path) => self.directives.push(IncludeDirective {
+                    path: PathBuf::from(path.value()),
+                    test_mode: self.test_mode,
+                }),
+                Err(_) => self
+                    .errors
+                    .push("include! must contain a single string literal".to_owned()),
+            }
+        }
+        visit::visit_macro(self, item);
+    }
 }
 
 fn scan_item_modules(
@@ -337,9 +554,7 @@ fn scan_item_modules(
     source_path: &Path,
     module_dir: &Path,
     inherited_test_mode: bool,
-    scanned_entirely: &HashSet<PathBuf>,
-    visited: &mut HashSet<(PathBuf, bool)>,
-    violations: &mut Vec<String>,
+    scan: &mut SourceGraphScan<'_>,
 ) -> io::Result<()> {
     for item in items {
         let Item::Mod(item_mod) = item else {
@@ -355,27 +570,19 @@ fn scan_item_modules(
                 source_path,
                 &child_module_dir,
                 module_test_mode,
-                scanned_entirely,
-                visited,
-                violations,
+                scan,
             )?;
         } else if module_test_mode {
             let module_path = resolve_external_module(item_mod, source_path, module_dir, true)?;
-            scan_test_modules(&module_path, true, scanned_entirely, visited, violations)?;
+            scan_test_modules(&module_path, true, scan)?;
         } else {
             let module_path = resolve_external_module(item_mod, source_path, module_dir, false)?;
-            scan_test_modules(&module_path, false, scanned_entirely, visited, violations)?;
+            scan_test_modules(&module_path, false, scan)?;
 
             if cfg_attr_test_path_attribute(item_mod)?.is_some() {
                 let test_module_path =
                     resolve_external_module(item_mod, source_path, module_dir, true)?;
-                scan_test_modules(
-                    &test_module_path,
-                    true,
-                    scanned_entirely,
-                    visited,
-                    violations,
-                )?;
+                scan_test_modules(&test_module_path, true, scan)?;
             }
         }
     }
@@ -1392,4 +1599,138 @@ fn scanner_uses_cfg_attr_test_path_and_rejects_ambiguous_path_shapes() {
     let unsupported = scan_crate_test_sources(directory.path()).unwrap_err();
     assert_eq!(unsupported.kind(), io::ErrorKind::InvalidData);
     assert!(unsupported.to_string().contains("unsupported cfg_attr"));
+}
+
+#[test]
+fn scanner_follows_literal_include_files_recursively() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir_all(directory.path().join("src")).unwrap();
+    fs::create_dir_all(directory.path().join("shared")).unwrap();
+    fs::write(
+        directory.path().join("src/lib.rs"),
+        r#"
+            #[cfg(test)]
+            mod tests {
+                include!("../shared/helper.inc");
+            }
+        "#,
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("shared/helper.inc"),
+        r#"
+            fn included_helper() {
+                wokcore_storage::NativeSecretStore::new();
+            }
+            include!("nested.rs");
+        "#,
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("shared/nested.rs"),
+        r#"fn recursively_included_helper() { keyring::Entry::new("service", "account"); }"#,
+    )
+    .unwrap();
+
+    let violations = scan_crate_test_sources(directory.path()).unwrap();
+
+    for (expected_file, expected) in [("helper.inc", "NativeSecretStore"), ("nested.rs", "Entry")] {
+        assert!(
+            violations.iter().any(|violation| {
+                violation.contains(expected_file) && violation.ends_with(expected)
+            }),
+            "include graph missed {expected_file}: {expected}: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn scanner_rejects_nonliteral_missing_and_ambiguous_includes() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir_all(directory.path().join("src")).unwrap();
+
+    for (source, expected) in [
+        (
+            r#"const HELPER: &str = "helper.inc"; include!(HELPER);"#,
+            "string literal",
+        ),
+        (r#"include!("missing.inc");"#, "failed to resolve"),
+        (
+            r#"include!("first.inc", "second.inc");"#,
+            "single string literal",
+        ),
+    ] {
+        fs::write(directory.path().join("src/lib.rs"), source).unwrap();
+        let error = scan_crate_test_sources(directory.path()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            error.to_string().contains(expected),
+            "unexpected include error for {source}: {error}"
+        );
+    }
+}
+
+#[test]
+fn scanner_rejects_includes_outside_the_crate_and_include_cycles() {
+    let directory = tempfile::tempdir().unwrap();
+    let crate_dir = directory.path().join("crate");
+    fs::create_dir_all(crate_dir.join("src")).unwrap();
+    fs::write(
+        directory.path().join("outside.inc"),
+        "fn outside_crate() {}",
+    )
+    .unwrap();
+    fs::write(
+        crate_dir.join("src/lib.rs"),
+        r#"include!("../../outside.inc");"#,
+    )
+    .unwrap();
+
+    let outside = scan_crate_test_sources(&crate_dir).unwrap_err();
+    assert_eq!(outside.kind(), io::ErrorKind::InvalidData);
+    assert!(outside.to_string().contains("outside crate root"));
+
+    fs::write(crate_dir.join("src/lib.rs"), r#"include!("first.inc");"#).unwrap();
+    fs::write(
+        crate_dir.join("src/first.inc"),
+        r#"include!("second.inc");"#,
+    )
+    .unwrap();
+    fs::write(
+        crate_dir.join("src/second.inc"),
+        r#"include!("first.inc");"#,
+    )
+    .unwrap();
+
+    let cycle = scan_crate_test_sources(&crate_dir).unwrap_err();
+    assert_eq!(cycle.kind(), io::ErrorKind::InvalidData);
+    assert!(cycle.to_string().contains("include cycle"));
+
+    fs::write(crate_dir.join("shared.inc"), "fn shared() {}").unwrap();
+    fs::write(
+        crate_dir.join("src/lib.rs"),
+        r#"
+            include!("../shared.inc");
+            #[cfg(test)]
+            mod tests {
+                include!("../shared.inc");
+            }
+        "#,
+    )
+    .unwrap();
+
+    let ambiguous = scan_crate_test_sources(&crate_dir).unwrap_err();
+    assert_eq!(ambiguous.kind(), io::ErrorKind::InvalidData);
+    assert!(ambiguous.to_string().contains("both production and test"));
+}
+
+#[test]
+fn storage_library_disables_doctests_outside_the_scanned_source_graph() {
+    let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    let manifest = fs::read_to_string(manifest_path)
+        .unwrap()
+        .parse::<toml_edit::DocumentMut>()
+        .unwrap();
+
+    assert_eq!(manifest["lib"]["doctest"].as_bool(), Some(false));
 }
