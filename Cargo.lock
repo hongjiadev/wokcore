@@ -1840,8 +1840,14 @@ dependencies = [
 name = "wokcore-platform"
 version = "0.1.0"
 dependencies = [
+ "fs4",
+ "libc",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
+ "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

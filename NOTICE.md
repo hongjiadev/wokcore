@@ -22,7 +22,9 @@ The initial WokCore durable state storage was migrated from WokRouter commit `22
 
 The initial WokCore platform path discovery was adapted from WokRouter commit `226a40e08ad6c783e996ceed77b8e6dfe2640fb4`. Its exact source path and blob mapping, product-directory rename, pure environment-snapshot resolver, discovery/lock path values, and excluded locale/service modules are recorded in `MIGRATION.md`.
 
-The migrated WokRouter domain types, protocol source, and fixture files, configuration storage, secret storage, durable state storage, and platform path discovery retain the source MIT notice:
+The WokCore secure runtime ownership and discovery implementation adapts the atomic-file and opened-handle permission-verification patterns from WokRouter commit `226a40e08ad6c783e996ceed77b8e6dfe2640fb4`. Exact source paths and blobs, retained behavior, and deliberate omissions are recorded in `MIGRATION.md`.
+
+The migrated WokRouter domain types, protocol source, and fixture files, configuration storage, secret storage, durable state storage, platform path discovery, and secure runtime filesystem patterns retain the source MIT notice:
 
 Copyright (c) 2026 WokRouter contributors
 

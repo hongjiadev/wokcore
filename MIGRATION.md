@@ -169,3 +169,23 @@ The private pre-rewrite recovery bundle is stored in WokDocs, not this public re
 - Verification:
   - `cargo +1.97.1 clippy -p wokcore-platform --all-targets --all-features -- -D warnings`
   - `cargo +1.97.1 test -p wokcore-platform --all-features`
+
+## Runtime import 7: secure runtime ownership and discovery
+
+- Source repository: `https://github.com/hongjiadev/wokrouter`
+- Source commit: `226a40e08ad6c783e996ceed77b8e6dfe2640fb4`
+- Reviewed source patterns:
+  - same-directory temporary-file write, file synchronization, Windows `ReplaceFileW`, Unix atomic rename, and Unix parent-directory synchronization from `crates/wokrouter-storage/src/config/store.rs` (blob `8dcc6f163940b9bc380901aabb5f202ba9eedac8`) → `crates/wokcore-platform/src/runtime/discovery.rs`
+  - opened-handle file-type, Unix owner/mode, and Windows owner/DACL verification from `crates/wokrouter-storage/src/secrets/permissioned_file.rs` (blob `cf6fa6015e08e62d65bbcf7a49156b38dcb51521`) → `crates/wokcore-platform/src/runtime/permissions.rs`
+- Deliberate adaptation:
+  - runtime ownership uses a non-blocking `fs4` operating-system lock held by `RuntimeLease`; stale lock-file text is never interpreted as ownership and the lock file is not removed on release;
+  - runtime, lock, temporary, and discovery objects are created with owner-only permissions and verified through opened handles; symlink/reparse, wrong-type, foreign-owner, and broader-access targets fail closed;
+  - discovery is reduced to the five public fields `base_url`, `pid`, `instance_id`, `wokcore_version`, and `api_major`, uses exact loopback URL and value validation, rejects unknown fields, and bounds reads at 16 KiB;
+  - discovery publication retains the reviewed atomic-file primitives and additionally synchronizes the securely opened parent-directory handle after replacement on Windows as well as Unix; configuration revisions, daemon PID liveness inference, fallback ports, legacy control IPC, and WokRouter runtime lifecycle behavior are not imported;
+  - owned removal validates the opened discovery record and file identity before deletion so a replacement instance is preserved.
+- License: the adapted patterns remain available under `MIT OR Apache-2.0`; the direct WokRouter source MIT notice remains retained in `NOTICE.md` and `LICENSE-MIT`.
+- Verification:
+  - `cargo +1.97.1 clippy -p wokcore-platform --all-targets --all-features -- -D warnings`
+  - `cargo +1.97.1 test -p wokcore-platform --test runtime_ownership`
+  - `cargo +1.97.1 test -p wokcore-platform --test discovery`
+  - `cargo +1.97.1 test -p wokcore-platform --all-features`

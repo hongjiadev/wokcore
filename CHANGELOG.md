@@ -13,6 +13,7 @@ All notable WokCore changes are documented in this file.
 - Internal SQLite durable state storage with batch-only request metrics, metadata and token totals only, corruption-preserving initial migration, and orphan-secret recovery metadata.
 - Explicit WAL byte measurement, threshold-gated passive checkpointing at the architecture constant of 16 MiB, and idle-time truncate checkpoint primitives with automatic checkpointing disabled.
 - Internal `wokcore-platform` path discovery with deterministic environment snapshots, WokCore-owned OS directories, and discovery/instance-lock path values that have no filesystem side effects.
+- Secure per-user runtime ownership with a lease-scoped operating-system lock and bounded, token-free, atomically published loopback discovery.
 
 ### Fixed
 
