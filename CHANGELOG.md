@@ -15,6 +15,7 @@ All notable WokCore changes are documented in this file.
 - Internal `wokcore-platform` path discovery with deterministic environment snapshots, WokCore-owned OS directories, and discovery/instance-lock path values that have no filesystem side effects.
 - Secure per-user runtime ownership with a lease-scoped operating-system lock and bounded, token-free, atomically published loopback discovery.
 - Ordered SQLite schema 2 authentication metadata, distinct client identifiers, redacted split-scope token primitives, fail-closed management bootstrap, and immutable in-memory proxy-token validation.
+- Unlimited lock-free request admission tracking with explicit drain, cancellation, timeout, and graceful stopping lifecycle states.
 
 ### Fixed
 
