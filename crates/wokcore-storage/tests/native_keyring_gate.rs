@@ -63,7 +63,10 @@ fn scan_crate_test_sources(manifest_dir: &Path) -> io::Result<Vec<String>> {
         scanned_entirely.insert(canonical_path(path)?);
     }
 
-    let mut module_files = source_files;
+    let mut module_files = source_files
+        .into_iter()
+        .filter(|path| is_source_crate_root(path, &src_dir))
+        .collect::<Vec<_>>();
     module_files.extend(test_files);
     let mut visited_modules = HashSet::new();
     for path in module_files {
@@ -77,6 +80,13 @@ fn scan_crate_test_sources(manifest_dir: &Path) -> io::Result<Vec<String>> {
         )?;
     }
     Ok(violations)
+}
+
+fn is_source_crate_root(path: &Path, src_dir: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| matches!(name, "lib.rs" | "main.rs"))
+        || path.starts_with(src_dir.join("bin"))
 }
 
 fn parse_source(path: &Path, source: &str) -> io::Result<syn::File> {
@@ -300,9 +310,13 @@ fn scan_test_modules(
 
     let source = fs::read_to_string(&canonical)?;
     let syntax = parse_source(&canonical, &source)?;
-    if test_mode && !scanned_entirely.contains(&canonical) {
-        let detected = detect_forbidden_native_access(&source, true)
-            .map_err(|error| parse_error(&canonical, error))?;
+    if !scanned_entirely.contains(&canonical) {
+        let detected = if test_mode {
+            detect_forbidden_native_access(&source, true)
+                .map_err(|error| parse_error(&canonical, error))?
+        } else {
+            detect_forbidden_production_access(Path::new("__external_module.rs"), &syntax)
+        };
         append_violations(&canonical, detected, violations);
     }
 
@@ -332,7 +346,7 @@ fn scan_item_modules(
             continue;
         };
         let module_test_mode =
-            inherited_test_mode || item_mod.attrs.iter().any(attribute_marks_test_code);
+            inherited_test_mode || item_mod.attrs.iter().any(attribute_gates_test_code);
 
         if let Some((_, items)) = &item_mod.content {
             let child_module_dir = module_dir.join(item_mod.ident.to_string());
@@ -346,8 +360,23 @@ fn scan_item_modules(
                 violations,
             )?;
         } else if module_test_mode {
-            let module_path = resolve_external_module(item_mod, source_path, module_dir)?;
+            let module_path = resolve_external_module(item_mod, source_path, module_dir, true)?;
             scan_test_modules(&module_path, true, scanned_entirely, visited, violations)?;
+        } else {
+            let module_path = resolve_external_module(item_mod, source_path, module_dir, false)?;
+            scan_test_modules(&module_path, false, scanned_entirely, visited, violations)?;
+
+            if cfg_attr_test_path_attribute(item_mod)?.is_some() {
+                let test_module_path =
+                    resolve_external_module(item_mod, source_path, module_dir, true)?;
+                scan_test_modules(
+                    &test_module_path,
+                    true,
+                    scanned_entirely,
+                    visited,
+                    violations,
+                )?;
+            }
         }
     }
     Ok(())
@@ -367,8 +396,27 @@ fn resolve_external_module(
     item: &ItemMod,
     source_path: &Path,
     module_dir: &Path,
+    test_mode: bool,
 ) -> io::Result<PathBuf> {
-    if let Some(path) = module_path_attribute(item)? {
+    let direct_path = module_path_attribute(item)?;
+    let test_path = test_mode
+        .then(|| cfg_attr_test_path_attribute(item))
+        .transpose()?
+        .flatten();
+    let configured_path = match (direct_path, test_path) {
+        (Some(_), Some(_)) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "module {} declared in {} has ambiguous direct and test path attributes",
+                    item.ident,
+                    source_path.display()
+                ),
+            ));
+        }
+        (direct, test) => test.or(direct),
+    };
+    if let Some(path) = configured_path {
         let parent = source_path.parent().unwrap_or_else(|| Path::new(""));
         let candidate = parent.join(path);
         if candidate.is_file() {
@@ -450,6 +498,74 @@ fn module_path_attribute(item: &ItemMod) -> io::Result<Option<PathBuf>> {
         }
     }
     Ok(result)
+}
+
+fn cfg_attr_test_path_attribute(item: &ItemMod) -> io::Result<Option<PathBuf>> {
+    let mut result = None;
+    for attribute in item
+        .attrs
+        .iter()
+        .filter(|attribute| attribute.path().is_ident("cfg_attr"))
+    {
+        let Meta::List(list) = &attribute.meta else {
+            return Err(invalid_cfg_attr_path(item, "is not a list"));
+        };
+        let arguments = parse_meta_arguments(list)
+            .map_err(|error| invalid_cfg_attr_path(item, &error.to_string()))?;
+        let Some(predicate) = arguments.first() else {
+            return Err(invalid_cfg_attr_path(item, "has no predicate"));
+        };
+        if !matches!(
+            cfg_relation(predicate),
+            TestCfgRelation::Positive | TestCfgRelation::Unknown
+        ) {
+            continue;
+        }
+        for meta in arguments.iter().skip(1) {
+            if meta.path().is_ident("path") {
+                let Meta::NameValue(name_value) = meta else {
+                    return Err(invalid_cfg_attr_path(
+                        item,
+                        "contains a non-value path attribute",
+                    ));
+                };
+                let Expr::Lit(expression) = &name_value.value else {
+                    return Err(invalid_cfg_attr_path(
+                        item,
+                        "contains a non-literal path value",
+                    ));
+                };
+                let syn::Lit::Str(path) = &expression.lit else {
+                    return Err(invalid_cfg_attr_path(
+                        item,
+                        "contains a non-string path value",
+                    ));
+                };
+                if result.replace(PathBuf::from(path.value())).is_some() {
+                    return Err(invalid_cfg_attr_path(
+                        item,
+                        "contains multiple test path attributes",
+                    ));
+                }
+            } else if meta.path().is_ident("cfg_attr") {
+                return Err(invalid_cfg_attr_path(
+                    item,
+                    "contains a nested cfg_attr that may select a path",
+                ));
+            }
+        }
+    }
+    Ok(result)
+}
+
+fn invalid_cfg_attr_path(item: &ItemMod, reason: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "module {} has an unsupported cfg_attr path shape: {reason}",
+            item.ident
+        ),
+    )
 }
 
 #[derive(Default)]
@@ -687,6 +803,21 @@ fn expression_attributes(expression: &Expr) -> &[Attribute] {
 }
 
 fn attribute_marks_test_code(attribute: &Attribute) -> bool {
+    if attribute_gates_test_code(attribute) {
+        return true;
+    }
+    match &attribute.meta {
+        Meta::List(list) if list.path.is_ident("cfg_attr") => {
+            matches!(
+                parse_cfg_attr_predicate(list),
+                TestCfgRelation::Positive | TestCfgRelation::Unknown
+            )
+        }
+        _ => false,
+    }
+}
+
+fn attribute_gates_test_code(attribute: &Attribute) -> bool {
     if attribute
         .path()
         .segments
@@ -699,12 +830,6 @@ fn attribute_marks_test_code(attribute: &Attribute) -> bool {
         Meta::List(list) if list.path.is_ident("cfg") => {
             matches!(
                 parse_cfg_predicate(list),
-                TestCfgRelation::Positive | TestCfgRelation::Unknown
-            )
-        }
-        Meta::List(list) if list.path.is_ident("cfg_attr") => {
-            matches!(
-                parse_cfg_attr_predicate(list),
                 TestCfgRelation::Positive | TestCfgRelation::Unknown
             )
         }
@@ -1026,6 +1151,11 @@ fn scanner_fails_closed_when_a_test_reachable_module_cannot_be_resolved() {
         "#[cfg(not(test))] mod production_only;",
     )
     .unwrap();
+    fs::write(
+        directory.path().join("src/production_only.rs"),
+        "fn harmless_production_module() {}",
+    )
+    .unwrap();
 
     assert!(
         scan_crate_test_sources(directory.path())
@@ -1163,4 +1293,103 @@ fn source_policy_rejects_production_wrappers_and_hidden_native_factories() {
             .iter()
             .any(|violation| violation.contains("secrets\\mod.rs"))
     );
+}
+
+#[test]
+fn scanner_follows_production_path_modules_outside_the_src_tree() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir_all(directory.path().join("src")).unwrap();
+    fs::create_dir_all(directory.path().join("shared")).unwrap();
+    fs::write(
+        directory.path().join("src/lib.rs"),
+        r#"#[path = "../shared/wrapper.rs"] mod wrapper;"#,
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("shared/wrapper.rs"),
+        r#"
+            fn direct_native_access() {
+                keyring::Entry::new("service", "account");
+            }
+            #[path = "nested.rs"]
+            mod nested;
+        "#,
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("shared/nested.rs"),
+        r#"
+            macro_rules! hidden_native_wrapper {
+                () => { credential.delete_credential() };
+            }
+        "#,
+    )
+    .unwrap();
+
+    let violations = scan_crate_test_sources(directory.path()).unwrap();
+
+    for (expected_file, expected) in [("wrapper.rs", "Entry"), ("nested.rs", "delete_credential")] {
+        assert!(
+            violations.iter().any(|violation| {
+                violation.contains(expected_file) && violation.ends_with(expected)
+            }),
+            "production module graph missed {expected_file}: {expected}: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn scanner_uses_cfg_attr_test_path_and_rejects_ambiguous_path_shapes() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir_all(directory.path().join("src")).unwrap();
+    fs::create_dir_all(directory.path().join("shared")).unwrap();
+    fs::write(
+        directory.path().join("src/lib.rs"),
+        r#"#[cfg_attr(test, path = "../shared/test_wrapper.rs")] mod wrapper;"#,
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("src/wrapper.rs"),
+        "fn harmless_default_module() {}",
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("shared/test_wrapper.rs"),
+        r#"fn test_only_wrapper() { credential.set_password("secret"); }"#,
+    )
+    .unwrap();
+
+    let violations = scan_crate_test_sources(directory.path()).unwrap();
+
+    assert!(
+        violations.iter().any(|violation| {
+            violation.contains("test_wrapper.rs") && violation.ends_with("set_password")
+        }),
+        "cfg_attr(test, path) resolved the wrong module: {violations:?}"
+    );
+
+    fs::write(
+        directory.path().join("src/lib.rs"),
+        r#"
+            #[path = "wrapper.rs"]
+            #[cfg_attr(test, path = "../shared/test_wrapper.rs")]
+            mod wrapper;
+        "#,
+    )
+    .unwrap();
+    let ambiguous = scan_crate_test_sources(directory.path()).unwrap_err();
+    assert_eq!(ambiguous.kind(), io::ErrorKind::InvalidData);
+    assert!(ambiguous.to_string().contains("ambiguous"));
+
+    fs::write(
+        directory.path().join("src/lib.rs"),
+        r#"
+            #[cfg_attr(test, cfg_attr(test, path = "../shared/test_wrapper.rs"))]
+            mod wrapper;
+        "#,
+    )
+    .unwrap();
+    let unsupported = scan_crate_test_sources(directory.path()).unwrap_err();
+    assert_eq!(unsupported.kind(), io::ErrorKind::InvalidData);
+    assert!(unsupported.to_string().contains("unsupported cfg_attr"));
 }
