@@ -8,12 +8,13 @@ use std::{
 };
 
 use secrecy::{ExposeSecret, SecretString};
+use sha2::{Digest, Sha256};
 use wokcore_core::{
     id::{ClientId, ProviderId},
     secret::{SecretPurpose, SecretRef, SecretScope},
 };
 use wokcore_server::auth::{
-    AuthMetadataStore, AuthRegistry, EntropySource, TokenDigest, TokenError, TokenMaterial,
+    AuthMetadataStore, AuthRegistry, EntropySource, TokenError, TokenMaterial,
 };
 use wokcore_storage::{
     ClientTokenMetadata, MemorySecretStore, RuntimeSecretBinding, SecretStore, StorageError,
@@ -21,6 +22,10 @@ use wokcore_storage::{
 
 const CREATED_AT: &str = "2026-07-26T00:00:00Z";
 const REVOKED_AT: &str = "2026-07-26T01:00:00Z";
+
+fn token_digest(candidate: &str) -> [u8; 32] {
+    Sha256::digest(candidate.as_bytes()).into()
+}
 
 #[derive(Debug)]
 struct DeterministicEntropy {
@@ -66,6 +71,7 @@ struct RecordingSecretStore {
     events: Arc<Mutex<Vec<&'static str>>>,
     gets: AtomicUsize,
     read_back: Mutex<Option<SecretReadBack>>,
+    put_gate: Mutex<Option<BlockingGate>>,
 }
 
 impl RecordingSecretStore {
@@ -75,6 +81,12 @@ impl RecordingSecretStore {
 
     fn fail_on_get(&self) {
         *self.read_back.lock().unwrap() = Some(SecretReadBack::Failure);
+    }
+
+    fn arm_put_gate(&self) -> BlockingGateHandle {
+        let (gate, handle) = blocking_gate();
+        *self.put_gate.lock().unwrap() = Some(gate);
+        handle
     }
 }
 
@@ -86,7 +98,13 @@ impl SecretStore for RecordingSecretStore {
         value: SecretString,
     ) -> Result<SecretRef, StorageError> {
         self.events.lock().unwrap().push("secret.put");
-        self.inner.put(scope, value).await
+        let secret_ref = self.inner.put(scope, value).await?;
+        if let Some((started, release, completed)) = self.put_gate.lock().unwrap().take() {
+            let _ = started.send(());
+            release.wait();
+            let _ = completed.send(());
+        }
+        Ok(secret_ref)
     }
 
     async fn get(&self, secret_ref: &SecretRef) -> Result<SecretString, StorageError> {
@@ -115,7 +133,21 @@ struct FakeMetadataStore {
     calls: AtomicUsize,
     fail_bind: AtomicBool,
     fail_issue: AtomicBool,
-    revoke_gate: Mutex<Option<(mpsc::Sender<()>, Arc<Barrier>)>>,
+    issue_gate: Mutex<Option<BlockingGate>>,
+    revoke_gate: Mutex<Option<BlockingGate>>,
+}
+
+type BlockingGate = (mpsc::Sender<()>, Arc<Barrier>, mpsc::Sender<()>);
+type BlockingGateHandle = (mpsc::Receiver<()>, Arc<Barrier>, mpsc::Receiver<()>);
+
+fn blocking_gate() -> (BlockingGate, BlockingGateHandle) {
+    let (started_tx, started_rx) = mpsc::channel();
+    let (completed_tx, completed_rx) = mpsc::channel();
+    let release = Arc::new(Barrier::new(2));
+    (
+        (started_tx, Arc::clone(&release), completed_tx),
+        (started_rx, release, completed_rx),
+    )
 }
 
 impl FakeMetadataStore {
@@ -135,11 +167,16 @@ impl FakeMetadataStore {
         });
     }
 
-    fn arm_revoke_gate(&self) -> (mpsc::Receiver<()>, Arc<Barrier>) {
-        let (started_tx, started_rx) = mpsc::channel();
-        let release = Arc::new(Barrier::new(2));
-        *self.revoke_gate.lock().unwrap() = Some((started_tx, Arc::clone(&release)));
-        (started_rx, release)
+    fn arm_issue_gate(&self) -> BlockingGateHandle {
+        let (gate, handle) = blocking_gate();
+        *self.issue_gate.lock().unwrap() = Some(gate);
+        handle
+    }
+
+    fn arm_revoke_gate(&self) -> BlockingGateHandle {
+        let (gate, handle) = blocking_gate();
+        *self.revoke_gate.lock().unwrap() = Some(gate);
+        handle
     }
 }
 
@@ -194,10 +231,18 @@ impl AuthMetadataStore for FakeMetadataStore {
     fn issue_client_token(&self, token: &ClientTokenMetadata) -> Result<(), StorageError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.events.lock().unwrap().push("metadata.issue");
+        let gate = self.issue_gate.lock().unwrap().take();
+        if let Some((started, release, _)) = &gate {
+            let _ = started.send(());
+            release.wait();
+        }
         if self.fail_issue.load(Ordering::SeqCst) {
             return Err(StorageError::SecretBackendFailure);
         }
         self.active.lock().unwrap().push(token.clone());
+        if let Some((_, _, completed)) = gate {
+            let _ = completed.send(());
+        }
         Ok(())
     }
 
@@ -209,15 +254,41 @@ impl AuthMetadataStore for FakeMetadataStore {
     ) -> Result<bool, StorageError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.events.lock().unwrap().push("metadata.revoke");
-        if let Some((started, release)) = self.revoke_gate.lock().unwrap().take() {
-            started.send(()).unwrap();
+        let gate = self.revoke_gate.lock().unwrap().take();
+        if let Some((started, release, _)) = &gate {
+            let _ = started.send(());
             release.wait();
         }
         let mut active = self.active.lock().unwrap();
         let before = active.len();
         active.retain(|token| token.token_id != token_id || token.client_id != *client_id);
-        Ok(active.len() != before)
+        let changed = active.len() != before;
+        drop(active);
+        if let Some((_, _, completed)) = gate {
+            let _ = completed.send(());
+        }
+        Ok(changed)
     }
+}
+
+async fn wait_for_event(events: &Mutex<Vec<&'static str>>, expected: &'static str) {
+    for _ in 0..10_000 {
+        if events.lock().unwrap().contains(&expected) {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("event {expected:?} was not observed");
+}
+
+async fn wait_for_client_presence(registry: &AuthRegistry, raw: &str, expected: bool) {
+    for _ in 0..10_000 {
+        if registry.validate_client(raw).is_some() == expected {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("client snapshot did not reach expected presence {expected}");
 }
 
 fn management_scope() -> SecretScope {
@@ -287,30 +358,16 @@ fn token_material_uses_exact_prefixes_and_32_bytes_of_base64url_no_pad_entropy()
 }
 
 #[test]
-fn token_and_digest_debug_and_errors_never_expose_material() {
+fn token_debug_and_errors_never_expose_material() {
     let entropy = DeterministicEntropy::repeated(0x7a);
     let material = TokenMaterial::generate_proxy(&entropy).unwrap();
     assert_eq!(format!("{material:?}"), "TokenMaterial([redacted])");
     let response = material.into_response_value();
     let canary = response.expose_secret().to_owned();
-    let digest = TokenDigest::of(&canary);
 
     assert!(!format!("{response:?}").contains(&canary));
-    assert!(!format!("{digest:?}").contains(&canary));
     let error = TokenMaterial::generate_proxy(&FailingEntropy).unwrap_err();
     assert!(!format!("{error:?} {error}").contains(&canary));
-}
-
-#[test]
-fn sha256_digest_is_stable_distinct_and_management_match_is_constant_time_backed() {
-    let first = TokenDigest::of("first-candidate");
-    let same = TokenDigest::of("first-candidate");
-    let second = TokenDigest::of("second-candidate");
-
-    assert_eq!(first, same);
-    assert_ne!(first, second);
-    assert!(first.constant_time_matches(&same));
-    assert!(!first.constant_time_matches(&second));
 }
 
 #[test]
@@ -346,7 +403,7 @@ async fn bootstrap_reads_once_and_registry_retains_only_digests_and_active_metad
     metadata.active.lock().unwrap().push(ClientTokenMetadata {
         token_id: "token-existing".to_owned(),
         client_id: ClientId::new("wokrouter").unwrap(),
-        digest: TokenDigest::of(&proxy_raw).into_bytes(),
+        digest: token_digest(&proxy_raw),
         issued_at: CREATED_AT.to_owned(),
     });
     let registry = AuthRegistry::bootstrap(
@@ -570,6 +627,57 @@ async fn new_bootstrap_rejects_invalid_bound_secret_read_back_without_exposing_i
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn validation_rejects_noncanonical_base64url_trailing_bits() {
+    let noncanonical_admin = format!("wok_admin_v1_{}B", "A".repeat(42));
+    let admin_secrets = Arc::new(RecordingSecretStore::default());
+    let stored = TokenMaterial::generate_admin(&DeterministicEntropy::repeated(0x4a))
+        .unwrap()
+        .into_response_value();
+    let admin_ref = admin_secrets
+        .put(&management_scope(), stored)
+        .await
+        .unwrap();
+    admin_secrets.return_on_get(noncanonical_admin);
+    let admin_metadata = Arc::new(FakeMetadataStore::default());
+    admin_metadata.set_binding(admin_ref);
+
+    let admin_error = AuthRegistry::bootstrap(
+        admin_secrets,
+        admin_metadata,
+        Arc::new(DeterministicEntropy::repeated(0x4b)),
+        management_scope(),
+        CREATED_AT.to_owned(),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        admin_error,
+        wokcore_server::auth::AuthError::InvalidManagementSecret
+    ));
+
+    let noncanonical_proxy = format!("wok_proxy_v1_{}B", "A".repeat(42));
+    let (_registry, secrets, metadata, _) = existing_registry(0x4c).await;
+    metadata.active.lock().unwrap().push(ClientTokenMetadata {
+        token_id: "token-noncanonical".to_owned(),
+        client_id: ClientId::new("wokrouter").unwrap(),
+        digest: token_digest(&noncanonical_proxy),
+        issued_at: CREATED_AT.to_owned(),
+    });
+    let registry = AuthRegistry::bootstrap(
+        secrets,
+        metadata,
+        Arc::new(DeterministicEntropy::repeated(0x4d)),
+        management_scope(),
+        CREATED_AT.to_owned(),
+    )
+    .await
+    .unwrap();
+
+    assert!(registry.validate_client(&noncanonical_proxy).is_none());
+    drop(registry);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn issue_persists_before_exposing_material_and_failure_exposes_nothing() {
     let (registry, _secrets, metadata, _management_raw) = existing_registry(0x51).await;
     metadata.events.lock().unwrap().clear();
@@ -627,7 +735,7 @@ async fn revoke_commits_before_replacing_the_immutable_snapshot() {
             .unwrap()
     );
     assert!(registry.validate_client(&raw).is_some());
-    let (started, release) = metadata.arm_revoke_gate();
+    let (started, release, completed) = metadata.arm_revoke_gate();
     let registry_for_revoke = Arc::clone(&registry);
     let revoke = tokio::spawn(async move {
         registry_for_revoke
@@ -642,12 +750,201 @@ async fn revoke_commits_before_replacing_the_immutable_snapshot() {
     started.recv_timeout(Duration::from_secs(5)).unwrap();
     assert!(registry.validate_client(&raw).is_some());
     release.wait();
+    completed.recv_timeout(Duration::from_secs(5)).unwrap();
     assert!(revoke.await.unwrap().unwrap());
     assert!(registry.validate_client(&raw).is_none());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_issue_finishes_persistence_and_snapshot_without_delivering_material() {
+    let (registry, _secrets, metadata, _management_raw) = existing_registry(0x81).await;
+    let expected = TokenMaterial::generate_proxy(&DeterministicEntropy::repeated(0x82))
+        .unwrap()
+        .into_response_value();
+    let expected_raw = expected.expose_secret().to_owned();
+    let (started, release, completed) = metadata.arm_issue_gate();
+    let registry_for_issue = Arc::clone(&registry);
+    let issue = tokio::spawn(async move {
+        registry_for_issue
+            .issue_client_token(
+                "token-cancelled-issue".to_owned(),
+                ClientId::new("wokrouter").unwrap(),
+                CREATED_AT.to_owned(),
+            )
+            .await
+    });
+
+    started.recv_timeout(Duration::from_secs(5)).unwrap();
+    issue.abort();
+    release.wait();
+    assert!(issue.await.unwrap_err().is_cancelled());
+    completed.recv_timeout(Duration::from_secs(5)).unwrap();
+    wait_for_client_presence(&registry, &expected_raw, true).await;
+
+    let persisted = metadata
+        .active
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|token| token.token_id == "token-cancelled-issue")
+        .cloned()
+        .unwrap();
+    assert_eq!(persisted.digest, token_digest(&expected_raw));
+    assert_eq!(
+        registry.validate_client(&expected_raw).unwrap().client_id,
+        ClientId::new("wokrouter").unwrap()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_revoke_finishes_commit_and_snapshot_then_retry_is_idempotent() {
+    let (registry, _secrets, metadata, _management_raw) = existing_registry(0x91).await;
+    let raw = registry
+        .issue_client_token(
+            "token-cancelled-revoke".to_owned(),
+            ClientId::new("wokrouter").unwrap(),
+            CREATED_AT.to_owned(),
+        )
+        .await
+        .unwrap()
+        .into_response_value();
+    let raw = raw.expose_secret().to_owned();
+    let (started, release, completed) = metadata.arm_revoke_gate();
+    let registry_for_revoke = Arc::clone(&registry);
+    let revoke = tokio::spawn(async move {
+        registry_for_revoke
+            .revoke_client_token(
+                ClientId::new("wokrouter").unwrap(),
+                "token-cancelled-revoke".to_owned(),
+                REVOKED_AT.to_owned(),
+            )
+            .await
+    });
+
+    started.recv_timeout(Duration::from_secs(5)).unwrap();
+    revoke.abort();
+    release.wait();
+    assert!(revoke.await.unwrap_err().is_cancelled());
+    completed.recv_timeout(Duration::from_secs(5)).unwrap();
+    wait_for_client_presence(&registry, &raw, false).await;
+    assert!(
+        !registry
+            .revoke_client_token(
+                ClientId::new("wokrouter").unwrap(),
+                "token-cancelled-revoke".to_owned(),
+                REVOKED_AT.to_owned(),
+            )
+            .await
+            .unwrap()
+    );
+    assert!(registry.validate_client(&raw).is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unchanged_revoke_reconciles_a_stale_active_snapshot() {
+    let (registry, _secrets, metadata, _management_raw) = existing_registry(0xa1).await;
+    let raw = registry
+        .issue_client_token(
+            "token-stale-snapshot".to_owned(),
+            ClientId::new("wokrouter").unwrap(),
+            CREATED_AT.to_owned(),
+        )
+        .await
+        .unwrap()
+        .into_response_value();
+    let raw = raw.expose_secret().to_owned();
+    metadata.active.lock().unwrap().clear();
+    assert!(registry.validate_client(&raw).is_some());
+
+    assert!(
+        !registry
+            .revoke_client_token(
+                ClientId::new("wokrouter").unwrap(),
+                "token-stale-snapshot".to_owned(),
+                REVOKED_AT.to_owned(),
+            )
+            .await
+            .unwrap()
+    );
+    assert!(registry.validate_client(&raw).is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_bootstrap_after_put_finishes_binding_readback_and_load() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let secrets = Arc::new(RecordingSecretStore {
+        events: Arc::clone(&events),
+        ..RecordingSecretStore::default()
+    });
+    let metadata = Arc::new(FakeMetadataStore::with_events(Arc::clone(&events)));
+    let expected = TokenMaterial::generate_admin(&DeterministicEntropy::repeated(0xb1))
+        .unwrap()
+        .into_response_value();
+    let expected_raw = expected.expose_secret().to_owned();
+    let (started, release, completed) = secrets.arm_put_gate();
+    let secrets_for_bootstrap = Arc::clone(&secrets);
+    let metadata_for_bootstrap = Arc::clone(&metadata);
+    let bootstrap = tokio::spawn(async move {
+        AuthRegistry::bootstrap(
+            secrets_for_bootstrap,
+            metadata_for_bootstrap,
+            Arc::new(DeterministicEntropy::repeated(0xb1)),
+            management_scope(),
+            CREATED_AT.to_owned(),
+        )
+        .await
+    });
+
+    started.recv_timeout(Duration::from_secs(5)).unwrap();
+    bootstrap.abort();
+    release.wait();
+    assert!(bootstrap.await.unwrap_err().is_cancelled());
+    completed.recv_timeout(Duration::from_secs(5)).unwrap();
+    wait_for_event(&events, "metadata.load").await;
+
+    let binding = metadata.binding.lock().unwrap().clone().unwrap();
+    let persisted = secrets.get(&binding.secret_ref).await.unwrap();
+    assert_eq!(persisted.expose_secret(), &expected_raw);
+    assert!(metadata.orphans.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_bootstrap_bind_failure_tracks_the_written_secret_as_an_orphan() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let secrets = Arc::new(RecordingSecretStore {
+        events: Arc::clone(&events),
+        ..RecordingSecretStore::default()
+    });
+    let metadata = Arc::new(FakeMetadataStore::with_events(Arc::clone(&events)));
+    metadata.fail_bind.store(true, Ordering::SeqCst);
+    let (started, release, completed) = secrets.arm_put_gate();
+    let secrets_for_bootstrap = Arc::clone(&secrets);
+    let metadata_for_bootstrap = Arc::clone(&metadata);
+    let bootstrap = tokio::spawn(async move {
+        AuthRegistry::bootstrap(
+            secrets_for_bootstrap,
+            metadata_for_bootstrap,
+            Arc::new(DeterministicEntropy::repeated(0xc1)),
+            management_scope(),
+            CREATED_AT.to_owned(),
+        )
+        .await
+    });
+
+    started.recv_timeout(Duration::from_secs(5)).unwrap();
+    bootstrap.abort();
+    release.wait();
+    assert!(bootstrap.await.unwrap_err().is_cancelled());
+    completed.recv_timeout(Duration::from_secs(5)).unwrap();
+    wait_for_event(&events, "metadata.orphan").await;
+
+    assert!(metadata.binding.lock().unwrap().is_none());
+    let orphan = metadata.orphans.lock().unwrap().first().cloned().unwrap();
+    assert!(secrets.get(&orphan).await.is_ok());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn one_thousand_parallel_validations_use_only_the_memory_snapshot() {
+async fn one_thousand_parallel_validations_perform_no_metadata_io() {
     let (registry, _secrets, metadata, _management_raw) = existing_registry(0x71).await;
     let issued = registry
         .issue_client_token(

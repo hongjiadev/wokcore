@@ -25,18 +25,18 @@ impl EntropySource for OsEntropy {
 }
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
-pub struct TokenDigest([u8; 32]);
+pub(crate) struct TokenDigest([u8; 32]);
 
 impl TokenDigest {
-    pub fn of(candidate: &str) -> Self {
+    pub(crate) fn of(candidate: &str) -> Self {
         Self(Sha256::digest(candidate.as_bytes()).into())
     }
 
-    pub fn constant_time_matches(&self, candidate: &Self) -> bool {
+    pub(crate) fn constant_time_matches(&self, candidate: &Self) -> bool {
         bool::from(self.0.ct_eq(&candidate.0))
     }
 
-    pub fn into_bytes(self) -> [u8; 32] {
+    pub(crate) fn into_bytes(self) -> [u8; 32] {
         self.0
     }
 }
@@ -78,7 +78,7 @@ impl TokenMaterial {
         })
     }
 
-    pub fn digest(&self) -> TokenDigest {
+    pub(crate) fn digest(&self) -> TokenDigest {
         TokenDigest::of(self.value.expose_secret())
     }
 
@@ -115,8 +115,31 @@ fn has_token_shape(candidate: &str, prefix: &str) -> bool {
     let Some(encoded) = candidate.strip_prefix(prefix) else {
         return false;
     };
-    encoded.len() == ENCODED_ENTROPY_BYTES
-        && encoded
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    if encoded.len() != ENCODED_ENTROPY_BYTES {
+        return false;
+    }
+
+    let mut decoded = Zeroizing::new([0_u8; ENTROPY_BYTES]);
+    matches!(
+        URL_SAFE_NO_PAD.decode_slice(encoded, decoded.as_mut_slice()),
+        Ok(ENTROPY_BYTES)
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TokenDigest;
+
+    #[test]
+    fn digest_is_stable_redacted_and_supports_explicit_constant_time_matching() {
+        let first = TokenDigest::of("first-candidate");
+        let same = TokenDigest::of("first-candidate");
+        let second = TokenDigest::of("second-candidate");
+
+        assert_eq!(first, same);
+        assert_ne!(first, second);
+        assert!(first.constant_time_matches(&same));
+        assert!(!first.constant_time_matches(&second));
+        assert_eq!(format!("{first:?}"), "TokenDigest([redacted])");
+    }
 }

@@ -138,11 +138,15 @@ struct ActiveClient {
 }
 
 pub struct AuthRegistry {
+    state: Arc<AuthRegistryState>,
+}
+
+struct AuthRegistryState {
     management_digest: TokenDigest,
     clients: ArcSwap<HashMap<TokenDigest, ActiveClient>>,
     metadata: Arc<dyn AuthMetadataStore>,
     entropy: Arc<dyn EntropySource>,
-    mutation: tokio::sync::Mutex<()>,
+    mutation: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl AuthRegistry {
@@ -153,6 +157,27 @@ impl AuthRegistry {
         management_scope: SecretScope,
         created_at: String,
     ) -> Result<Self, AuthError> {
+        let mutation = Arc::new(tokio::sync::Mutex::new(()));
+        await_mutation_task(task::spawn(Self::bootstrap_owned(
+            secrets,
+            metadata,
+            entropy,
+            management_scope,
+            created_at,
+            mutation,
+        )))
+        .await
+    }
+
+    async fn bootstrap_owned(
+        secrets: Arc<dyn SecretStore>,
+        metadata: Arc<dyn AuthMetadataStore>,
+        entropy: Arc<dyn EntropySource>,
+        management_scope: SecretScope,
+        created_at: String,
+        mutation: Arc<tokio::sync::Mutex<()>>,
+    ) -> Result<Self, AuthError> {
+        let _mutation = mutation.lock().await;
         let binding = run_metadata(Arc::clone(&metadata), move |metadata| {
             metadata.runtime_secret_binding(MANAGEMENT_BINDING_NAME)
         })
@@ -218,11 +243,13 @@ impl AuthRegistry {
         let clients = active_client_map(active)?;
 
         Ok(Self {
-            management_digest,
-            clients: ArcSwap::from_pointee(clients),
-            metadata,
-            entropy,
-            mutation: tokio::sync::Mutex::new(()),
+            state: Arc::new(AuthRegistryState {
+                management_digest,
+                clients: ArcSwap::from_pointee(clients),
+                metadata,
+                entropy,
+                mutation: Arc::clone(&mutation),
+            }),
         })
     }
 
@@ -230,7 +257,8 @@ impl AuthRegistry {
         if !is_admin_token(candidate) {
             return false;
         }
-        self.management_digest
+        self.state
+            .management_digest
             .constant_time_matches(&TokenDigest::of(candidate))
     }
 
@@ -239,7 +267,7 @@ impl AuthRegistry {
             return None;
         }
         let digest = TokenDigest::of(candidate);
-        let snapshot = self.clients.load();
+        let snapshot = self.state.clients.load();
         let active = snapshot.get(&digest)?;
         Some(AuthorizedClient {
             token_id: active.token_id.clone(),
@@ -253,8 +281,21 @@ impl AuthRegistry {
         client_id: ClientId,
         issued_at: String,
     ) -> Result<TokenMaterial, AuthError> {
-        let _mutation = self.mutation.lock().await;
-        let material = TokenMaterial::generate_proxy(self.entropy.as_ref())?;
+        let state = Arc::clone(&self.state);
+        await_mutation_task(task::spawn(async move {
+            Self::issue_client_token_owned(state, token_id, client_id, issued_at).await
+        }))
+        .await
+    }
+
+    async fn issue_client_token_owned(
+        state: Arc<AuthRegistryState>,
+        token_id: String,
+        client_id: ClientId,
+        issued_at: String,
+    ) -> Result<TokenMaterial, AuthError> {
+        let _mutation = state.mutation.lock().await;
+        let material = TokenMaterial::generate_proxy(state.entropy.as_ref())?;
         let digest = material.digest();
         let metadata = ClientTokenMetadata {
             token_id: token_id.clone(),
@@ -262,12 +303,12 @@ impl AuthRegistry {
             digest: digest.into_bytes(),
             issued_at,
         };
-        run_metadata(Arc::clone(&self.metadata), move |store| {
+        run_metadata(Arc::clone(&state.metadata), move |store| {
             store.issue_client_token(&metadata)
         })
         .await?;
 
-        let mut clients = (**self.clients.load()).clone();
+        let mut clients = (**state.clients.load()).clone();
         clients.insert(
             digest,
             ActiveClient {
@@ -275,7 +316,7 @@ impl AuthRegistry {
                 client_id,
             },
         );
-        self.clients.store(Arc::new(clients));
+        state.clients.store(Arc::new(clients));
         Ok(material)
     }
 
@@ -285,21 +326,31 @@ impl AuthRegistry {
         token_id: String,
         revoked_at: String,
     ) -> Result<bool, AuthError> {
-        let _mutation = self.mutation.lock().await;
+        let state = Arc::clone(&self.state);
+        await_mutation_task(task::spawn(async move {
+            Self::revoke_client_token_owned(state, client_id, token_id, revoked_at).await
+        }))
+        .await
+    }
+
+    async fn revoke_client_token_owned(
+        state: Arc<AuthRegistryState>,
+        client_id: ClientId,
+        token_id: String,
+        revoked_at: String,
+    ) -> Result<bool, AuthError> {
+        let _mutation = state.mutation.lock().await;
         let persisted_client_id = client_id.clone();
         let persisted_token_id = token_id.clone();
-        let changed = run_metadata(Arc::clone(&self.metadata), move |store| {
+        let changed = run_metadata(Arc::clone(&state.metadata), move |store| {
             store.revoke_client_token(&persisted_client_id, &persisted_token_id, &revoked_at)
         })
         .await?;
-        if !changed {
-            return Ok(false);
-        }
 
-        let mut clients = (**self.clients.load()).clone();
+        let mut clients = (**state.clients.load()).clone();
         clients.retain(|_, active| active.token_id != token_id || active.client_id != client_id);
-        self.clients.store(Arc::new(clients));
-        Ok(true)
+        state.clients.store(Arc::new(clients));
+        Ok(changed)
     }
 }
 
@@ -307,8 +358,8 @@ impl fmt::Debug for AuthRegistry {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("AuthRegistry")
-            .field("management_digest", &self.management_digest)
-            .field("active_clients", &self.clients.load().len())
+            .field("management_digest", &self.state.management_digest)
+            .field("active_clients", &self.state.clients.load().len())
             .finish_non_exhaustive()
     }
 }
@@ -347,6 +398,12 @@ where
         .map_err(|_| AuthError::Storage)
 }
 
+async fn await_mutation_task<T>(
+    operation: task::JoinHandle<Result<T, AuthError>>,
+) -> Result<T, AuthError> {
+    operation.await.map_err(|_| AuthError::MutationTask)?
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
     #[error("runtime authentication metadata operation failed")]
@@ -361,6 +418,8 @@ pub enum AuthError {
     OrphanRecording { orphan_ref: SecretRef },
     #[error("blocking runtime authentication task failed")]
     BlockingTask,
+    #[error("runtime authentication mutation task failed")]
+    MutationTask,
     #[error(transparent)]
     Token(#[from] TokenError),
 }
