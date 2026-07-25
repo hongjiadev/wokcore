@@ -114,22 +114,20 @@ fn missing_required_environment_and_home_fails_closed() {
 #[test]
 fn resolving_paths_creates_no_directories_or_files() {
     let temporary_root = tempdir().expect("test temporary directory");
-    let app_data = temporary_root.path().join("absent-app-data");
-    let local_app_data = temporary_root.path().join("absent-local-app-data");
+    let environment = no_io_environment(temporary_root.path());
     let before = directory_entries(temporary_root.path());
-    let app_data_value = app_data.to_string_lossy().into_owned();
-    let local_app_data_value = local_app_data.to_string_lossy().into_owned();
     let paths = AppPaths::resolve(EnvironmentSnapshot::new(
-        Platform::Windows,
-        [
-            ("APPDATA", app_data_value.as_str()),
-            ("LOCALAPPDATA", local_app_data_value.as_str()),
-        ],
+        environment.platform,
+        environment
+            .values
+            .iter()
+            .map(|(name, value)| (*name, value.as_str())),
     ))
     .expect("paths resolve without materializing the supplied roots");
 
-    assert!(!app_data.exists());
-    assert!(!local_app_data.exists());
+    for root in environment.roots {
+        assert!(!root.exists());
+    }
     assert_eq!(directory_entries(temporary_root.path()), before);
     assert!(!paths.config_file.exists());
     assert!(!paths.state_db.exists());
@@ -137,6 +135,60 @@ fn resolving_paths_creates_no_directories_or_files() {
     assert!(!paths.log_dir.exists());
     assert!(!paths.discovery_file.exists());
     assert!(!paths.instance_lock.exists());
+}
+
+struct NoIoEnvironment {
+    platform: Platform,
+    values: Vec<(&'static str, String)>,
+    roots: Vec<std::path::PathBuf>,
+}
+
+#[cfg(windows)]
+fn no_io_environment(temporary_root: &Path) -> NoIoEnvironment {
+    let app_data = temporary_root.join("absent-app-data");
+    let local_app_data = temporary_root.join("absent-local-app-data");
+
+    NoIoEnvironment {
+        platform: Platform::Windows,
+        values: vec![
+            ("APPDATA", app_data.to_string_lossy().into_owned()),
+            (
+                "LOCALAPPDATA",
+                local_app_data.to_string_lossy().into_owned(),
+            ),
+        ],
+        roots: vec![app_data, local_app_data],
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn no_io_environment(temporary_root: &Path) -> NoIoEnvironment {
+    let config = temporary_root.join("absent-config");
+    let data = temporary_root.join("absent-data");
+    let state = temporary_root.join("absent-state");
+    let runtime = temporary_root.join("absent-runtime");
+
+    NoIoEnvironment {
+        platform: Platform::Linux,
+        values: vec![
+            ("XDG_CONFIG_HOME", config.to_string_lossy().into_owned()),
+            ("XDG_DATA_HOME", data.to_string_lossy().into_owned()),
+            ("XDG_STATE_HOME", state.to_string_lossy().into_owned()),
+            ("XDG_RUNTIME_DIR", runtime.to_string_lossy().into_owned()),
+        ],
+        roots: vec![config, data, state, runtime],
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn no_io_environment(temporary_root: &Path) -> NoIoEnvironment {
+    let home = temporary_root.join("absent-home");
+
+    NoIoEnvironment {
+        platform: Platform::Macos,
+        values: vec![("HOME", home.to_string_lossy().into_owned())],
+        roots: vec![home],
+    }
 }
 
 fn assert_path(path: &Path, expected: &str) {
