@@ -3,7 +3,7 @@ use std::{
     num::NonZeroU64,
     sync::{
         Arc,
-        atomic::{AtomicU8, AtomicUsize, Ordering},
+        atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
 };
 
@@ -39,7 +39,14 @@ impl AdmissionController {
             return Err(MaintenanceAdmission::new());
         }
 
+        #[cfg(test)]
+        self.shared
+            .checkpoint(AdmissionTestPoint::IncrementBeforePhaseRecheck);
+
         if self.shared.phase.load(Ordering::SeqCst) == PHASE_RUNNING {
+            #[cfg(test)]
+            self.shared
+                .checkpoint(AdmissionTestPoint::RunningPhaseRecheck);
             return Ok(ActiveRequestGuard {
                 shared: Arc::clone(&self.shared),
             });
@@ -98,7 +105,10 @@ impl MaintenanceAdmission {
 pub(crate) struct SharedLifecycle {
     pub(crate) phase: AtomicU8,
     pub(crate) active: AtomicUsize,
+    transition_revision: AtomicU64,
     zero_active: Notify,
+    #[cfg(test)]
+    test_hooks: AdmissionTestHooks,
 }
 
 impl SharedLifecycle {
@@ -106,7 +116,10 @@ impl SharedLifecycle {
         Self {
             phase: AtomicU8::new(PHASE_STARTING),
             active: AtomicUsize::new(0),
+            transition_revision: AtomicU64::new(0),
             zero_active: Notify::new(),
+            #[cfg(test)]
+            test_hooks: AdmissionTestHooks::default(),
         }
     }
 
@@ -125,6 +138,18 @@ impl SharedLifecycle {
         self.phase.store(phase, Ordering::SeqCst);
     }
 
+    pub(crate) fn advance_transition_revision(&self) -> bool {
+        self.transition_revision
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |revision| {
+                revision.checked_add(1)
+            })
+            .is_ok()
+    }
+
+    pub(crate) fn transition_revision(&self) -> u64 {
+        self.transition_revision.load(Ordering::SeqCst)
+    }
+
     pub(crate) fn active_requests(&self) -> usize {
         self.active.load(Ordering::SeqCst)
     }
@@ -134,6 +159,8 @@ impl SharedLifecycle {
             let notified = self.zero_active.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
+            #[cfg(test)]
+            self.checkpoint(AdmissionTestPoint::NotifyRegistrationBeforeZeroCheck);
             if self.active_requests() == 0 {
                 return;
             }
@@ -142,6 +169,10 @@ impl SharedLifecycle {
     }
 
     fn decrement_active(&self) {
+        #[cfg(test)]
+        self.test_hooks
+            .decrement_attempts
+            .fetch_add(1, Ordering::SeqCst);
         if Self::checked_decrement(&self.active) == DecrementOutcome::BecameZero {
             self.zero_active.notify_waiters();
         }
@@ -157,6 +188,43 @@ impl SharedLifecycle {
             Err(_) => unreachable!("checked subtraction fails only at zero"),
         }
     }
+
+    #[cfg(test)]
+    fn install_test_gate(&self, point: AdmissionTestPoint, gate: Arc<TestGate>) {
+        let slot = match point {
+            AdmissionTestPoint::IncrementBeforePhaseRecheck => {
+                &self.test_hooks.after_increment_before_phase_recheck
+            }
+            AdmissionTestPoint::RunningPhaseRecheck => &self.test_hooks.after_running_phase_recheck,
+            AdmissionTestPoint::NotifyRegistrationBeforeZeroCheck => {
+                &self.test_hooks.after_notify_registration_before_zero_check
+            }
+        };
+        *slot.lock().unwrap() = Some(gate);
+    }
+
+    #[cfg(test)]
+    fn checkpoint(&self, point: AdmissionTestPoint) {
+        let slot = match point {
+            AdmissionTestPoint::IncrementBeforePhaseRecheck => {
+                &self.test_hooks.after_increment_before_phase_recheck
+            }
+            AdmissionTestPoint::RunningPhaseRecheck => &self.test_hooks.after_running_phase_recheck,
+            AdmissionTestPoint::NotifyRegistrationBeforeZeroCheck => {
+                &self.test_hooks.after_notify_registration_before_zero_check
+            }
+        };
+        let gate = slot.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.reached.wait();
+            gate.release.wait();
+        }
+    }
+
+    #[cfg(test)]
+    fn decrement_attempts(&self) -> usize {
+        self.test_hooks.decrement_attempts.load(Ordering::SeqCst)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -167,13 +235,193 @@ enum DecrementOutcome {
 }
 
 #[cfg(test)]
+#[derive(Clone, Copy)]
+enum AdmissionTestPoint {
+    IncrementBeforePhaseRecheck,
+    RunningPhaseRecheck,
+    NotifyRegistrationBeforeZeroCheck,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct AdmissionTestHooks {
+    after_increment_before_phase_recheck: std::sync::Mutex<Option<Arc<TestGate>>>,
+    after_running_phase_recheck: std::sync::Mutex<Option<Arc<TestGate>>>,
+    after_notify_registration_before_zero_check: std::sync::Mutex<Option<Arc<TestGate>>>,
+    decrement_attempts: AtomicUsize,
+}
+
+#[cfg(test)]
+struct TestGate {
+    reached: std::sync::Barrier,
+    release: std::sync::Barrier,
+}
+
+#[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
+    use std::{
+        sync::{
+            Arc, Barrier,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
     };
 
-    use super::{AdmissionController, DecrementOutcome, SharedLifecycle};
+    use tokio::{sync::oneshot, task::yield_now, time::timeout};
+
+    use super::{
+        AdmissionController, AdmissionTestPoint, DecrementOutcome, SharedLifecycle, TestGate,
+    };
+    use crate::lifecycle::{DrainOutcome, LifecyclePhase, ServiceLifecycle};
+
+    const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+    impl TestGate {
+        fn new() -> Self {
+            Self {
+                reached: Barrier::new(2),
+                release: Barrier::new(2),
+            }
+        }
+    }
+
+    async fn wait_for_phase(lifecycle: &ServiceLifecycle, expected: LifecyclePhase) {
+        timeout(TEST_TIMEOUT, async {
+            loop {
+                if lifecycle.snapshot().phase == expected {
+                    return;
+                }
+                yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admission_paused_after_increment_rolls_back_when_drain_publishes() {
+        let lifecycle = Arc::new(ServiceLifecycle::new());
+        lifecycle.mark_running().unwrap();
+        let admission = lifecycle.admission_controller();
+        let gate = Arc::new(TestGate::new());
+        admission.shared.install_test_gate(
+            AdmissionTestPoint::IncrementBeforePhaseRecheck,
+            Arc::clone(&gate),
+        );
+        let admission_thread = std::thread::spawn(move || admission.try_enter());
+
+        gate.reached.wait();
+        assert_eq!(lifecycle.snapshot().active_requests, 1);
+        let lifecycle_for_drain = Arc::clone(&lifecycle);
+        let drain =
+            tokio::spawn(
+                async move { lifecycle_for_drain.begin_drain(TEST_TIMEOUT).await.unwrap() },
+            );
+        wait_for_phase(&lifecycle, LifecyclePhase::Draining).await;
+        gate.release.wait();
+
+        assert!(admission_thread.join().unwrap().is_err());
+        assert_eq!(drain.await.unwrap(), DrainOutcome::Completed);
+        assert_eq!(lifecycle.snapshot().active_requests, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admission_that_rechecks_running_before_drain_is_counted_as_existing() {
+        let lifecycle = Arc::new(ServiceLifecycle::new());
+        lifecycle.mark_running().unwrap();
+        let admission = lifecycle.admission_controller();
+        let gate = Arc::new(TestGate::new());
+        admission
+            .shared
+            .install_test_gate(AdmissionTestPoint::RunningPhaseRecheck, Arc::clone(&gate));
+        let admission_thread = std::thread::spawn(move || admission.try_enter());
+
+        gate.reached.wait();
+        let lifecycle_for_drain = Arc::clone(&lifecycle);
+        let drain =
+            tokio::spawn(
+                async move { lifecycle_for_drain.begin_drain(TEST_TIMEOUT).await.unwrap() },
+            );
+        wait_for_phase(&lifecycle, LifecyclePhase::Draining).await;
+        gate.release.wait();
+
+        let guard = admission_thread.join().unwrap().unwrap();
+        assert_eq!(lifecycle.snapshot().active_requests, 1);
+        drop(guard);
+        assert_eq!(drain.await.unwrap(), DrainOutcome::Completed);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn zero_wait_registers_notification_before_the_active_check_window() {
+        let lifecycle = Arc::new(ServiceLifecycle::new());
+        lifecycle.mark_running().unwrap();
+        let admission = lifecycle.admission_controller();
+        let guard = admission.try_enter().unwrap();
+        let gate = Arc::new(TestGate::new());
+        admission.shared.install_test_gate(
+            AdmissionTestPoint::NotifyRegistrationBeforeZeroCheck,
+            Arc::clone(&gate),
+        );
+        let lifecycle_for_wait = Arc::clone(&lifecycle);
+        let waiter = tokio::spawn(async move {
+            lifecycle_for_wait.wait_for_zero_active().await;
+        });
+
+        gate.reached.wait();
+        drop(guard);
+        gate.release.wait();
+
+        timeout(TEST_TIMEOUT, waiter).await.unwrap().unwrap();
+        assert_eq!(lifecycle.snapshot().active_requests, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn each_guard_drop_path_attempts_exactly_one_decrement() {
+        let lifecycle = ServiceLifecycle::new();
+        lifecycle.mark_running().unwrap();
+        let admission = lifecycle.admission_controller();
+        let survivor = admission.try_enter().unwrap();
+        let normal = admission.try_enter().unwrap();
+        drop(normal);
+        assert_eq!(admission.shared.decrement_attempts(), 1);
+        assert_eq!(lifecycle.snapshot().active_requests, 1);
+        drop(survivor);
+        assert_eq!(admission.shared.decrement_attempts(), 2);
+
+        let lifecycle = ServiceLifecycle::new();
+        lifecycle.mark_running().unwrap();
+        let admission = lifecycle.admission_controller();
+        let survivor = admission.try_enter().unwrap();
+        let (entered, ready) = oneshot::channel();
+        let admission_for_abort = admission.clone();
+        let aborted = tokio::spawn(async move {
+            let _target = admission_for_abort.try_enter().unwrap();
+            entered.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        ready.await.unwrap();
+        aborted.abort();
+        assert!(aborted.await.unwrap_err().is_cancelled());
+        assert_eq!(admission.shared.decrement_attempts(), 1);
+        assert_eq!(lifecycle.snapshot().active_requests, 1);
+        drop(survivor);
+        assert_eq!(admission.shared.decrement_attempts(), 2);
+
+        let lifecycle = ServiceLifecycle::new();
+        lifecycle.mark_running().unwrap();
+        let admission = lifecycle.admission_controller();
+        let survivor = admission.try_enter().unwrap();
+        let admission_for_panic = admission.clone();
+        let panicked = tokio::spawn(async move {
+            let _target = admission_for_panic.try_enter().unwrap();
+            panic!("intentional decrement observer unwind");
+        });
+        assert!(panicked.await.unwrap_err().is_panic());
+        assert_eq!(admission.shared.decrement_attempts(), 1);
+        assert_eq!(lifecycle.snapshot().active_requests, 1);
+        drop(survivor);
+        assert_eq!(admission.shared.decrement_attempts(), 2);
+    }
 
     #[test]
     fn active_counter_overflow_is_rejected_without_wrapping() {
