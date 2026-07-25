@@ -6,7 +6,8 @@ use uuid::Uuid;
 use crate::{AppPaths, PlatformError};
 
 use super::permissions::{
-    open_existing_runtime_directory, open_existing_secure_file, publish_secure_file,
+    open_existing_runtime_directory, open_existing_secure_file,
+    open_existing_secure_file_for_update, prepare_secure_publish, publish_secure_file,
     remove_open_secure_file, sync_parent_directory,
 };
 
@@ -56,13 +57,16 @@ impl DiscoveryStore {
         }
 
         let runtime_dir = open_existing_runtime_directory(&self.runtime_dir)?;
-        match open_existing_secure_file(&runtime_dir, &self.path) {
-            Ok(existing) => drop(existing),
-            Err(PlatformError::Io { source }) if source.kind() == std::io::ErrorKind::NotFound => {}
+        prepare_secure_publish(&runtime_dir, &self.runtime_dir)?;
+        let existing = match open_existing_secure_file_for_update(&runtime_dir, &self.path) {
+            Ok(existing) => Some(existing),
+            Err(PlatformError::Io { source }) if source.kind() == std::io::ErrorKind::NotFound => {
+                None
+            }
             Err(error) => return Err(error),
-        }
+        };
 
-        publish_secure_file(&runtime_dir, &self.path, &document)?;
+        publish_secure_file(&runtime_dir, &self.path, &document, existing)?;
         sync_parent_directory(&runtime_dir)?;
         Ok(())
     }

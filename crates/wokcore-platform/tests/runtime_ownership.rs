@@ -86,6 +86,44 @@ fn cross_process_lease_holder_helper() {
     drop(lease);
 }
 
+#[cfg(unix)]
+#[test]
+fn exec_child_does_not_extend_the_runtime_lease_lifetime() {
+    let directory = tempdir().unwrap();
+    let paths = test_paths(directory.path());
+    let owner = RuntimeLease::acquire(&paths).unwrap();
+    let ready = directory.path().join("exec-child-ready");
+    let release = directory.path().join("release-exec-child");
+    let mut child = Command::new(env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "exec_waiting_child_helper",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("WOKCORE_TEST_EXEC_CHILD_READY", &ready)
+        .env("WOKCORE_TEST_EXEC_CHILD_RELEASE", &release)
+        .spawn()
+        .unwrap();
+
+    wait_until_exists(&ready, Duration::from_secs(10));
+    drop(owner);
+    let replacement = RuntimeLease::acquire(&paths);
+    fs::write(&release, b"release").unwrap();
+    assert!(child.wait().unwrap().success());
+    drop(replacement.expect("an exec child must not inherit and extend the runtime lock"));
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "spawned only by exec_child_does_not_extend_the_runtime_lease_lifetime"]
+fn exec_waiting_child_helper() {
+    let ready = env::var_os("WOKCORE_TEST_EXEC_CHILD_READY").unwrap();
+    let release = env::var_os("WOKCORE_TEST_EXEC_CHILD_RELEASE").unwrap();
+    fs::write(&ready, b"ready").unwrap();
+    wait_until_exists(Path::new(&release), Duration::from_secs(10));
+}
+
 #[test]
 fn dropping_the_owner_releases_the_operating_system_lock() {
     let directory = tempdir().unwrap();

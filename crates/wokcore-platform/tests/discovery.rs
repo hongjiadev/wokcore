@@ -256,10 +256,15 @@ fn reads_and_failed_ownership_checks_do_not_mutate_bytes_or_mtime() {
     let fixture = Fixture::new();
     fixture.store.publish(&sample_record()).unwrap();
     let before = snapshot(&fixture.paths.discovery_file);
+    let entries_before = directory_entries(&fixture.paths.runtime_dir);
 
     assert_eq!(fixture.store.read().unwrap(), sample_record());
     assert!(!fixture.store.remove_if_owned(Uuid::nil()).unwrap());
     assert_eq!(snapshot(&fixture.paths.discovery_file), before);
+    assert_eq!(
+        directory_entries(&fixture.paths.runtime_dir),
+        entries_before
+    );
 }
 
 #[test]
@@ -283,6 +288,53 @@ fn owned_removal_preserves_a_replacement_instance() {
 
     assert!(!fixture.store.remove_if_owned(original.instance_id).unwrap());
     assert_eq!(fixture.store.read().unwrap(), replacement);
+}
+
+#[test]
+fn repeated_publish_remove_lifecycles_keep_internal_tombstones_bounded() {
+    let fixture = Fixture::new();
+
+    for pid in 5000..5008 {
+        let mut record = sample_record();
+        record.pid = pid;
+        record.instance_id = Uuid::new_v4();
+        fixture.store.publish(&record).unwrap();
+        assert_eq!(fixture.store.read().unwrap(), record);
+        assert!(internal_runtime_entries(&fixture.paths.runtime_dir).len() <= 1);
+
+        assert!(fixture.store.remove_if_owned(record.instance_id).unwrap());
+        assert!(!fixture.paths.discovery_file.exists());
+        assert!(internal_runtime_entries(&fixture.paths.runtime_dir).len() <= 1);
+    }
+}
+
+#[test]
+fn malformed_reserved_tombstone_fails_publish_closed() {
+    let fixture = Fixture::new();
+    let malformed = fixture.paths.runtime_dir.join(".wokcore-tombstone-invalid");
+    fs::create_dir(&malformed).unwrap();
+
+    assert!(matches!(
+        fixture.store.publish(&sample_record()),
+        Err(PlatformError::UnsafeRuntimePath)
+    ));
+    assert!(!fixture.paths.discovery_file.exists());
+    assert!(malformed.is_dir());
+}
+
+#[test]
+fn identity_mismatched_reserved_tombstone_is_preserved_and_fails_closed() {
+    let fixture = Fixture::new();
+    let mismatched = fixture.paths.runtime_dir.join(mismatched_tombstone_name());
+    fs::write(&mismatched, b"competing internal entry").unwrap();
+    harden_test_tombstone(&mismatched);
+
+    assert!(matches!(
+        fixture.store.publish(&sample_record()),
+        Err(PlatformError::UnsafeRuntimePath)
+    ));
+    assert_eq!(fs::read(mismatched).unwrap(), b"competing internal entry");
+    assert!(!fixture.paths.discovery_file.exists());
 }
 
 #[test]
@@ -410,6 +462,33 @@ fn directory_entries(path: &Path) -> Vec<std::ffi::OsString> {
     entries.sort();
     entries
 }
+
+fn internal_runtime_entries(path: &Path) -> Vec<std::ffi::OsString> {
+    directory_entries(path)
+        .into_iter()
+        .filter(|name| name.to_string_lossy().starts_with(".wokcore-"))
+        .collect()
+}
+
+#[cfg(unix)]
+fn mismatched_tombstone_name() -> &'static str {
+    ".wokcore-tombstone-u-0000000000000000-0000000000000000"
+}
+
+#[cfg(windows)]
+fn mismatched_tombstone_name() -> &'static str {
+    ".wokcore-tombstone-w-00000000-00000000-00000000"
+}
+
+#[cfg(unix)]
+fn harden_test_tombstone(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+#[cfg(windows)]
+fn harden_test_tombstone(_path: &Path) {}
 
 #[cfg(unix)]
 fn create_file_symlink(target: &Path, link: &Path) {

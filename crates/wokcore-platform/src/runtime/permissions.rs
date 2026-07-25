@@ -5,6 +5,10 @@ use std::{
 
 use crate::PlatformError;
 
+const TOMBSTONE_PREFIX: &str = ".wokcore-tombstone-";
+#[cfg(unix)]
+const PUBLISH_STAGING_NAME: &str = ".wokcore-publish-staging";
+
 #[cfg(unix)]
 pub(super) fn open_or_create_runtime_directory(path: &Path) -> Result<File, PlatformError> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -88,6 +92,14 @@ pub(super) fn open_existing_secure_file(
 }
 
 #[cfg(unix)]
+pub(super) fn open_existing_secure_file_for_update(
+    directory: &File,
+    path: &Path,
+) -> Result<File, PlatformError> {
+    open_existing_secure_file(directory, path)
+}
+
+#[cfg(unix)]
 fn unix_child_name(path: &Path) -> Result<std::ffi::CString, PlatformError> {
     use std::os::unix::ffi::OsStrExt;
 
@@ -104,7 +116,14 @@ fn unix_openat(
 ) -> Result<File, PlatformError> {
     use std::os::fd::{AsRawFd, FromRawFd};
 
-    let descriptor = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags, mode) };
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            flags | libc::O_CLOEXEC,
+            mode,
+        )
+    };
     if descriptor < 0 {
         let source = std::io::Error::last_os_error();
         return Err(match source.raw_os_error() {
@@ -113,6 +132,48 @@ fn unix_openat(
         });
     }
     Ok(unsafe { File::from_raw_fd(descriptor) })
+}
+
+#[cfg(unix)]
+fn unix_rename_noreplace(
+    directory: &File,
+    source: &std::ffi::CStr,
+    destination: &std::ffi::CStr,
+) -> Result<(), PlatformError> {
+    use std::os::fd::AsRawFd;
+
+    let descriptor = directory.as_raw_fd();
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let result = unsafe {
+        libc::renameat2(
+            descriptor,
+            source.as_ptr(),
+            descriptor,
+            destination.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    #[cfg(target_vendor = "apple")]
+    let result = unsafe {
+        libc::renameatx_np(
+            descriptor,
+            source.as_ptr(),
+            descriptor,
+            destination.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+    return Err(PlatformError::UnsafeRuntimePath);
+
+    if result != 0 {
+        let source = std::io::Error::last_os_error();
+        return Err(match source.raw_os_error() {
+            Some(libc::EEXIST) => PlatformError::UnsafeRuntimePath,
+            _ => PlatformError::Io { source },
+        });
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -136,75 +197,209 @@ pub(super) fn harden_secure_file(file: &File, _path: &Path) -> Result<(), Platfo
 }
 
 #[cfg(unix)]
-pub(super) fn publish_secure_file(
+pub(super) fn prepare_secure_publish(
     directory: &File,
-    destination: &Path,
-    document: &[u8],
+    _runtime_path: &Path,
 ) -> Result<(), PlatformError> {
-    use std::{io::Write, os::fd::AsRawFd};
-
-    struct TemporaryEntry<'a> {
-        directory: &'a File,
-        name: std::ffi::CString,
-        file: File,
-        committed: bool,
+    cleanup_unix_internal_entry(directory, PUBLISH_STAGING_NAME, None)?;
+    for name in list_unix_tombstones(directory)? {
+        let expected =
+            parse_unix_tombstone_identity(&name).ok_or(PlatformError::UnsafeRuntimePath)?;
+        let name = name
+            .to_str()
+            .map_err(|_| PlatformError::UnsafeRuntimePath)?;
+        cleanup_unix_internal_entry(directory, name, Some(expected))?;
     }
+    Ok(())
+}
 
-    impl Drop for TemporaryEntry<'_> {
-        fn drop(&mut self) {
-            if !self.committed {
-                use std::os::fd::AsRawFd;
+#[cfg(unix)]
+fn cleanup_unix_internal_entry(
+    directory: &File,
+    reserved_name: &str,
+    expected: Option<(u64, u64)>,
+) -> Result<(), PlatformError> {
+    use std::os::fd::AsRawFd;
 
-                unsafe {
-                    libc::unlinkat(self.directory.as_raw_fd(), self.name.as_ptr(), 0);
-                }
-            }
+    let name = std::ffi::CString::new(reserved_name)
+        .expect("reserved internal runtime name contains no NUL");
+    let file = match unix_openat(directory, &name, libc::O_RDONLY | libc::O_NOFOLLOW, 0) {
+        Ok(file) => file,
+        Err(PlatformError::Io { source }) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(());
         }
-    }
-
-    let destination = unix_child_name(destination)?;
-    let mut temporary = loop {
-        let name = std::ffi::CString::new(format!(".wokcore-publish-{}.tmp", uuid::Uuid::new_v4()))
-            .expect("generated temporary name contains no NUL");
-        match unix_openat(
-            directory,
-            &name,
-            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW,
-            0o600,
-        ) {
-            Ok(file) => {
-                break TemporaryEntry {
-                    directory,
-                    name,
-                    file,
-                    committed: false,
-                };
-            }
-            Err(PlatformError::Io { source }) if source.raw_os_error() == Some(libc::EEXIST) => {}
-            Err(error) => return Err(error),
-        }
+        Err(error) => return Err(error),
     };
-    harden_secure_file(&temporary.file, Path::new(""))?;
-    temporary.file.write_all(document)?;
-    temporary.file.sync_all()?;
-    #[cfg(test)]
-    run_publish_after_temp_creation_hook()?;
-
-    if unsafe {
-        libc::renameat(
-            directory.as_raw_fd(),
-            temporary.name.as_ptr(),
-            directory.as_raw_fd(),
-            destination.as_ptr(),
-        )
-    } != 0
-    {
+    verify_unix_file(&file)?;
+    let metadata = file.metadata()?;
+    if expected.is_some_and(|identity| identity != unix_file_identity(&metadata)) {
+        return Err(PlatformError::UnsafeRuntimePath);
+    }
+    if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) } != 0 {
         return Err(PlatformError::Io {
             source: std::io::Error::last_os_error(),
         });
     }
-    temporary.committed = true;
     Ok(())
+}
+
+#[cfg(unix)]
+fn unix_file_identity(metadata: &fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+
+    (metadata.dev(), metadata.ino())
+}
+
+#[cfg(unix)]
+fn unix_tombstone_name(metadata: &fs::Metadata) -> std::ffi::CString {
+    let (device, inode) = unix_file_identity(metadata);
+    std::ffi::CString::new(format!("{TOMBSTONE_PREFIX}u-{device:016x}-{inode:016x}"))
+        .expect("generated tombstone name contains no NUL")
+}
+
+#[cfg(unix)]
+fn parse_unix_tombstone_identity(name: &std::ffi::CStr) -> Option<(u64, u64)> {
+    let value = std::str::from_utf8(name.to_bytes()).ok()?;
+    let identity = value.strip_prefix(&format!("{TOMBSTONE_PREFIX}u-"))?;
+    let (device, inode) = identity.split_once('-')?;
+    if device.len() != 16 || inode.len() != 16 || inode.contains('-') {
+        return None;
+    }
+    Some((
+        u64::from_str_radix(device, 16).ok()?,
+        u64::from_str_radix(inode, 16).ok()?,
+    ))
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn list_unix_tombstones(directory: &File) -> Result<Vec<std::ffi::CString>, PlatformError> {
+    use std::os::fd::AsRawFd;
+
+    struct DirectoryStream(*mut libc::DIR);
+
+    impl Drop for DirectoryStream {
+        fn drop(&mut self) {
+            unsafe {
+                libc::closedir(self.0);
+            }
+        }
+    }
+
+    let duplicated = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    if duplicated < 0 {
+        return Err(PlatformError::Io {
+            source: std::io::Error::last_os_error(),
+        });
+    }
+    let stream = unsafe { libc::fdopendir(duplicated) };
+    if stream.is_null() {
+        unsafe {
+            libc::close(duplicated);
+        }
+        return Err(PlatformError::Io {
+            source: std::io::Error::last_os_error(),
+        });
+    }
+    let stream = DirectoryStream(stream);
+    let mut names = Vec::new();
+    loop {
+        set_unix_errno(0);
+        let entry = unsafe { libc::readdir(stream.0) };
+        if entry.is_null() {
+            let error = unix_errno();
+            if error != 0 {
+                return Err(PlatformError::Io {
+                    source: std::io::Error::from_raw_os_error(error),
+                });
+            }
+            break;
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+        if name.to_bytes().starts_with(TOMBSTONE_PREFIX.as_bytes()) {
+            names.push(name.to_owned());
+        }
+    }
+    Ok(names)
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "android", target_vendor = "apple"))
+))]
+fn list_unix_tombstones(_directory: &File) -> Result<Vec<std::ffi::CString>, PlatformError> {
+    Err(PlatformError::UnsafeRuntimePath)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn unix_errno() -> i32 {
+    unsafe { *libc::__errno_location() }
+}
+
+#[cfg(target_vendor = "apple")]
+fn unix_errno() -> i32 {
+    unsafe { *libc::__error() }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn set_unix_errno(value: i32) {
+    unsafe {
+        *libc::__errno_location() = value;
+    }
+}
+
+#[cfg(target_vendor = "apple")]
+fn set_unix_errno(value: i32) {
+    unsafe {
+        *libc::__error() = value;
+    }
+}
+
+#[cfg(unix)]
+pub(super) fn publish_secure_file(
+    directory: &File,
+    destination: &Path,
+    document: &[u8],
+    existing: Option<File>,
+) -> Result<(), PlatformError> {
+    use std::{io::Write, os::unix::fs::MetadataExt};
+
+    let destination = unix_child_name(destination)?;
+    let staging_name = std::ffi::CString::new(PUBLISH_STAGING_NAME)
+        .expect("reserved internal runtime name contains no NUL");
+    let mut temporary = unix_openat(
+        directory,
+        &staging_name,
+        libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW,
+        0o600,
+    )?;
+    harden_secure_file(&temporary, Path::new(""))?;
+    let temporary_name = unix_tombstone_name(&temporary.metadata()?);
+    unix_rename_noreplace(directory, &staging_name, &temporary_name)?;
+    temporary.write_all(document)?;
+    temporary.sync_all()?;
+    #[cfg(test)]
+    run_publish_after_temp_creation_hook()?;
+
+    if let Some(existing) = existing {
+        let expected = existing.metadata()?;
+        let retired_name = unix_tombstone_name(&expected);
+        unix_rename_noreplace(directory, &destination, &retired_name)?;
+        let retired = unix_openat(
+            directory,
+            &retired_name,
+            libc::O_RDONLY | libc::O_NOFOLLOW,
+            0,
+        )?;
+        let retired_metadata = retired.metadata()?;
+        if !retired_metadata.is_file()
+            || retired_metadata.dev() != expected.dev()
+            || retired_metadata.ino() != expected.ino()
+        {
+            return Err(PlatformError::UnsafeRuntimePath);
+        }
+    }
+
+    unix_rename_noreplace(directory, &temporary_name, &destination)
 }
 
 #[cfg(unix)]
@@ -214,76 +409,25 @@ pub(super) fn remove_open_secure_file(
     path: &Path,
 ) -> Result<(), PlatformError> {
     use std::os::unix::fs::MetadataExt;
-    use std::os::unix::io::AsRawFd;
 
     let opened = file.metadata()?;
     #[cfg(test)]
     run_unix_remove_after_identity_check_hook();
 
+    prepare_secure_publish(directory, Path::new(""))?;
     let canonical = unix_child_name(path)?;
-    let quarantine =
-        std::ffi::CString::new(format!(".wokcore-remove-{}.tmp", uuid::Uuid::new_v4()))
-            .expect("generated quarantine name contains no NUL");
-    if unsafe {
-        libc::renameat(
-            directory.as_raw_fd(),
-            canonical.as_ptr(),
-            directory.as_raw_fd(),
-            quarantine.as_ptr(),
-        )
-    } != 0
-    {
-        return Err(PlatformError::Io {
-            source: std::io::Error::last_os_error(),
-        });
-    }
-
-    let quarantined = unix_openat(directory, &quarantine, libc::O_RDONLY | libc::O_NOFOLLOW, 0);
-    let matches_opened = match quarantined {
-        Ok(file) => file.metadata().is_ok_and(|metadata| {
-            metadata.is_file() && metadata.dev() == opened.dev() && metadata.ino() == opened.ino()
-        }),
-        Err(_) => false,
-    };
+    let tombstone = unix_tombstone_name(&opened);
+    unix_rename_noreplace(directory, &canonical, &tombstone)?;
+    let tombstone_file = unix_openat(directory, &tombstone, libc::O_RDONLY | libc::O_NOFOLLOW, 0)?;
+    let matches_opened = tombstone_file.metadata().is_ok_and(|metadata| {
+        metadata.is_file() && metadata.dev() == opened.dev() && metadata.ino() == opened.ino()
+    });
+    #[cfg(test)]
+    run_unix_remove_after_quarantine_verification_hook(&tombstone, matches_opened);
     if !matches_opened {
-        restore_unix_quarantine(directory, &quarantine, &canonical)?;
         return Err(PlatformError::UnsafeRuntimePath);
     }
 
-    if unsafe { libc::unlinkat(directory.as_raw_fd(), quarantine.as_ptr(), 0) } != 0 {
-        return Err(PlatformError::Io {
-            source: std::io::Error::last_os_error(),
-        });
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn restore_unix_quarantine(
-    directory: &File,
-    quarantine: &std::ffi::CStr,
-    canonical: &std::ffi::CStr,
-) -> Result<(), PlatformError> {
-    use std::os::fd::AsRawFd;
-
-    let descriptor = directory.as_raw_fd();
-    if unsafe {
-        libc::linkat(
-            descriptor,
-            quarantine.as_ptr(),
-            descriptor,
-            canonical.as_ptr(),
-            0,
-        )
-    } != 0
-    {
-        return Err(PlatformError::UnsafeRuntimePath);
-    }
-    if unsafe { libc::unlinkat(descriptor, quarantine.as_ptr(), 0) } != 0 {
-        return Err(PlatformError::Io {
-            source: std::io::Error::last_os_error(),
-        });
-    }
     Ok(())
 }
 
@@ -318,6 +462,52 @@ fn with_unix_remove_after_identity_check_hook<T>(
     impl Drop for ResetHook {
         fn drop(&mut self) {
             UNIX_REMOVE_AFTER_IDENTITY_CHECK_HOOK.with(|slot| {
+                slot.borrow_mut().take();
+            });
+        }
+    }
+
+    let _reset = ResetHook;
+    operation()
+}
+
+#[cfg(all(test, unix))]
+type UnixRemoveAfterQuarantineVerificationHook = Box<dyn FnOnce(&std::ffi::CStr, bool)>;
+
+#[cfg(all(test, unix))]
+thread_local! {
+    static UNIX_REMOVE_AFTER_QUARANTINE_VERIFICATION_HOOK:
+        std::cell::RefCell<Option<UnixRemoveAfterQuarantineVerificationHook>> =
+            const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, unix))]
+fn run_unix_remove_after_quarantine_verification_hook(
+    quarantine: &std::ffi::CStr,
+    matches_opened: bool,
+) {
+    UNIX_REMOVE_AFTER_QUARANTINE_VERIFICATION_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook(quarantine, matches_opened);
+        }
+    });
+}
+
+#[cfg(all(test, unix))]
+fn with_unix_remove_after_quarantine_verification_hook<T>(
+    hook: impl FnOnce(&std::ffi::CStr, bool) + 'static,
+    operation: impl FnOnce() -> T,
+) -> T {
+    UNIX_REMOVE_AFTER_QUARANTINE_VERIFICATION_HOOK.with(|slot| {
+        assert!(slot.borrow().is_none());
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+
+    struct ResetHook;
+
+    impl Drop for ResetHook {
+        fn drop(&mut self) {
+            UNIX_REMOVE_AFTER_QUARANTINE_VERIFICATION_HOOK.with(|slot| {
                 slot.borrow_mut().take();
             });
         }
@@ -476,6 +666,14 @@ pub(super) fn open_existing_secure_file(
     path: &Path,
 ) -> Result<File, PlatformError> {
     open_windows_existing_file(path, false)
+}
+
+#[cfg(windows)]
+pub(super) fn open_existing_secure_file_for_update(
+    _directory: &File,
+    path: &Path,
+) -> Result<File, PlatformError> {
+    open_windows_existing_file(path, true)
 }
 
 #[cfg(windows)]
@@ -779,10 +977,89 @@ pub(super) fn harden_secure_file(file: &File, path: &Path) -> Result<(), Platfor
 }
 
 #[cfg(windows)]
+pub(super) fn prepare_secure_publish(
+    _directory: &File,
+    runtime_path: &Path,
+) -> Result<(), PlatformError> {
+    for entry in fs::read_dir(runtime_path)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            return Err(PlatformError::UnsafeRuntimePath);
+        };
+        if !name.starts_with(TOMBSTONE_PREFIX) {
+            continue;
+        }
+        let expected =
+            parse_windows_tombstone_identity(name).ok_or(PlatformError::UnsafeRuntimePath)?;
+        cleanup_windows_internal_entry(&entry.path(), expected)?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn cleanup_windows_internal_entry(
+    path: &Path,
+    expected: (u32, u32, u32),
+) -> Result<(), PlatformError> {
+    let file = open_windows_existing_file(path, true)?;
+    if windows_file_identity(&file)? != expected {
+        return Err(PlatformError::UnsafeRuntimePath);
+    }
+    delete_windows_file(file)
+}
+
+#[cfg(windows)]
+fn windows_file_identity(file: &File) -> Result<(u32, u32, u32), PlatformError> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) } == 0 {
+        return Err(PlatformError::Io {
+            source: std::io::Error::last_os_error(),
+        });
+    }
+    Ok((
+        information.dwVolumeSerialNumber,
+        information.nFileIndexHigh,
+        information.nFileIndexLow,
+    ))
+}
+
+#[cfg(windows)]
+fn windows_tombstone_name(file: &File) -> Result<String, PlatformError> {
+    let (volume, high, low) = windows_file_identity(file)?;
+    Ok(format!(
+        "{TOMBSTONE_PREFIX}w-{volume:08x}-{high:08x}-{low:08x}"
+    ))
+}
+
+#[cfg(windows)]
+fn parse_windows_tombstone_identity(name: &str) -> Option<(u32, u32, u32)> {
+    let identity = name.strip_prefix(&format!("{TOMBSTONE_PREFIX}w-"))?;
+    let mut fields = identity.split('-');
+    let volume = fields.next()?;
+    let high = fields.next()?;
+    let low = fields.next()?;
+    if fields.next().is_some() || volume.len() != 8 || high.len() != 8 || low.len() != 8 {
+        return None;
+    }
+    Some((
+        u32::from_str_radix(volume, 16).ok()?,
+        u32::from_str_radix(high, 16).ok()?,
+        u32::from_str_radix(low, 16).ok()?,
+    ))
+}
+
+#[cfg(windows)]
 pub(super) fn publish_secure_file(
     _directory: &File,
     destination: &Path,
     document: &[u8],
+    existing: Option<File>,
 ) -> Result<(), PlatformError> {
     use std::io::Write;
 
@@ -796,76 +1073,80 @@ pub(super) fn publish_secure_file(
     #[cfg(test)]
     run_publish_after_temp_creation_hook()?;
 
-    let temporary_path = temporary.into_temp_path();
-    replace_windows_file(temporary_path.as_ref(), destination)?;
+    if let Some(existing) = existing.as_ref() {
+        let retired = parent.join(windows_tombstone_name(existing)?);
+        rename_windows_file_noreplace(existing, &retired)?;
+    }
+
+    let persisted =
+        temporary
+            .persist_noclobber(destination)
+            .map_err(|error| match error.error.kind() {
+                std::io::ErrorKind::AlreadyExists => PlatformError::UnsafeRuntimePath,
+                _ => PlatformError::Io {
+                    source: error.error,
+                },
+            })?;
+    persisted.sync_all()?;
+    if let Some(existing) = existing {
+        delete_windows_file(existing)?;
+    }
     Ok(())
 }
 
 #[cfg(windows)]
-fn replace_windows_file(source: &Path, destination: &Path) -> Result<(), PlatformError> {
-    use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
+fn rename_windows_file_noreplace(file: &File, destination: &Path) -> Result<(), PlatformError> {
+    use std::{
+        mem::{offset_of, size_of},
+        os::windows::io::AsRawHandle,
+    };
 
-    if !destination.exists() {
-        return fs::rename(source, destination).map_err(PlatformError::from);
-    }
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_RENAME_INFO, FileRenameInfo, SetFileInformationByHandle,
+    };
 
-    let source = wide_path(source);
-    let destination = wide_path(destination);
-    if unsafe {
-        ReplaceFileW(
+    use std::os::windows::ffi::OsStrExt;
+
+    let destination = destination.as_os_str().encode_wide().collect::<Vec<_>>();
+    let buffer_size = offset_of!(FILE_RENAME_INFO, FileName) + size_of_val(destination.as_slice());
+    let mut buffer = vec![0_usize; buffer_size.div_ceil(size_of::<usize>())];
+    let information = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    unsafe {
+        (*information).Anonymous.ReplaceIfExists = false;
+        (*information).RootDirectory = std::ptr::null_mut();
+        (*information).FileNameLength = size_of_val(destination.as_slice()) as u32;
+        std::ptr::copy_nonoverlapping(
             destination.as_ptr(),
-            source.as_ptr(),
-            std::ptr::null(),
-            0,
-            std::ptr::null(),
-            std::ptr::null(),
+            (&raw mut (*information).FileName).cast::<u16>(),
+            destination.len(),
+        );
+    }
+    if unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            FileRenameInfo,
+            information.cast(),
+            buffer_size as u32,
         )
     } == 0
     {
-        return Err(PlatformError::Io {
-            source: std::io::Error::last_os_error(),
+        let source = std::io::Error::last_os_error();
+        return Err(match source.kind() {
+            std::io::ErrorKind::AlreadyExists => PlatformError::UnsafeRuntimePath,
+            _ => PlatformError::Io { source },
         });
     }
     Ok(())
 }
 
 #[cfg(windows)]
-pub(super) fn remove_open_secure_file(
-    _directory: &File,
-    file: File,
-    path: &Path,
-) -> Result<(), PlatformError> {
+fn delete_windows_file(file: File) -> Result<(), PlatformError> {
     use std::{mem::size_of, os::windows::io::AsRawHandle};
 
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
     };
 
-    fn identity(file: &File) -> Result<(u32, u32, u32), PlatformError> {
-        use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::Storage::FileSystem::{
-            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
-        };
-
-        let mut information = BY_HANDLE_FILE_INFORMATION::default();
-        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) } == 0 {
-            return Err(PlatformError::Io {
-                source: std::io::Error::last_os_error(),
-            });
-        }
-        Ok((
-            information.dwVolumeSerialNumber,
-            information.nFileIndexHigh,
-            information.nFileIndexLow,
-        ))
-    }
-
-    let expected = identity(&file)?;
-    drop(file);
-    let file = open_windows_existing_file(path, true)?;
-    if identity(&file)? != expected {
-        return Err(PlatformError::UnsafeRuntimePath);
-    }
     let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
     if unsafe {
         SetFileInformationByHandle(
@@ -882,6 +1163,21 @@ pub(super) fn remove_open_secure_file(
     }
     drop(file);
     Ok(())
+}
+
+#[cfg(windows)]
+pub(super) fn remove_open_secure_file(
+    _directory: &File,
+    file: File,
+    path: &Path,
+) -> Result<(), PlatformError> {
+    let expected = windows_file_identity(&file)?;
+    drop(file);
+    let file = open_windows_existing_file(path, true)?;
+    if windows_file_identity(&file)? != expected {
+        return Err(PlatformError::UnsafeRuntimePath);
+    }
+    delete_windows_file(file)
 }
 
 #[cfg(windows)]
@@ -1055,6 +1351,14 @@ pub(super) fn open_or_create_runtime_directory(_path: &Path) -> Result<File, Pla
 }
 
 #[cfg(not(any(unix, windows)))]
+pub(super) fn open_existing_secure_file_for_update(
+    _directory: &File,
+    _path: &Path,
+) -> Result<File, PlatformError> {
+    Err(PlatformError::UnsafeRuntimePath)
+}
+
+#[cfg(not(any(unix, windows)))]
 pub(super) fn open_or_create_secure_file(
     _directory: &File,
     _path: &Path,
@@ -1081,10 +1385,19 @@ pub(super) fn harden_secure_file(_file: &File, _path: &Path) -> Result<(), Platf
 }
 
 #[cfg(not(any(unix, windows)))]
+pub(super) fn prepare_secure_publish(
+    _directory: &File,
+    _runtime_path: &Path,
+) -> Result<(), PlatformError> {
+    Err(PlatformError::UnsafeRuntimePath)
+}
+
+#[cfg(not(any(unix, windows)))]
 pub(super) fn publish_secure_file(
     _directory: &File,
     _destination: &Path,
     _document: &[u8],
+    _existing: Option<File>,
 ) -> Result<(), PlatformError> {
     Err(PlatformError::UnsafeRuntimePath)
 }
@@ -1109,13 +1422,15 @@ mod publish_tests {
 
     use crate::PlatformError;
 
+    #[cfg(any(unix, windows))]
+    use super::open_existing_secure_file_for_update;
     use super::{
-        open_or_create_runtime_directory, publish_secure_file,
+        open_or_create_runtime_directory, prepare_secure_publish, publish_secure_file,
         with_publish_after_temp_creation_hook,
     };
 
     #[test]
-    fn failed_publish_after_temporary_creation_leaves_no_residue() {
+    fn failed_publish_after_temporary_creation_is_cleaned_at_next_safe_preparation() {
         let root = tempfile::tempdir().unwrap();
         let runtime_path = root.path().join("runtime");
         let runtime = open_or_create_runtime_directory(&runtime_path).unwrap();
@@ -1127,14 +1442,133 @@ mod publish_tests {
                     source: io::Error::other("injected failure after temporary creation"),
                 })
             },
-            || publish_secure_file(&runtime, &discovery, b"temporary document"),
+            || publish_secure_file(&runtime, &discovery, b"temporary document", None),
         );
 
         assert!(matches!(result, Err(PlatformError::Io { .. })));
-        assert_eq!(
-            directory_entries(&runtime_path),
-            Vec::<std::ffi::OsString>::new()
+        assert_post_failure_entries(&directory_entries(&runtime_path));
+        prepare_secure_publish(&runtime, &runtime_path).unwrap();
+        assert!(directory_entries(&runtime_path).is_empty());
+    }
+
+    #[test]
+    fn publish_preserves_a_destination_installed_after_precheck() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime_path = root.path().join("runtime");
+        let runtime = open_or_create_runtime_directory(&runtime_path).unwrap();
+        let discovery = runtime_path.join("discovery.json");
+        let replacement_path = discovery.clone();
+
+        let result = with_publish_after_temp_creation_hook(
+            move || {
+                fs::write(&replacement_path, b"replacement").unwrap();
+                harden_test_file(&replacement_path);
+                Ok(())
+            },
+            || publish_secure_file(&runtime, &discovery, b"new document", None),
         );
+
+        assert!(matches!(result, Err(PlatformError::UnsafeRuntimePath)));
+        assert_eq!(fs::read(discovery).unwrap(), b"replacement");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_publish_retains_an_existing_destination_swapped_after_precheck() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime_path = root.path().join("runtime");
+        let runtime = open_or_create_runtime_directory(&runtime_path).unwrap();
+        let discovery = runtime_path.join("discovery.json");
+        let original = runtime_path.join("original-discovery");
+        fs::write(&discovery, b"original").unwrap();
+        harden_test_file(&discovery);
+        let existing = open_existing_secure_file_for_update(&runtime, &discovery).unwrap();
+        let discovery_for_hook = discovery.clone();
+        let original_for_hook = original.clone();
+
+        let result = with_publish_after_temp_creation_hook(
+            move || {
+                fs::rename(&discovery_for_hook, original_for_hook).unwrap();
+                fs::write(&discovery_for_hook, b"replacement").unwrap();
+                harden_test_file(&discovery_for_hook);
+                Ok(())
+            },
+            || publish_secure_file(&runtime, &discovery, b"new document", Some(existing)),
+        );
+
+        assert!(matches!(result, Err(PlatformError::UnsafeRuntimePath)));
+        assert!(!discovery.exists());
+        assert_eq!(fs::read(original).unwrap(), b"original");
+        let mut retained = fs::read_dir(&runtime_path)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(super::TOMBSTONE_PREFIX)
+            })
+            .map(|entry| fs::read(entry.path()).unwrap())
+            .collect::<Vec<_>>();
+        retained.sort();
+        assert_eq!(
+            retained,
+            vec![b"new document".to_vec(), b"replacement".to_vec()]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn verified_directory_and_destination_handles_block_path_swaps_during_publish() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime_path = root.path().join("runtime");
+        let moved_runtime = root.path().join("moved-runtime");
+        let runtime = open_or_create_runtime_directory(&runtime_path).unwrap();
+        let discovery = runtime_path.join("discovery.json");
+        publish_secure_file(&runtime, &discovery, b"original", None).unwrap();
+        let existing = open_existing_secure_file_for_update(&runtime, &discovery).unwrap();
+        let discovery_for_hook = discovery.clone();
+        let moved_discovery = runtime_path.join("moved-discovery.json");
+        let runtime_for_hook = runtime_path.clone();
+        let moved_runtime_for_hook = moved_runtime.clone();
+
+        with_publish_after_temp_creation_hook(
+            move || {
+                assert!(fs::rename(&discovery_for_hook, moved_discovery).is_err());
+                assert!(fs::rename(&runtime_for_hook, moved_runtime_for_hook).is_err());
+                Ok(())
+            },
+            || publish_secure_file(&runtime, &discovery, b"replacement", Some(existing)),
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(discovery).unwrap(), b"replacement");
+        assert!(!moved_runtime.exists());
+    }
+
+    #[cfg(unix)]
+    fn harden_test_file(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[cfg(windows)]
+    fn harden_test_file(_path: &Path) {}
+
+    #[cfg(unix)]
+    fn assert_post_failure_entries(entries: &[std::ffi::OsString]) {
+        assert_eq!(entries.len(), 1);
+        assert!(
+            entries[0]
+                .to_string_lossy()
+                .starts_with(super::TOMBSTONE_PREFIX)
+        );
+    }
+
+    #[cfg(windows)]
+    fn assert_post_failure_entries(entries: &[std::ffi::OsString]) {
+        assert!(entries.is_empty());
     }
 
     fn directory_entries(path: &Path) -> Vec<std::ffi::OsString> {
@@ -1149,13 +1583,21 @@ mod publish_tests {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::{fs, io::Read, os::unix::fs::PermissionsExt, sync::mpsc, thread};
+    use std::{
+        ffi::OsStr,
+        fs,
+        io::Read,
+        os::unix::{ffi::OsStrExt, fs::PermissionsExt},
+        sync::{Arc, Mutex, mpsc},
+        thread,
+    };
 
     use crate::PlatformError;
 
     use super::{
         open_existing_runtime_directory, open_existing_secure_file, remove_open_secure_file,
         with_unix_remove_after_identity_check_hook,
+        with_unix_remove_after_quarantine_verification_hook,
     };
 
     #[test]
@@ -1180,6 +1622,90 @@ mod tests {
         let mut bytes = Vec::new();
         opened.read_to_end(&mut bytes).unwrap();
         assert_eq!(bytes, b"verified-directory");
+    }
+
+    #[test]
+    fn owned_removal_never_unlinks_an_entry_swapped_after_quarantine_verification() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("discovery.json");
+        let verified_tombstone = directory.path().join("verified-owned-tombstone");
+        fs::write(&path, b"owned").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let directory_handle = open_existing_runtime_directory(directory.path()).unwrap();
+        let opened = open_existing_secure_file(&directory_handle, &path).unwrap();
+        let replacement_tombstone = Arc::new(Mutex::new(None));
+        let observed_tombstone = Arc::clone(&replacement_tombstone);
+        let runtime_path = directory.path().to_path_buf();
+        let verified_tombstone_for_hook = verified_tombstone.clone();
+
+        let result = with_unix_remove_after_quarantine_verification_hook(
+            move |quarantine, matches_opened| {
+                assert!(matches_opened);
+                let quarantine_path = runtime_path.join(OsStr::from_bytes(quarantine.to_bytes()));
+                fs::rename(&quarantine_path, verified_tombstone_for_hook).unwrap();
+                fs::write(&quarantine_path, b"replacement").unwrap();
+                fs::set_permissions(&quarantine_path, fs::Permissions::from_mode(0o600)).unwrap();
+                *observed_tombstone.lock().unwrap() = Some(quarantine_path);
+            },
+            || remove_open_secure_file(&directory_handle, opened, &path),
+        );
+
+        assert!(result.is_ok());
+        assert!(!path.exists());
+        assert_eq!(fs::read(verified_tombstone).unwrap(), b"owned");
+        let replacement_tombstone = replacement_tombstone.lock().unwrap().take().unwrap();
+        assert_eq!(fs::read(replacement_tombstone).unwrap(), b"replacement");
+    }
+
+    #[test]
+    fn mismatched_removal_never_restores_an_entry_swapped_after_verification() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("discovery.json");
+        let original = directory.path().join("original-owned");
+        let verified_mismatch = directory.path().join("verified-mismatch-tombstone");
+        fs::write(&path, b"owned").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let directory_handle = open_existing_runtime_directory(directory.path()).unwrap();
+        let opened = open_existing_secure_file(&directory_handle, &path).unwrap();
+        let replacement_tombstone = Arc::new(Mutex::new(None));
+        let observed_tombstone = Arc::clone(&replacement_tombstone);
+        let runtime_path = directory.path().to_path_buf();
+        let verified_mismatch_for_hook = verified_mismatch.clone();
+        let path_for_first_swap = path.clone();
+        let original_for_first_swap = original.clone();
+
+        let result = with_unix_remove_after_identity_check_hook(
+            move || {
+                fs::rename(&path_for_first_swap, original_for_first_swap).unwrap();
+                fs::write(&path_for_first_swap, b"mismatch").unwrap();
+                fs::set_permissions(&path_for_first_swap, fs::Permissions::from_mode(0o600))
+                    .unwrap();
+            },
+            || {
+                with_unix_remove_after_quarantine_verification_hook(
+                    move |quarantine, matches_opened| {
+                        assert!(!matches_opened);
+                        let quarantine_path =
+                            runtime_path.join(OsStr::from_bytes(quarantine.to_bytes()));
+                        fs::rename(&quarantine_path, verified_mismatch_for_hook).unwrap();
+                        fs::write(&quarantine_path, b"replacement").unwrap();
+                        fs::set_permissions(&quarantine_path, fs::Permissions::from_mode(0o600))
+                            .unwrap();
+                        *observed_tombstone.lock().unwrap() = Some(quarantine_path);
+                    },
+                    || remove_open_secure_file(&directory_handle, opened, &path),
+                )
+            },
+        );
+
+        assert!(matches!(result, Err(PlatformError::UnsafeRuntimePath)));
+        assert!(!path.exists());
+        assert_eq!(fs::read(original).unwrap(), b"owned");
+        assert_eq!(fs::read(verified_mismatch).unwrap(), b"mismatch");
+        let replacement_tombstone = replacement_tombstone.lock().unwrap().take().unwrap();
+        assert_eq!(fs::read(replacement_tombstone).unwrap(), b"replacement");
     }
 
     #[test]
@@ -1214,7 +1740,19 @@ mod tests {
         replacement.join().unwrap();
 
         assert!(matches!(result, Err(PlatformError::UnsafeRuntimePath)));
-        assert_eq!(fs::read(path).unwrap(), b"replacement");
+        assert!(!path.exists());
+        let tombstones = fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(super::TOMBSTONE_PREFIX)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tombstones.len(), 1);
+        assert_eq!(fs::read(&tombstones[0]).unwrap(), b"replacement");
         assert_eq!(fs::read(moved).unwrap(), b"owned");
     }
 }
