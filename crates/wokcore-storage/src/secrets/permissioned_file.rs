@@ -6,7 +6,7 @@ use std::{
 
 use secrecy::SecretString;
 use wokcore_core::secret::{SecretRef, SecretScope};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::{HeadlessSecretStoreConfig, MAX_HEADLESS_SECRET_BYTES, SecretStore, StorageError};
 
@@ -43,8 +43,10 @@ impl SecretStore for PermissionedFileSecretStore {
             return Err(StorageError::SecretNotFound);
         }
         let path = self.path.clone();
-        let value = run_blocking_secret_read(move || read_secret_file(&path)).await?;
-        Ok(SecretString::from(value))
+        let value =
+            run_blocking_secret_read(move || read_secret_file(&path).map(SecretString::from))
+                .await?;
+        Ok((*value).clone())
     }
 
     async fn delete(&self, secret_ref: &SecretRef) -> Result<(), StorageError> {
@@ -55,10 +57,13 @@ impl SecretStore for PermissionedFileSecretStore {
     }
 }
 
-async fn run_blocking_secret_read(
-    operation: impl FnOnce() -> Result<String, StorageError> + Send + 'static,
-) -> Result<String, StorageError> {
-    tokio::task::spawn_blocking(operation)
+async fn run_blocking_secret_read<T>(
+    operation: impl FnOnce() -> Result<T, StorageError> + Send + 'static,
+) -> Result<Zeroizing<T>, StorageError>
+where
+    T: Zeroize + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || operation().map(Zeroizing::new))
         .await
         .map_err(|_| StorageError::SecretBackendFailure)?
 }
@@ -418,6 +423,7 @@ mod tests {
         sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
+            mpsc,
         },
         time::{Duration, Instant},
     };
@@ -427,6 +433,23 @@ mod tests {
         verify_regular_file_type, with_invalid_utf8_zeroize_observer,
     };
     use crate::{MAX_HEADLESS_SECRET_BYTES, StorageError};
+    use zeroize::Zeroize;
+
+    struct CancellationObservedSecret {
+        bytes: Vec<u8>,
+        zeroized: Option<tokio::sync::oneshot::Sender<bool>>,
+    }
+
+    impl Zeroize for CancellationObservedSecret {
+        fn zeroize(&mut self) {
+            self.bytes.zeroize();
+            self.zeroized
+                .take()
+                .unwrap()
+                .send(self.bytes.iter().all(|byte| *byte == 0))
+                .unwrap();
+        }
+    }
 
     #[test]
     fn bounded_reader_accepts_the_exact_limit_and_rejects_one_more_byte() {
@@ -527,7 +550,37 @@ mod tests {
         started_receiver.await.unwrap();
         executor_progressed.store(true, Ordering::SeqCst);
 
-        assert_eq!(read.await.unwrap().unwrap(), "true");
+        assert_eq!(&*read.await.unwrap().unwrap(), "true");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelling_blocking_secret_read_zeroizes_the_unreceived_result() {
+        let (started_sender, started_receiver) = tokio::sync::oneshot::channel();
+        let (release_sender, release_receiver) = mpsc::sync_channel(0);
+        let (zeroized_sender, zeroized_receiver) = tokio::sync::oneshot::channel();
+        let read = tokio::spawn(run_blocking_secret_read(move || {
+            started_sender.send(()).unwrap();
+            release_receiver.recv().unwrap();
+            Ok(CancellationObservedSecret {
+                bytes: b"cancellation-secret".to_vec(),
+                zeroized: Some(zeroized_sender),
+            })
+        }));
+
+        tokio::time::timeout(Duration::from_secs(1), started_receiver)
+            .await
+            .expect("blocking task did not start")
+            .unwrap();
+        read.abort();
+        assert!(matches!(read.await, Err(error) if error.is_cancelled()));
+        release_sender.send(()).unwrap();
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), zeroized_receiver)
+                .await
+                .expect("unreceived blocking result was not dropped")
+                .unwrap()
+        );
     }
 
     #[cfg(unix)]

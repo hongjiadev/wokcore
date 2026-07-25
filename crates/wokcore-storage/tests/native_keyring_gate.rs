@@ -447,6 +447,19 @@ impl IncludeVisitor {
 }
 
 impl<'syntax> Visit<'syntax> for IncludeVisitor {
+    fn visit_item_use(&mut self, item: &'syntax ItemUse) {
+        let mut leaves = Vec::new();
+        flatten_use_tree(&item.tree, &mut Vec::new(), &mut leaves);
+        if leaves
+            .iter()
+            .any(|(path, _)| path.last().is_some_and(|segment| segment == "include"))
+        {
+            self.errors
+                .push("include import is not supported".to_owned());
+        }
+        visit::visit_item_use(self, item);
+    }
+
     fn visit_item(&mut self, item: &'syntax Item) {
         if !self.test_mode && item_attributes(item).iter().any(attribute_marks_test_code) {
             let mut nested = IncludeVisitor::new(true);
@@ -534,7 +547,12 @@ impl<'syntax> Visit<'syntax> for IncludeVisitor {
     }
 
     fn visit_macro(&mut self, item: &'syntax Macro) {
-        if item.path.is_ident("include") {
+        if item.path.is_ident("macro_rules")
+            && token_stream_contains_include_invocation(&item.tokens)
+        {
+            self.errors
+                .push("macro_rules! may not generate an include! invocation".to_owned());
+        } else if item.path.is_ident("include") {
             match syn::parse2::<syn::LitStr>(item.tokens.clone()) {
                 Ok(path) => self.directives.push(IncludeDirective {
                     path: PathBuf::from(path.value()),
@@ -544,9 +562,29 @@ impl<'syntax> Visit<'syntax> for IncludeVisitor {
                     .errors
                     .push("include! must contain a single string literal".to_owned()),
             }
+        } else if item
+            .path
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "include")
+        {
+            self.errors
+                .push("qualified include! macros are not supported".to_owned());
         }
         visit::visit_macro(self, item);
     }
+}
+
+fn token_stream_contains_include_invocation(tokens: &TokenStream) -> bool {
+    let tokens = tokens.clone().into_iter().collect::<Vec<_>>();
+    tokens.iter().enumerate().any(|(index, token)| match token {
+        TokenTree::Ident(identifier) if identifier == "include" => matches!(
+            tokens.get(index + 1),
+            Some(TokenTree::Punct(punctuation)) if punctuation.as_char() == '!'
+        ),
+        TokenTree::Group(group) => token_stream_contains_include_invocation(&group.stream()),
+        TokenTree::Ident(_) | TokenTree::Punct(_) | TokenTree::Literal(_) => false,
+    })
 }
 
 fn scan_item_modules(
@@ -1611,7 +1649,7 @@ fn scanner_follows_literal_include_files_recursively() {
         r#"
             #[cfg(test)]
             mod tests {
-                include!("../shared/helper.inc");
+                include!(r"../shared/helper.inc");
             }
         "#,
     )
@@ -1659,6 +1697,11 @@ fn scanner_rejects_nonliteral_missing_and_ambiguous_includes() {
             r#"include!("first.inc", "second.inc");"#,
             "single string literal",
         ),
+        (
+            r#"include!(concat!("../shared/", "helper.inc"));"#,
+            "string literal",
+        ),
+        (r#"include!(env!("OUT_DIR"));"#, "string literal"),
     ] {
         fs::write(directory.path().join("src/lib.rs"), source).unwrap();
         let error = scan_crate_test_sources(directory.path()).unwrap_err();
@@ -1668,6 +1711,97 @@ fn scanner_rejects_nonliteral_missing_and_ambiguous_includes() {
             "unexpected include error for {source}: {error}"
         );
     }
+}
+
+#[test]
+fn scanner_rejects_qualified_include_macros() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir_all(directory.path().join("src")).unwrap();
+    fs::create_dir_all(directory.path().join("shared")).unwrap();
+    fs::write(
+        directory.path().join("src/lib.rs"),
+        r#"std::include!("../shared/helper.inc");"#,
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("shared/helper.inc"),
+        "fn included_helper() {}",
+    )
+    .unwrap();
+
+    let error = scan_crate_test_sources(directory.path()).unwrap_err();
+
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("qualified include"));
+}
+
+#[test]
+fn scanner_rejects_imported_and_aliased_include_macros() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir_all(directory.path().join("src")).unwrap();
+    fs::create_dir_all(directory.path().join("shared")).unwrap();
+    fs::write(
+        directory.path().join("shared/helper.inc"),
+        "fn included_helper() {}",
+    )
+    .unwrap();
+
+    for source in [
+        r#"use std::include; include!("../shared/helper.inc");"#,
+        r#"use std::include as load; load!("../shared/helper.inc");"#,
+    ] {
+        fs::write(directory.path().join("src/lib.rs"), source).unwrap();
+        let error = scan_crate_test_sources(directory.path()).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            error.to_string().contains("include import"),
+            "unexpected include import result for {source}: {error}"
+        );
+    }
+}
+
+#[test]
+fn scanner_rejects_macro_rules_that_can_generate_include_invocations() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir_all(directory.path().join("src")).unwrap();
+
+    for source in [
+        r#"macro_rules! load { () => { include!("helper.inc"); } }"#,
+        r#"macro_rules! load { () => { std::include!("helper.inc"); } }"#,
+    ] {
+        fs::write(directory.path().join("src/lib.rs"), source).unwrap();
+        let error = scan_crate_test_sources(directory.path()).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            error.to_string().contains("macro_rules") && error.to_string().contains("include"),
+            "unexpected macro_rules result for {source}: {error}"
+        );
+    }
+}
+
+#[test]
+fn scanner_ignores_include_spellings_inside_literals() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir_all(directory.path().join("src")).unwrap();
+    fs::write(
+        directory.path().join("src/lib.rs"),
+        r#"
+            /// Documentation mentioning `std::include!("helper.inc")`.
+            fn harmless() {
+                let message = "macro_rules! { include!(\"helper.inc\") }";
+                assert!(message.contains("include"));
+            }
+        "#,
+    )
+    .unwrap();
+
+    assert!(
+        scan_crate_test_sources(directory.path())
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
