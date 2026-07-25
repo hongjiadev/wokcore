@@ -169,7 +169,6 @@ impl AuthRegistry {
             TokenDigest::of(value.expose_secret())
         } else {
             let material = TokenMaterial::generate_admin(entropy.as_ref())?;
-            let digest = material.digest();
             let secret_ref = secrets
                 .put(&management_scope, material.into_secret_value())
                 .await
@@ -184,22 +183,32 @@ impl AuthRegistry {
                 )
             })
             .await;
-            if bind_result.is_err() {
-                let orphan_ref = secret_ref.clone();
-                let orphan_created_at = created_at.clone();
-                if run_metadata(Arc::clone(&metadata), move |metadata| {
-                    metadata.record_orphan_secret(&orphan_ref, &orphan_created_at)
-                })
-                .await
-                .is_err()
-                {
-                    return Err(AuthError::OrphanRecording {
-                        orphan_ref: secret_ref,
-                    });
+            let binding = match bind_result {
+                Ok(binding) => binding,
+                Err(_) => {
+                    let orphan_ref = secret_ref.clone();
+                    let orphan_created_at = created_at.clone();
+                    if run_metadata(Arc::clone(&metadata), move |metadata| {
+                        metadata.record_orphan_secret(&orphan_ref, &orphan_created_at)
+                    })
+                    .await
+                    .is_err()
+                    {
+                        return Err(AuthError::OrphanRecording {
+                            orphan_ref: secret_ref,
+                        });
+                    }
+                    return Err(AuthError::BootstrapBinding);
                 }
-                return Err(AuthError::BootstrapBinding);
+            };
+            let value = secrets
+                .get(&binding.secret_ref)
+                .await
+                .map_err(|_| AuthError::SecretStore)?;
+            if !is_admin_token(value.expose_secret()) {
+                return Err(AuthError::InvalidManagementSecret);
             }
-            digest
+            TokenDigest::of(value.expose_secret())
         };
 
         let active = run_metadata(Arc::clone(&metadata), |metadata| {

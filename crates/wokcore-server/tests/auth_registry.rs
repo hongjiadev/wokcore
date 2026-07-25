@@ -54,11 +54,28 @@ impl EntropySource for FailingEntropy {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone)]
+enum SecretReadBack {
+    Value(String),
+    Failure,
+}
+
+#[derive(Default)]
 struct RecordingSecretStore {
     inner: MemorySecretStore,
     events: Arc<Mutex<Vec<&'static str>>>,
     gets: AtomicUsize,
+    read_back: Mutex<Option<SecretReadBack>>,
+}
+
+impl RecordingSecretStore {
+    fn return_on_get(&self, value: String) {
+        *self.read_back.lock().unwrap() = Some(SecretReadBack::Value(value));
+    }
+
+    fn fail_on_get(&self) {
+        *self.read_back.lock().unwrap() = Some(SecretReadBack::Failure);
+    }
 }
 
 #[async_trait::async_trait]
@@ -75,7 +92,12 @@ impl SecretStore for RecordingSecretStore {
     async fn get(&self, secret_ref: &SecretRef) -> Result<SecretString, StorageError> {
         self.events.lock().unwrap().push("secret.get");
         self.gets.fetch_add(1, Ordering::SeqCst);
-        self.inner.get(secret_ref).await
+        let read_back = self.read_back.lock().unwrap().clone();
+        match read_back {
+            Some(SecretReadBack::Value(value)) => Ok(SecretString::from(value)),
+            Some(SecretReadBack::Failure) => Err(StorageError::SecretBackendFailure),
+            None => self.inner.get(secret_ref).await,
+        }
     }
 
     async fn delete(&self, secret_ref: &SecretRef) -> Result<(), StorageError> {
@@ -388,6 +410,163 @@ async fn bootstrap_writes_secret_before_binding_and_records_orphan_on_bind_failu
     );
     assert_eq!(metadata.orphans.lock().unwrap().len(), 1);
     assert!(!format!("{error:?} {error}").contains(&expected_raw));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn new_bootstrap_uses_the_bound_secret_read_back_for_its_digest() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let secrets = Arc::new(RecordingSecretStore {
+        events: Arc::clone(&events),
+        ..RecordingSecretStore::default()
+    });
+    let metadata = Arc::new(FakeMetadataStore::with_events(Arc::clone(&events)));
+    let generated = TokenMaterial::generate_admin(&DeterministicEntropy::repeated(0x45))
+        .unwrap()
+        .into_response_value();
+    let generated_raw = generated.expose_secret().to_owned();
+    let persisted = TokenMaterial::generate_admin(&DeterministicEntropy::repeated(0x46))
+        .unwrap()
+        .into_response_value();
+    let persisted_raw = persisted.expose_secret().to_owned();
+    secrets.return_on_get(persisted_raw.clone());
+
+    let registry = AuthRegistry::bootstrap(
+        secrets.clone(),
+        metadata,
+        Arc::new(DeterministicEntropy::repeated(0x45)),
+        management_scope(),
+        CREATED_AT.to_owned(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        *events.lock().unwrap(),
+        [
+            "metadata.binding",
+            "secret.put",
+            "metadata.bind",
+            "secret.get",
+            "metadata.load",
+        ]
+    );
+    assert_eq!(secrets.gets.load(Ordering::SeqCst), 1);
+    assert!(registry.validate_management(&persisted_raw));
+    assert!(!registry.validate_management(&generated_raw));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn new_bootstrap_round_trips_the_generated_value_through_memory_store() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let secrets = Arc::new(RecordingSecretStore {
+        events: Arc::clone(&events),
+        ..RecordingSecretStore::default()
+    });
+    let metadata = Arc::new(FakeMetadataStore::with_events(Arc::clone(&events)));
+    let expected = TokenMaterial::generate_admin(&DeterministicEntropy::repeated(0x47))
+        .unwrap()
+        .into_response_value();
+    let expected_raw = expected.expose_secret().to_owned();
+
+    let registry = AuthRegistry::bootstrap(
+        secrets.clone(),
+        metadata,
+        Arc::new(DeterministicEntropy::repeated(0x47)),
+        management_scope(),
+        CREATED_AT.to_owned(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        *events.lock().unwrap(),
+        [
+            "metadata.binding",
+            "secret.put",
+            "metadata.bind",
+            "secret.get",
+            "metadata.load",
+        ]
+    );
+    assert_eq!(secrets.gets.load(Ordering::SeqCst), 1);
+    assert!(registry.validate_management(&expected_raw));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn new_bootstrap_fails_closed_when_bound_secret_read_back_fails() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let secrets = Arc::new(RecordingSecretStore {
+        events: Arc::clone(&events),
+        ..RecordingSecretStore::default()
+    });
+    secrets.fail_on_get();
+    let metadata = Arc::new(FakeMetadataStore::with_events(Arc::clone(&events)));
+    let generated = TokenMaterial::generate_admin(&DeterministicEntropy::repeated(0x48))
+        .unwrap()
+        .into_response_value();
+    let generated_raw = generated.expose_secret().to_owned();
+
+    let error = AuthRegistry::bootstrap(
+        secrets.clone(),
+        metadata,
+        Arc::new(DeterministicEntropy::repeated(0x48)),
+        management_scope(),
+        CREATED_AT.to_owned(),
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(
+        *events.lock().unwrap(),
+        [
+            "metadata.binding",
+            "secret.put",
+            "metadata.bind",
+            "secret.get",
+        ]
+    );
+    assert_eq!(secrets.gets.load(Ordering::SeqCst), 1);
+    assert!(!format!("{error:?} {error}").contains(&generated_raw));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn new_bootstrap_rejects_invalid_bound_secret_read_back_without_exposing_it() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let secrets = Arc::new(RecordingSecretStore {
+        events: Arc::clone(&events),
+        ..RecordingSecretStore::default()
+    });
+    let invalid_read_back = ["invalid", "management", "read-back"].join("-");
+    secrets.return_on_get(invalid_read_back.clone());
+    let metadata = Arc::new(FakeMetadataStore::with_events(Arc::clone(&events)));
+    let generated = TokenMaterial::generate_admin(&DeterministicEntropy::repeated(0x49))
+        .unwrap()
+        .into_response_value();
+    let generated_raw = generated.expose_secret().to_owned();
+
+    let error = AuthRegistry::bootstrap(
+        secrets.clone(),
+        metadata,
+        Arc::new(DeterministicEntropy::repeated(0x49)),
+        management_scope(),
+        CREATED_AT.to_owned(),
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(
+        *events.lock().unwrap(),
+        [
+            "metadata.binding",
+            "secret.put",
+            "metadata.bind",
+            "secret.get",
+        ]
+    );
+    assert_eq!(secrets.gets.load(Ordering::SeqCst), 1);
+    let rendered = format!("{error:?} {error}");
+    assert!(!rendered.contains(&generated_raw));
+    assert!(!rendered.contains(&invalid_read_back));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
