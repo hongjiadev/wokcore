@@ -6,7 +6,6 @@ use std::{
 use crate::PlatformError;
 
 const TOMBSTONE_PREFIX: &str = ".wokcore-tombstone-";
-#[cfg(unix)]
 const PUBLISH_STAGING_NAME: &str = ".wokcore-publish-staging";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -765,7 +764,7 @@ pub(super) fn open_or_create_secure_file(
             verify_windows_permissions(&file)?;
             Ok(file)
         }
-        None => open_windows_existing_file(path, false),
+        None => open_windows_existing_file(path, WindowsExistingFileMode::Read),
     }
 }
 
@@ -774,7 +773,7 @@ pub(super) fn open_existing_secure_file(
     _directory: &File,
     path: &Path,
 ) -> Result<File, PlatformError> {
-    open_windows_existing_file(path, false)
+    open_windows_existing_file(path, WindowsExistingFileMode::DiscoveryRead)
 }
 
 #[cfg(windows)]
@@ -782,7 +781,7 @@ pub(super) fn open_existing_secure_file_for_update(
     _directory: &File,
     path: &Path,
 ) -> Result<File, PlatformError> {
-    open_windows_existing_file(path, true)
+    open_windows_existing_file(path, WindowsExistingFileMode::Update)
 }
 
 #[cfg(windows)]
@@ -790,6 +789,14 @@ pub(super) fn open_existing_secure_file_for_update(
 enum WindowsFileKind {
     Directory,
     Regular,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+enum WindowsExistingFileMode {
+    Read,
+    DiscoveryRead,
+    Update,
 }
 
 #[cfg(windows)]
@@ -828,7 +835,10 @@ fn open_windows_file(path: &Path, kind: WindowsFileKind) -> Result<File, Platfor
 }
 
 #[cfg(windows)]
-fn open_windows_existing_file(path: &Path, for_removal: bool) -> Result<File, PlatformError> {
+fn open_windows_existing_file(
+    path: &Path,
+    mode: WindowsExistingFileMode,
+) -> Result<File, PlatformError> {
     use std::{
         os::windows::{fs::MetadataExt, io::FromRawHandle},
         ptr,
@@ -837,8 +847,8 @@ fn open_windows_existing_file(path: &Path, for_removal: bool) -> Result<File, Pl
     use windows_sys::Win32::{
         Foundation::{GENERIC_READ, INVALID_HANDLE_VALUE},
         Storage::FileSystem::{
-            CreateFileW, DELETE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
-            OPEN_EXISTING, READ_CONTROL,
+            CreateFileW, DELETE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ,
+            FILE_SHARE_WRITE, OPEN_EXISTING, READ_CONTROL,
         },
     };
 
@@ -852,12 +862,25 @@ fn open_windows_existing_file(path: &Path, for_removal: bool) -> Result<File, Pl
     }
 
     let path = wide_path(path);
-    let desired_access = GENERIC_READ | READ_CONTROL | if for_removal { DELETE } else { 0 };
+    let desired_access = GENERIC_READ
+        | READ_CONTROL
+        | if matches!(mode, WindowsExistingFileMode::Update) {
+            DELETE
+        } else {
+            0
+        };
+    let share_mode = FILE_SHARE_READ
+        | FILE_SHARE_WRITE
+        | if matches!(mode, WindowsExistingFileMode::DiscoveryRead) {
+            FILE_SHARE_DELETE
+        } else {
+            0
+        };
     let handle = unsafe {
         CreateFileW(
             path.as_ptr(),
             desired_access,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            share_mode,
             ptr::null(),
             OPEN_EXISTING,
             FILE_FLAG_OPEN_REPARSE_POINT,
@@ -1090,6 +1113,7 @@ pub(super) fn prepare_secure_publish(
     _directory: &File,
     runtime_path: &Path,
 ) -> Result<(), PlatformError> {
+    cleanup_windows_fixed_internal_entry(&runtime_path.join(PUBLISH_STAGING_NAME))?;
     for entry in fs::read_dir(runtime_path)? {
         let entry = entry?;
         let name = entry.file_name();
@@ -1107,11 +1131,23 @@ pub(super) fn prepare_secure_publish(
 }
 
 #[cfg(windows)]
+fn cleanup_windows_fixed_internal_entry(path: &Path) -> Result<(), PlatformError> {
+    let file = match open_windows_existing_file(path, WindowsExistingFileMode::Update) {
+        Ok(file) => file,
+        Err(PlatformError::Io { source }) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    delete_windows_file(file)
+}
+
+#[cfg(windows)]
 fn cleanup_windows_internal_entry(
     path: &Path,
     expected: (u32, u32, u32),
 ) -> Result<(), PlatformError> {
-    let file = open_windows_existing_file(path, true)?;
+    let file = open_windows_existing_file(path, WindowsExistingFileMode::Update)?;
     if windows_file_identity(&file)? != expected {
         return Err(PlatformError::UnsafeRuntimePath);
     }
@@ -1191,7 +1227,10 @@ pub(super) fn publish_secure_file(
         replace_windows_file(destination, &temporary_path, &retired)?;
         #[cfg(test)]
         run_publish_after_existing_commit_hook()?;
-        drop(open_windows_existing_file(destination, false)?);
+        drop(open_windows_existing_file(
+            destination,
+            WindowsExistingFileMode::DiscoveryRead,
+        )?);
         cleanup_windows_internal_entry(&retired, expected)?;
         return Ok(());
     }
@@ -1213,23 +1252,50 @@ pub(super) fn publish_secure_file(
 fn create_windows_publish_temporary(
     parent: &Path,
 ) -> Result<tempfile::NamedTempFile, PlatformError> {
-    use std::os::windows::fs::OpenOptionsExt;
+    use std::{os::windows::io::FromRawHandle, ptr};
 
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    use windows_sys::Win32::{
+        Foundation::{
+            ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, GENERIC_READ, GENERIC_WRITE,
+            INVALID_HANDLE_VALUE,
+        },
+        Storage::FileSystem::{
+            CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT,
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        },
     };
 
-    tempfile::Builder::new()
-        .prefix(".wokcore-publish-")
-        .make_in(parent, |path| {
-            fs::OpenOptions::new()
-                .create_new(true)
-                .read(true)
-                .write(true)
-                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-                .open(path)
-        })
-        .map_err(PlatformError::from)
+    let path = parent.join(PUBLISH_STAGING_NAME);
+    let wide_path = wide_path(&path);
+    let handle = with_current_user_security_attributes(false, |attributes| {
+        let handle = unsafe {
+            CreateFileW(
+                wide_path.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                attributes,
+                CREATE_NEW,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+                ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            let source = std::io::Error::last_os_error();
+            return Err(match source.raw_os_error() {
+                Some(error)
+                    if error == ERROR_FILE_EXISTS as i32
+                        || error == ERROR_ALREADY_EXISTS as i32 =>
+                {
+                    PlatformError::UnsafeRuntimePath
+                }
+                _ => PlatformError::Io { source },
+            });
+        }
+        Ok(handle)
+    })?;
+    let file = unsafe { File::from_raw_handle(handle) };
+    let temporary_path = tempfile::TempPath::try_from_path(path)?;
+    Ok(tempfile::NamedTempFile::from_parts(file, temporary_path))
 }
 
 #[cfg(windows)]
@@ -1309,7 +1375,7 @@ pub(super) fn remove_open_secure_file(
 ) -> Result<(), PlatformError> {
     let expected = windows_file_identity(&file)?;
     drop(file);
-    let file = open_windows_existing_file(path, true)?;
+    let file = open_windows_existing_file(path, WindowsExistingFileMode::Update)?;
     if windows_file_identity(&file)? != expected {
         return Err(PlatformError::UnsafeRuntimePath);
     }
@@ -1564,7 +1630,11 @@ mod publish_tests {
     use std::{fs, io, path::Path};
 
     use crate::PlatformError;
+    #[cfg(windows)]
+    use crate::{AppPaths, DiscoveryRecord, DiscoveryStore, RuntimeLease};
 
+    #[cfg(windows)]
+    use super::open_existing_secure_file;
     #[cfg(any(unix, windows))]
     use super::open_existing_secure_file_for_update;
     use super::{
@@ -1688,6 +1758,140 @@ mod publish_tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn read_only_discovery_handle_allows_atomic_existing_publish() {
+        use std::io::Read;
+
+        let root = tempfile::tempdir().unwrap();
+        let runtime_path = root.path().join("runtime");
+        let runtime = open_or_create_runtime_directory(&runtime_path).unwrap();
+        let discovery = runtime_path.join("discovery.json");
+        publish_secure_file(&runtime, &discovery, b"complete old document", None).unwrap();
+        let mut reader = open_existing_secure_file(&runtime, &discovery).unwrap();
+        let existing = open_existing_secure_file_for_update(&runtime, &discovery).unwrap();
+
+        publish_secure_file(
+            &runtime,
+            &discovery,
+            b"complete new document",
+            Some(existing),
+        )
+        .unwrap();
+
+        let mut observed_old = Vec::new();
+        reader.read_to_end(&mut observed_old).unwrap();
+        assert_eq!(observed_old, b"complete old document");
+
+        let mut new_reader = open_existing_secure_file(&runtime, &discovery).unwrap();
+        let mut observed_new = Vec::new();
+        new_reader.read_to_end(&mut observed_new).unwrap();
+        assert_eq!(observed_new, b"complete new document");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn crash_after_publish_temp_sync_is_recovered_with_constant_bound() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = publish_test_paths(root.path());
+
+        for _ in 0..4 {
+            spawn_publish_crash(root.path());
+            assert!(
+                internal_publish_entries(&paths.runtime_dir).len() <= 1,
+                "pre-commit crashes must not accumulate an unbounded publish namespace"
+            );
+        }
+
+        let lease = RuntimeLease::acquire(&paths).unwrap();
+        let store = DiscoveryStore::new(&paths).unwrap();
+        let mut current = publish_test_record(5100);
+        store.publish(&current).unwrap();
+        assert_eq!(store.read().unwrap(), current);
+        assert!(internal_publish_entries(&paths.runtime_dir).is_empty());
+        drop(lease);
+
+        for pid in 5101..5105 {
+            spawn_publish_crash(root.path());
+            assert_eq!(
+                store.read().unwrap(),
+                current,
+                "a pre-commit crash must preserve the complete canonical document"
+            );
+            assert!(internal_publish_entries(&paths.runtime_dir).len() <= 1);
+
+            let replacement = publish_test_record(pid);
+            let lease = RuntimeLease::acquire(&paths).unwrap();
+            store.publish(&replacement).unwrap();
+            assert_eq!(store.read().unwrap(), replacement);
+            assert!(internal_publish_entries(&paths.runtime_dir).is_empty());
+            drop(lease);
+            current = replacement;
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn fixed_publish_staging_recovery_rejects_wrong_type_without_touching_canonical() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime_path = root.path().join("runtime");
+        let runtime = open_or_create_runtime_directory(&runtime_path).unwrap();
+        let discovery = runtime_path.join("discovery.json");
+        publish_secure_file(&runtime, &discovery, b"complete canonical", None).unwrap();
+        let staging = runtime_path.join(super::PUBLISH_STAGING_NAME);
+        fs::create_dir(&staging).unwrap();
+
+        assert!(matches!(
+            prepare_secure_publish(&runtime, &runtime_path),
+            Err(PlatformError::UnsafeRuntimePath)
+        ));
+        assert_eq!(fs::read(discovery).unwrap(), b"complete canonical");
+        assert!(staging.is_dir());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn fixed_publish_staging_recovery_never_follows_an_external_reparse_target() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime_path = root.path().join("runtime");
+        let runtime = open_or_create_runtime_directory(&runtime_path).unwrap();
+        let external = root.path().join("external");
+        fs::write(&external, b"must remain external").unwrap();
+        let staging = runtime_path.join(super::PUBLISH_STAGING_NAME);
+        std::os::windows::fs::symlink_file(&external, &staging).unwrap();
+
+        assert!(matches!(
+            prepare_secure_publish(&runtime, &runtime_path),
+            Err(PlatformError::UnsafeRuntimePath)
+        ));
+        assert_eq!(fs::read(external).unwrap(), b"must remain external");
+        assert!(
+            fs::symlink_metadata(staging)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "spawned only by crash_after_publish_temp_sync_is_recovered_with_constant_bound"]
+    fn crash_after_publish_temp_sync_helper() {
+        let Some(root) = std::env::var_os("WOKCORE_TEST_PUBLISH_CRASH_ROOT") else {
+            return;
+        };
+        let paths = publish_test_paths(Path::new(&root));
+        let _lease = RuntimeLease::acquire(&paths).unwrap();
+        let store = DiscoveryStore::new(&paths).unwrap();
+        let record = publish_test_record(5999);
+
+        let _ = with_publish_after_temp_creation_hook(
+            || std::process::exit(73),
+            || store.publish(&record),
+        );
+        unreachable!("the injected abrupt exit must terminate the helper process");
+    }
+
     #[cfg(unix)]
     #[test]
     fn unix_publish_retains_an_existing_destination_swapped_after_precheck() {
@@ -1781,6 +1985,53 @@ mod publish_tests {
             .collect::<Vec<_>>();
         entries.sort();
         entries
+    }
+
+    #[cfg(windows)]
+    fn spawn_publish_crash(root: &Path) {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "runtime::permissions::publish_tests::crash_after_publish_temp_sync_helper",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("WOKCORE_TEST_PUBLISH_CRASH_ROOT", root)
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(73));
+    }
+
+    #[cfg(windows)]
+    fn publish_test_paths(root: &Path) -> AppPaths {
+        let runtime_dir = root.join("runtime");
+        AppPaths {
+            config_file: root.join("config").join("config.toml"),
+            state_db: root.join("state").join("state.sqlite3"),
+            log_dir: root.join("logs"),
+            discovery_file: runtime_dir.join("discovery.json"),
+            instance_lock: runtime_dir.join("instance.lock"),
+            runtime_dir,
+        }
+    }
+
+    #[cfg(windows)]
+    fn publish_test_record(pid: u32) -> DiscoveryRecord {
+        DiscoveryRecord {
+            base_url: "http://127.0.0.1:10101".to_owned(),
+            pid,
+            instance_id: uuid::Uuid::from_u128(u128::from(pid)),
+            wokcore_version: "0.1.0".to_owned(),
+            api_major: 1,
+        }
+    }
+
+    #[cfg(windows)]
+    fn internal_publish_entries(path: &Path) -> Vec<std::ffi::OsString> {
+        directory_entries(path)
+            .into_iter()
+            .filter(|name| name.to_string_lossy().starts_with(".wokcore-"))
+            .collect()
     }
 }
 
