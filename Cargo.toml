@@ -5,6 +5,7 @@ members = [
   "crates/wokcore-core",
   "crates/wokcore-protocols",
   "crates/wokcore-storage",
+  "crates/wokcore-platform",
 ]
 
 [workspace.package]

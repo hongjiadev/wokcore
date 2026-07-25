@@ -20,7 +20,9 @@ The initial WokCore secret-storage backends were migrated from WokRouter commit 
 
 The initial WokCore durable state storage was migrated from WokRouter commit `226a40e08ad6c783e996ceed77b8e6dfe2640fb4`. Its exact source-path and blob mapping, batch-only request metrics, metadata-only schema, disabled automatic WAL checkpointing, 16 MiB passive threshold primitive, explicit truncate checkpoint, and corruption-preservation behavior are recorded in `MIGRATION.md`.
 
-The migrated WokRouter domain types, protocol source, fixture files, configuration storage, secret storage, and durable state storage retain the source MIT notice:
+The initial WokCore platform path discovery was adapted from WokRouter commit `226a40e08ad6c783e996ceed77b8e6dfe2640fb4`. Its exact source path and blob mapping, product-directory rename, pure environment-snapshot resolver, discovery/lock path values, and excluded locale/service modules are recorded in `MIGRATION.md`.
+
+The migrated WokRouter domain types, protocol source, and fixture files, configuration storage, secret storage, durable state storage, and platform path discovery retain the source MIT notice:
 
 Copyright (c) 2026 WokRouter contributors
 

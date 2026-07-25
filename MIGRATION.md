@@ -148,3 +148,24 @@ The private pre-rewrite recovery bundle is stored in WokDocs, not this public re
   - `cargo +1.97.1 clippy -p wokcore-storage --all-targets --all-features -- -D warnings`
   - `cargo +1.97.1 test -p wokcore-storage --test state_store`
   - `cargo +1.97.1 test -p wokcore-storage --all-features`
+
+## Runtime import 6: platform path discovery
+
+- Source repository: `https://github.com/hongjiadev/wokrouter`
+- Source commit: `226a40e08ad6c783e996ceed77b8e6dfe2640fb4`
+- Imported path:
+  - `crates/wokrouter-platform/src/system/paths.rs` (blob `c9d671235de0d5caa57525422dc367aea88a2e1d`) adapted into `crates/wokcore-platform/src/system/paths.rs`
+- Renames:
+  - Cargo package `wokrouter-platform` to internal, unpublished `wokcore-platform`
+  - application directory identity `WokRouter` to `WokCore`
+- Deliberate adaptation:
+  - production discovery snapshots the operating-system environment and passes it to the same pure resolver used by deterministic tests;
+  - `AppPaths` additionally provides discovery and instance-lock path values; resolving does not create directories or files, set permissions, acquire locks, or write discovery contents;
+  - Linux and Windows reject relative environment values, use the documented home fallback when available, and otherwise fail closed.
+- Excluded source:
+  - `crates/wokrouter-platform/src/system/locale.rs`
+  - `crates/wokrouter-platform/src/service/**`
+- License: the adapted source remains available under `MIT OR Apache-2.0`; the direct WokRouter source MIT notice remains retained in `NOTICE.md` and `LICENSE-MIT`.
+- Verification:
+  - `cargo +1.97.1 clippy -p wokcore-platform --all-targets --all-features -- -D warnings`
+  - `cargo +1.97.1 test -p wokcore-platform --all-features`
