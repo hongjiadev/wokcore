@@ -429,6 +429,9 @@ fn cumulative_deltas_saturate_clamp_cache_and_ignore_duplicates() {
 
 #[test]
 fn model_normalization_does_not_assume_provider() {
+    let maximum_model = "m".repeat(256);
+    let expanding_model = "İ".repeat(128);
+
     assert_eq!(normalize_model(" openai/GPT-5.6-CODEX "), "gpt-5.6-codex");
     assert_eq!(normalize_model("custom::模型-A"), "custom::模型-a");
     assert_eq!(normalize_model(""), "unknown");
@@ -436,12 +439,19 @@ fn model_normalization_does_not_assume_provider() {
     assert_eq!(normalize_model("openai/gpt\0secret"), "unknown");
     assert_eq!(normalize_model("openai/gpt\nsecret"), "unknown");
     assert_eq!(normalize_model("openai/gpt\u{0085}secret"), "unknown");
+    assert_eq!(maximum_model.len(), 256);
+    assert_eq!(normalize_model(&maximum_model), maximum_model);
+    assert_eq!(expanding_model.len(), 256);
+    assert_eq!(expanding_model.to_lowercase().len(), 384);
+    assert_eq!(normalize_model(&expanding_model), "unknown");
 }
 
 #[test]
 fn unsafe_provider_model_suffixes_are_contained_while_a_sibling_advances() {
     let root = TempDir::new().unwrap();
     let state = TempDir::new().unwrap();
+    let expanding_model = "İ".repeat(128);
+    let maximum_model = "m".repeat(256);
     write_session(
         root.path(),
         "sessions/2026/07/26/a-empty-model-suffix.jsonl",
@@ -464,6 +474,24 @@ fn unsafe_provider_model_suffixes_are_contained_while_a_sibling_advances() {
             ),
             turn("openai/gpt\0secret"),
             token("2026-07-26T12:00:01Z", 4, 1, 0),
+        ],
+    );
+    write_session(
+        root.path(),
+        "sessions/2026/07/26/c-expanding-model.jsonl",
+        &[
+            meta("expanding-model", serde_json::json!("2026-07-26T12:00:00Z")),
+            turn(&expanding_model),
+            token("2026-07-26T12:00:01Z", 5, 1, 0),
+        ],
+    );
+    write_session(
+        root.path(),
+        "sessions/2026/07/26/d-maximum-model.jsonl",
+        &[
+            meta("maximum-model", serde_json::json!("2026-07-26T12:00:00Z")),
+            turn(&maximum_model),
+            token("2026-07-26T12:00:01Z", 6, 1, 0),
         ],
     );
     write_session(
@@ -493,16 +521,36 @@ fn unsafe_provider_model_suffixes_are_contained_while_a_sibling_advances() {
         .iter()
         .find(|source| is_session(source, "control-model-suffix"))
         .unwrap();
+    let expanding_model_source = summary
+        .sources
+        .iter()
+        .find(|source| is_session(source, "expanding-model"))
+        .unwrap();
+    let maximum_model_source = summary
+        .sources
+        .iter()
+        .find(|source| is_session(source, "maximum-model"))
+        .unwrap();
     assert_eq!(empty_model.status, SessionSourceStatus::Available);
     assert_eq!(control_model.status, SessionSourceStatus::Available);
+    assert_eq!(
+        expanding_model_source.status,
+        SessionSourceStatus::Available
+    );
+    assert_eq!(maximum_model_source.status, SessionSourceStatus::Available);
     assert_eq!(sibling.status, SessionSourceStatus::Available);
-    for source in [empty_model, control_model] {
+    for source in [empty_model, control_model, expanding_model_source] {
         let usage = codex_scanner
             .state()
             .load_current_session_usage_page(&source.source_key, None, 1)
             .unwrap();
         assert_eq!(usage.items[0].model, "unknown");
     }
+    let maximum_usage = codex_scanner
+        .state()
+        .load_current_session_usage_page(&maximum_model_source.source_key, None, 1)
+        .unwrap();
+    assert_eq!(maximum_usage.items[0].model, maximum_model);
 }
 
 #[test]
