@@ -1,0 +1,4 @@
+{"timestamp":"2026-07-26T12:00:00Z","type":"session_meta","payload":{"id":"fixture-basic"}}
+{"timestamp":"2026-07-26T12:00:01Z","type":"turn_context","payload":{"model":"GPT-5.6-CODEX"}}
+{"timestamp":"2026-07-26T12:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"合成多语言内容 — مرحبا"}]}}
+{"timestamp":"2026-07-26T12:00:03Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":8,"output_tokens":3,"cached_input_tokens":2}}}}

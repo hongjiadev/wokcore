@@ -1729,6 +1729,57 @@ impl StateStore {
             .transpose()
     }
 
+    pub fn load_staging_session_scan_cursor(
+        &self,
+        source_key: &str,
+    ) -> Result<Option<SessionScanCursor>, StorageError> {
+        validate_opaque_key("source key", source_key)?;
+        self.connection
+            .query_row(
+                "SELECT c.source_key, c.source_kind, c.generation, c.generation_state,
+                        c.file_identity, c.observed_size, c.modified_at,
+                        c.complete_byte_offset, c.stable_record_ordinal,
+                        c.parser_checkpoint, c.head_fingerprint, c.boundary_fingerprint,
+                        c.parent_source_key, c.parent_generation,
+                        c.replay_boundary_fingerprint, c.result_code, c.result_changed_at
+                 FROM session_sources s
+                 JOIN session_scan_cursors c
+                   ON c.source_key = s.source_key
+                  AND c.generation = s.staging_generation
+                 WHERE s.source_key = ?1",
+                [source_key],
+                cursor_database_row,
+            )
+            .optional()
+            .map_err(map_database_error)?
+            .map(cursor_from_database)
+            .transpose()
+    }
+
+    pub fn load_staging_session_index_record(
+        &self,
+        source_key: &str,
+    ) -> Result<Option<SessionIndexRecord>, StorageError> {
+        validate_opaque_key("source key", source_key)?;
+        self.connection
+            .query_row(
+                "SELECT i.session_key, i.source_key, i.generation, i.source_kind,
+                        i.created_at, i.last_active_at, i.message_count,
+                        i.usage_event_count, i.availability
+                 FROM session_sources s
+                 JOIN session_index i
+                   ON i.source_key = s.source_key
+                  AND i.generation = s.staging_generation
+                 WHERE s.source_key = ?1",
+                [source_key],
+                index_database_row,
+            )
+            .optional()
+            .map_err(map_database_error)?
+            .map(index_record_from_database)
+            .transpose()
+    }
+
     pub fn load_session_source(
         &self,
         source_key: &str,
@@ -1837,6 +1888,54 @@ impl StateStore {
                     source_key,
                     transition_at,
                     to_i64(generation, "generation")?,
+                    source.status.as_str(),
+                    source.error_code.map(SessionSourceErrorCode::as_str),
+                ],
+            )
+            .map_err(map_database_error)?;
+        if changed != 1 {
+            return Err(StorageError::CandidateStateConflict);
+        }
+        transaction.commit().map_err(map_database_error)?;
+        Ok(true)
+    }
+
+    pub fn mark_source_unavailable(
+        &mut self,
+        source_key: &str,
+        error_code: SessionSourceErrorCode,
+        transition_at: &str,
+    ) -> Result<bool, StorageError> {
+        validate_opaque_key("source key", source_key)?;
+        validate_timestamp("source transition timestamp", transition_at)?;
+        if error_code.is_resource_limit() {
+            return Err(invalid_state(
+                "an unavailable source cannot use a resource-limit error code",
+            ));
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_database_error)?;
+        let source = query_session_source(&transaction, source_key)?
+            .ok_or(StorageError::CandidateStateConflict)?;
+        if source.status == SessionSourceStatus::Unavailable
+            && source.error_code == Some(error_code)
+        {
+            transaction.commit().map_err(map_database_error)?;
+            return Ok(false);
+        }
+        let changed = transaction
+            .execute(
+                "UPDATE session_sources
+                 SET status = 'unavailable', error_code = ?2, last_transition_at = ?3
+                 WHERE source_key = ?1
+                   AND status = ?4
+                   AND error_code IS ?5",
+                params![
+                    source_key,
+                    error_code.as_str(),
+                    transition_at,
                     source.status.as_str(),
                     source.error_code.map(SessionSourceErrorCode::as_str),
                 ],

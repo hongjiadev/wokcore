@@ -186,6 +186,130 @@ fn promote_one_record(
 }
 
 #[test]
+fn staging_loaders_follow_only_the_staging_pointer_and_fail_closed() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("state.sqlite3");
+    let source_key = opaque(8_001);
+    let mut store = StateStore::open(&path).unwrap();
+    let generation_cursor = cursor(&source_key, 1, 100);
+    store.begin_or_resume_candidate(&generation_cursor).unwrap();
+    store
+        .commit_candidate_batch(&SessionBatch {
+            cursor: Some(generation_cursor.clone()),
+            index_records: vec![index_record(&source_key, 1, 8_002)],
+            ..SessionBatch::default()
+        })
+        .unwrap();
+
+    assert_eq!(
+        store.load_staging_session_scan_cursor(&source_key).unwrap(),
+        Some(generation_cursor.clone())
+    );
+    assert_eq!(
+        store
+            .load_staging_session_index_record(&source_key)
+            .unwrap(),
+        Some(index_record(&source_key, 1, 8_002))
+    );
+    assert!(matches!(
+        store
+            .load_staging_session_scan_cursor("raw/path")
+            .unwrap_err(),
+        StorageError::InvalidStateRecord { .. }
+    ));
+    store.promote_candidate(&source_key, 1, NOW).unwrap();
+    assert!(
+        store
+            .load_staging_session_scan_cursor(&source_key)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .load_staging_session_index_record(&source_key)
+            .unwrap()
+            .is_none()
+    );
+    drop(store);
+
+    let corrupt_source = opaque(8_003);
+    let mut store = StateStore::open(&path).unwrap();
+    let corrupt_cursor = cursor(&corrupt_source, 1, 100);
+    store.begin_or_resume_candidate(&corrupt_cursor).unwrap();
+    store
+        .commit_candidate_batch(&SessionBatch {
+            cursor: Some(corrupt_cursor),
+            index_records: vec![index_record(&corrupt_source, 1, 8_004)],
+            ..SessionBatch::default()
+        })
+        .unwrap();
+    drop(store);
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch("PRAGMA ignore_check_constraints=ON;")
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE session_index SET source_kind='invalid' WHERE source_key=?1",
+            [&corrupt_source],
+        )
+        .unwrap();
+    drop(connection);
+    let store = StateStore::open(&path).unwrap();
+    assert!(matches!(
+        store
+            .load_staging_session_index_record(&corrupt_source)
+            .unwrap_err(),
+        StorageError::StateDatabaseCorrupt { .. }
+    ));
+}
+
+#[test]
+fn unavailable_transition_retains_current_generation_and_is_idempotent() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("state.sqlite3");
+    let source_key = opaque(8_010);
+    let mut store = StateStore::open(path).unwrap();
+    promote_one_record(&mut store, &source_key, 1, 8_011);
+
+    assert!(
+        store
+            .mark_source_unavailable(
+                &source_key,
+                SessionSourceErrorCode::SourceSessionsAbsent,
+                "2026-07-26T00:01:00Z",
+            )
+            .unwrap()
+    );
+    let source = store.load_session_source(&source_key).unwrap().unwrap();
+    assert_eq!(source.current_generation, Some(1));
+    assert_eq!(source.status, SessionSourceStatus::Unavailable);
+    assert_eq!(
+        source.error_code,
+        Some(SessionSourceErrorCode::SourceSessionsAbsent)
+    );
+    assert!(
+        !store
+            .mark_source_unavailable(
+                &source_key,
+                SessionSourceErrorCode::SourceSessionsAbsent,
+                "2026-07-26T00:02:00Z",
+            )
+            .unwrap()
+    );
+    assert!(matches!(
+        store
+            .mark_source_unavailable(
+                &source_key,
+                SessionSourceErrorCode::SourceReplayLimit,
+                "2026-07-26T00:03:00Z",
+            )
+            .unwrap_err(),
+        StorageError::InvalidStateRecord { .. }
+    ));
+}
+
+#[test]
 fn external_crate_can_rebuild_every_page_key_from_validated_components() {
     let source_key = opaque(1);
     let session_key = opaque(2);

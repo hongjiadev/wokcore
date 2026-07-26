@@ -205,6 +205,38 @@ impl SessionFile {
         Ok(bytes)
     }
 
+    /// Reads at most `maximum_bytes` from the already pinned Session object.
+    ///
+    /// The path entry, parent chain, and opened object are revalidated before
+    /// and after the range read. Callers can therefore process large Session
+    /// sources in bounded chunks without reopening an ambient path.
+    pub fn read_range_bounded(
+        &mut self,
+        offset: u64,
+        maximum_bytes: usize,
+    ) -> Result<Vec<u8>, SessionError> {
+        self.revalidate_entry()?;
+        if offset >= self.snapshot.size || maximum_bytes == 0 {
+            #[cfg(test)]
+            synchronization_tests::hit(SynchronizationPoint::BeforeEmptyRangeReturn);
+            self.revalidate_entry()?;
+            return Ok(Vec::new());
+        }
+        self.file.seek(SeekFrom::Start(offset))?;
+        let remaining = self.snapshot.size - offset;
+        let maximum_bytes = u64::try_from(maximum_bytes)
+            .unwrap_or(u64::MAX)
+            .min(remaining);
+        let capacity = usize::try_from(maximum_bytes).unwrap_or(usize::MAX);
+        let mut bytes = Vec::with_capacity(capacity);
+        self.file
+            .by_ref()
+            .take(maximum_bytes)
+            .read_to_end(&mut bytes)?;
+        self.revalidate_entry()?;
+        Ok(bytes)
+    }
+
     fn revalidate_entry(&self) -> Result<(), SessionError> {
         validate_directory_chain_generation(&self.parent, &self.parent_generation)
             .map_err(map_revalidation_error)?;
@@ -1189,13 +1221,15 @@ enum SynchronizationPoint {
     AfterEnumeration,
     BeforeOpen,
     AfterOpen,
+    BeforeEmptyRangeReturn,
 }
 
 #[cfg(test)]
 mod synchronization_tests {
     use std::{
         ffi::{OsStr, OsString},
-        fs,
+        fs::{self, OpenOptions},
+        io::Write,
         path::PathBuf,
         sync::{Arc, Barrier, Mutex, mpsc},
         thread::{self, ThreadId},
@@ -1374,6 +1408,54 @@ mod synchronization_tests {
             worker.join().unwrap(),
             Err(SessionError::UnsafePath)
         ));
+    }
+
+    #[test]
+    fn synchronized_empty_range_return_detects_truncate_and_replacement() {
+        for replace in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let relative = PathBuf::from("sessions/2026/07/26/session.jsonl");
+            let file_path = root.path().join(&relative);
+            fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+            fs::write(&file_path, b"original").unwrap();
+            let lease = SessionRootLease::open(root.path()).unwrap();
+            let mut file = lease.open_file(&relative, u64::MAX).unwrap();
+            let window = Arc::new(HookWindow::new());
+            let worker_window = Arc::clone(&window);
+            let (ready_sender, ready_receiver) = mpsc::channel();
+
+            let worker = thread::spawn(move || {
+                install_hook(
+                    thread::current().id(),
+                    vec![(SynchronizationPoint::BeforeEmptyRangeReturn, worker_window)],
+                    &ready_sender,
+                );
+                let result = file.read_range_bounded(u64::MAX, 0);
+                clear_hook();
+                result
+            });
+
+            ready_receiver.recv().unwrap();
+            window.wait_until_reached();
+            if replace {
+                let moved = file_path.with_extension("moved");
+                fs::rename(&file_path, moved).unwrap();
+                fs::write(&file_path, b"replacement").unwrap();
+            } else {
+                OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .open(&file_path)
+                    .unwrap()
+                    .write_all(b"")
+                    .unwrap();
+            }
+            window.resume_operation();
+            assert!(matches!(
+                worker.join().unwrap(),
+                Err(SessionError::SessionFileChanged | SessionError::SessionFileUnavailable)
+            ));
+        }
     }
 
     #[test]

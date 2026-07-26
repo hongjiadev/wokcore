@@ -214,6 +214,64 @@ fn bounded_reads_reject_growth_beyond_the_caller_limit() {
 }
 
 #[test]
+fn pinned_range_reads_are_bounded_seekable_and_eof_safe() {
+    let fixture = SessionFixture::new(b"0123456789");
+    let root = SessionRootLease::open(fixture.root.path()).unwrap();
+    let mut opened = root.open_file(&fixture.relative_file, u64::MAX).unwrap();
+
+    assert_eq!(opened.read_range_bounded(3, 4).unwrap(), b"3456");
+    assert_eq!(opened.read_range_bounded(8, usize::MAX).unwrap(), b"89");
+    assert!(opened.read_range_bounded(10, 1).unwrap().is_empty());
+    assert!(opened.read_range_bounded(u64::MAX, 1).unwrap().is_empty());
+    assert!(opened.read_range_bounded(0, 0).unwrap().is_empty());
+}
+
+#[test]
+fn pinned_range_read_revalidates_every_writer_mutation() {
+    for mutation in [
+        BoundedReadMutation::Append,
+        BoundedReadMutation::Truncate,
+        BoundedReadMutation::Rename,
+        BoundedReadMutation::Delete,
+        BoundedReadMutation::Replace,
+    ] {
+        let fixture = SessionFixture::new(b"original");
+        let root = SessionRootLease::open(fixture.root.path()).unwrap();
+        let mut opened = root.open_file(&fixture.relative_file, u64::MAX).unwrap();
+        let moved = fixture.file.with_extension("range-moved");
+        match mutation {
+            BoundedReadMutation::Append => OpenOptions::new()
+                .append(true)
+                .open(&fixture.file)
+                .unwrap()
+                .write_all(b"-append")
+                .unwrap(),
+            BoundedReadMutation::Truncate => {
+                OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .open(&fixture.file)
+                    .unwrap();
+            }
+            BoundedReadMutation::Rename => fs::rename(&fixture.file, &moved).unwrap(),
+            BoundedReadMutation::Delete => fs::remove_file(&fixture.file).unwrap(),
+            BoundedReadMutation::Replace => {
+                fs::rename(&fixture.file, &moved).unwrap();
+                fs::write(&fixture.file, b"replacement").unwrap();
+            }
+        }
+        assert!(
+            matches!(
+                opened.read_range_bounded(0, 4),
+                Err(SessionError::SessionFileChanged | SessionError::SessionFileUnavailable)
+            ),
+            "range read accepted mutation {}",
+            mutation.name()
+        );
+    }
+}
+
+#[test]
 fn bounded_read_revalidates_the_parent_relative_entry_after_every_writer_mutation() {
     for mutation in [
         BoundedReadMutation::Append,

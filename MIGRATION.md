@@ -12,6 +12,25 @@ The first runtime-code import will be reviewed separately. Its migration commit 
 
 The private pre-rewrite recovery bundle is stored in WokDocs, not this public repository.
 
+## Session ingestion 1: Codex
+
+- Implementation: original WokCore code in `crates/wokcore-sessions`.
+- Inputs:
+  - live Codex rollouts under `sessions/YYYY/MM/DD/*.jsonl`;
+  - archived Codex rollouts under `archived_sessions/*.jsonl`;
+  - optional bounded `session_index.jsonl` titles;
+  - optional recognized Codex SQLite title databases opened only through `mode=ro&immutable=1`.
+- Deliberate behavior:
+  - Session files are opened only through the pinned, component-safe, read-only `wokcore-platform` APIs;
+  - newline-complete JSONL records advance a durable byte cursor in bounded batches, while incomplete tails are replayed;
+  - cumulative and last-turn token totals produce content-free usage rows with keyed, domain-separated identifiers;
+  - fork prefixes are resolved through persisted, content-free signature pages capped at 512 rows per page and 262,144 rows per rollout;
+  - malformed, unavailable, or resource-limited sources are isolated without discarding a previously promoted generation;
+  - timestamps are normalized to UTC without locale or user-timezone configuration;
+  - no prompt, response, tool body, raw Session path, credential, or Provider traffic is stored or emitted.
+- Research references: the read-only Session-first approach is compatible with the CC-Switch research reference listed in `NOTICE.md`; no CC-Switch source code was imported.
+- Verification uses only synthetic temporary Session roots and synthetic fixtures. No real Session root, credential, Provider, or billable endpoint is accessed.
+
 ## Runtime import 1: domain types
 
 - Source repository: `https://github.com/hongjiadev/wokrouter`

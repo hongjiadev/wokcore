@@ -1,0 +1,4 @@
+{"timestamp":"2026-07-26T12:00:03Z","type":"session_meta","payload":{"id":"fixture-child","parent_thread_id":"fixture-parent"}}
+{"timestamp":"2026-07-26T12:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"output_tokens":1}}}}
+{"timestamp":"2026-07-26T12:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":20,"output_tokens":2}}}}
+{"timestamp":"2026-07-26T12:00:04Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":25,"output_tokens":4}}}}

@@ -6,6 +6,7 @@ members = [
   "crates/wokcore-protocols",
   "crates/wokcore-storage",
   "crates/wokcore-platform",
+  "crates/wokcore-sessions",
   "crates/wokcore-server",
 ]
 

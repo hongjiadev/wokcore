@@ -19,10 +19,12 @@ All notable WokCore changes are documented in this file.
 - Secure IPv4-loopback HTTP control plane with exact authority/origin enforcement, fresh request IDs, management-first authentication, bounded JSON, versioned capabilities, graceful stop, and an OpenAPI 3.1 contract.
 - Local `serve`, `status`, `stop`, `doctor`, and JSON-only `authorize` commands with stable exit/result codes, fixed-port fail-closed startup, exact loopback identity verification, injected runtime seams, read-only diagnostics, and ownership-conditional discovery cleanup.
 - Ordered SQLite schema 3 Session state with hidden staged generations, atomic promotion, bounded cursor/index/usage/replay batches, exact client-token scopes, and content-free supplemental request metadata with explicit capacity and retention cleanup.
+- Read-only Codex Session discovery and bounded JSONL ingestion with byte cursors, cumulative usage reconstruction, durable fork-replay signatures, automatic UTC timestamp normalization, and immutable title metadata fallbacks.
 
 ### Fixed
 
 - Session state now enforces monotonic same-generation appends, immutable same-position parser checkpoints, complete current-cursor reloads, lineage-safe resume, externally rebuildable validated page keys, source-derived effective availability, source-driven current-generation paging that ignores hidden-generation volume, transactional generation compare-and-swap updates, typed supplemental drop outcomes, exact cleanup byte budgets, and three-batch interruption coverage.
+- Codex Session scans isolate malformed or resource-limited sources, preserve the last promoted generation, detect same-identity rewrites at the committed cursor boundary, resume interrupted candidates across appends and live-to-archive moves, and perform unchanged scans without durable writes.
 - Configuration loading now rejects every field outside top-level `revision`/`server` and nested `server.port`, while preserving invalid source files.
 - Protocol channels, SSE frame aggregation, and Azure/Gemini event aggregation now fail closed at configured memory and event bounds.
 - OpenAI Responses streaming and non-stream aggregation now bound retained output, identifiers, output items, and serialized context and usage values.
