@@ -1,26 +1,31 @@
 use std::{
-    collections::{BTreeSet, HashMap, HashSet, VecDeque},
+    collections::{BTreeSet, HashMap, HashSet},
+    fmt,
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering as AtomicOrdering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, limits::Limit};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use wokcore_platform::sessions::{
     SessionFile, SessionFileIdentity as PlatformFileIdentity, SessionRootLease,
 };
 use wokcore_storage::{
-    CandidateBeginOutcome, CodexReplaySignature, MAX_CODEX_REPLAY_SIGNATURES,
-    MAX_SESSION_BATCH_BYTES, MAX_SESSION_BATCH_ROWS, ParserCheckpoint, ReplaySignaturePageKey,
-    SessionAvailability, SessionBatch, SessionFileIdentity, SessionGenerationState,
-    SessionIndexRecord, SessionScanCursor, SessionScanResultCode, SessionSourceErrorCode,
-    SessionSourceKind, SessionSourcePageKey, SessionSourceStatus, SessionUsageRecord, StateStore,
-    StorageError,
+    CandidateBeginOutcome, CodexReplaySignature, CodexReplaySignaturePage,
+    MAX_CODEX_REPLAY_SIGNATURES, MAX_SESSION_BATCH_BYTES, MAX_SESSION_BATCH_ROWS, ParserCheckpoint,
+    ReplaySignaturePageKey, SessionAvailability, SessionBatch, SessionFileIdentity,
+    SessionGenerationState, SessionIndexRecord, SessionScanCursor, SessionScanResultCode,
+    SessionSourceErrorCode, SessionSourceKind, SessionSourcePageKey, SessionSourceStatus,
+    SessionUsageRecord, StateStore, StorageError,
 };
 
 use crate::{
-    cursor::{JsonlCursor, JsonlError, JsonlRecordStatus, MAX_JSONL_LINE_BYTES},
+    cursor::{JsonlCursor, JsonlError, JsonlReader, JsonlRecordStatus, MAX_JSONL_LINE_BYTES},
     discovery::{
         DiscoveredSession, DiscoveryError, DiscoveryLimits, SessionLocation,
         discover_codex_sessions,
@@ -29,21 +34,39 @@ use crate::{
 };
 
 pub const REPLAY_PAGE_SIZE: usize = 512;
+const REPLAY_GROUP_PAGE_SIZE: usize = 400;
+const MAX_REPLAY_CHILDREN_PER_PARENT: usize = 4_096;
+const MAX_REPLAY_GROUP_WORKING_BYTES: usize = 256 * 1024;
+const PARSER_CHECKPOINT_VERSION: u16 = 2;
 const FINGERPRINT_WINDOW_BYTES: usize = 4 * 1024;
 const HEAD_FINGERPRINT_BYTES: usize = 64;
 const TITLE_INDEX_LIMIT_BYTES: u64 = 4 * 1024 * 1024;
+const TITLE_DATABASE_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
 const TITLE_LIMIT_BYTES: usize = 512;
 const TITLE_ROW_LIMIT: usize = 4_096;
+const TITLE_SQLITE_LENGTH_LIMIT_BYTES: i32 = 1024 * 1024;
+const TITLE_SQLITE_PLAN_ROW_LIMIT: usize = 8;
+const TITLE_SQLITE_VM_BUDGET: usize = 20_000;
+const TITLE_SQLITE_VM_GRANULARITY: usize = 100;
 const SESSION_BATCH_ROW_TARGET: usize = 384;
 const THREAD_ID_LIMIT_BYTES: usize = 512;
 const MODEL_LIMIT_BYTES: usize = 256;
 const METADATA_PROBE_RECORDS: usize = 64;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct CodexSessionMeta {
     pub root_thread_id: String,
     pub created_at: String,
     pub parent_thread_id: Option<String>,
+}
+
+impl fmt::Debug for CodexSessionMeta {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CodexSessionMeta")
+            .field("has_parent", &self.parent_thread_id.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -309,12 +332,14 @@ fn parse_token_totals(object: &Map<String, Value>) -> Result<TokenTotals, CodexE
 
 pub fn normalize_model(value: &str) -> String {
     let normalized = value.trim().to_lowercase();
-    if normalized.is_empty() || normalized.len() > MODEL_LIMIT_BYTES {
-        return "unknown".to_owned();
-    }
-    normalized
+    let model = normalized
         .rsplit_once('/')
-        .map_or(normalized.clone(), |(_, model)| model.to_owned())
+        .map_or(normalized.as_str(), |(_, model)| model);
+    if model.is_empty() || model.len() > MODEL_LIMIT_BYTES || model.chars().any(char::is_control) {
+        "unknown".to_owned()
+    } else {
+        model.to_owned()
+    }
 }
 
 pub fn parse_timestamp_utc(value: &Value) -> Result<String, CodexError> {
@@ -481,17 +506,32 @@ pub struct ScannerMetrics {
     pub parent_index_builds: u64,
     pub replay_pages_loaded: u64,
     pub maximum_replay_page_rows: usize,
+    pub maximum_replay_group_working_bytes: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SourceScanSummary {
     pub source_key: String,
-    pub root_thread_id: Option<String>,
-    pub title: Option<String>,
+    pub session_key: Option<String>,
     pub status: SessionSourceStatus,
     pub error_code: Option<SessionSourceErrorCode>,
     pub replay_resolution: ReplayResolution,
     pub complete_byte_offset: u64,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct SessionTitle(String);
+
+impl SessionTitle {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for SessionTitle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SessionTitle(<redacted>)")
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -533,6 +573,7 @@ pub struct CodexScanner {
     domain_key: [u8; 32],
     discovery_limits: DiscoveryLimits,
     replay_limit: u64,
+    title_database_identities: HashMap<String, PlatformFileIdentity>,
     metrics: ScannerMetrics,
 }
 
@@ -552,13 +593,9 @@ impl CodexScanner {
             domain_key,
             discovery_limits: DiscoveryLimits::default(),
             replay_limit: MAX_CODEX_REPLAY_SIGNATURES,
+            title_database_identities: HashMap::new(),
             metrics: ScannerMetrics::default(),
         })
-    }
-
-    #[doc(hidden)]
-    pub fn set_test_replay_limit(&mut self, limit: u64) {
-        self.replay_limit = limit.min(MAX_CODEX_REPLAY_SIGNATURES);
     }
 
     pub fn state(&self) -> &StateStore {
@@ -628,7 +665,6 @@ impl CodexScanner {
             }
             source_keys[index] = Some(source_key);
         }
-        let titles = self.read_titles();
         let mut inspected = Vec::with_capacity(discovered.len());
         for (index, source) in discovered.iter().enumerate() {
             let identity = identities[index].clone();
@@ -662,14 +698,29 @@ impl CodexScanner {
                     .push(index);
             }
         }
+        let replay_topology = ReplayTopology::build(&inspected, &thread_sources);
 
         let mut order = (0..inspected.len()).collect::<Vec<_>>();
-        order.sort_by_key(|index| {
-            inspected[*index]
-                .metadata
-                .as_ref()
-                .and_then(|metadata| metadata.parent_thread_id.as_ref())
-                .is_some()
+        order.sort_unstable_by(|left, right| {
+            replay_topology.depths[*left]
+                .cmp(&replay_topology.depths[*right])
+                .then_with(|| {
+                    inspected[*left]
+                        .metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.parent_thread_id.as_deref())
+                        .cmp(
+                            &inspected[*right]
+                                .metadata
+                                .as_ref()
+                                .and_then(|metadata| metadata.parent_thread_id.as_deref()),
+                        )
+                })
+                .then_with(|| {
+                    inspected[*left]
+                        .source_key
+                        .cmp(&inspected[*right].source_key)
+                })
         });
         let referenced_parent_indices = inspected
             .iter()
@@ -702,8 +753,11 @@ impl CodexScanner {
         let mut unchanged_sources = 0;
         let mut committed_batches = 0;
         let mut overall_outcome = ScanOutcome::Complete;
+        let mut replay_cache = ReplayGroupCache::default();
+        let mut replay_group_start = 0usize;
+        let mut replay_group_end = 0usize;
 
-        for work_index in order {
+        for (order_position, &work_index) in order.iter().enumerate() {
             let source = &inspected[work_index];
             let discovered_source = &discovered[source.discovered_index];
             let Some(metadata) = source.metadata.as_ref() else {
@@ -737,8 +791,7 @@ impl CodexScanner {
                     .map_or(default_status, |source| source.status);
                 summaries.push(SourceScanSummary {
                     source_key: source.source_key.clone(),
-                    root_thread_id: None,
-                    title: None,
+                    session_key: None,
                     status,
                     error_code: Some(code),
                     replay_resolution: ReplayResolution::NotForked,
@@ -746,58 +799,90 @@ impl CodexScanner {
                 });
                 continue;
             };
-            let replay =
-                match self.resolve_replay(work_index, metadata, &inspected, &thread_sources) {
-                    Ok(replay) => replay,
-                    Err(error) => {
-                        let (code, default_status) = match error {
-                            CodexScannerError::Read => (
-                                SessionSourceErrorCode::SourceIoFailed,
-                                SessionSourceStatus::Unavailable,
-                            ),
-                            CodexScannerError::Parse => (
-                                SessionSourceErrorCode::SourceReplayInconsistent,
-                                SessionSourceStatus::Unavailable,
-                            ),
-                            CodexScannerError::ReplayInconsistent => (
-                                SessionSourceErrorCode::SourceReplayInconsistent,
-                                SessionSourceStatus::Unavailable,
-                            ),
-                            CodexScannerError::RecordTooLarge => (
-                                SessionSourceErrorCode::SourceRecordTooLarge,
-                                SessionSourceStatus::ResourceLimited,
-                            ),
-                            CodexScannerError::ReplayLimit => (
-                                SessionSourceErrorCode::SourceReplayLimit,
-                                SessionSourceStatus::ResourceLimited,
-                            ),
-                            error => return Err(error),
-                        };
-                        self.record_source_failure_if_possible(
-                            source,
-                            discovered_source,
-                            code,
-                            transition_at,
-                        )?;
-                        let status = self
-                            .state
-                            .load_session_source(&source.source_key)?
-                            .map_or(default_status, |source| source.status);
-                        summaries.push(SourceScanSummary {
-                            source_key: source.source_key.clone(),
-                            root_thread_id: Some(metadata.root_thread_id.clone()),
-                            title: title_for(&titles, &metadata.root_thread_id),
-                            status,
-                            error_code: Some(code),
-                            replay_resolution: ReplayResolution::Deferred(code),
-                            complete_byte_offset: self
-                                .state
-                                .load_current_session_scan_cursor(&source.source_key)?
-                                .map_or(0, |cursor| cursor.complete_byte_offset),
-                        });
-                        continue;
+            let replay_group_indices = if metadata.parent_thread_id.is_some() {
+                if order_position >= replay_group_end {
+                    replay_group_start = order_position;
+                    replay_group_end = order_position + 1;
+                    while replay_group_end < order.len() {
+                        let next = order[replay_group_end];
+                        if replay_topology.depths[next] != replay_topology.depths[work_index]
+                            || inspected[next]
+                                .metadata
+                                .as_ref()
+                                .and_then(|metadata| metadata.parent_thread_id.as_deref())
+                                != metadata.parent_thread_id.as_deref()
+                        {
+                            break;
+                        }
+                        replay_group_end += 1;
                     }
-                };
+                }
+                &order[replay_group_start..replay_group_end]
+            } else {
+                &order[order_position..order_position + 1]
+            };
+            let replay_result = if let Some(code) = replay_topology.errors[work_index] {
+                Ok(ReplayState::deferred(code))
+            } else {
+                self.resolve_replay(
+                    work_index,
+                    metadata,
+                    &inspected,
+                    &thread_sources,
+                    replay_group_indices,
+                    &mut replay_cache,
+                )
+            };
+            let replay = match replay_result {
+                Ok(replay) => replay,
+                Err(error) => {
+                    let (code, default_status) = match error {
+                        CodexScannerError::Read => (
+                            SessionSourceErrorCode::SourceIoFailed,
+                            SessionSourceStatus::Unavailable,
+                        ),
+                        CodexScannerError::Parse => (
+                            SessionSourceErrorCode::SourceReplayInconsistent,
+                            SessionSourceStatus::Unavailable,
+                        ),
+                        CodexScannerError::ReplayInconsistent => (
+                            SessionSourceErrorCode::SourceReplayInconsistent,
+                            SessionSourceStatus::Unavailable,
+                        ),
+                        CodexScannerError::RecordTooLarge => (
+                            SessionSourceErrorCode::SourceRecordTooLarge,
+                            SessionSourceStatus::ResourceLimited,
+                        ),
+                        CodexScannerError::ReplayLimit => (
+                            SessionSourceErrorCode::SourceReplayLimit,
+                            SessionSourceStatus::ResourceLimited,
+                        ),
+                        error => return Err(error),
+                    };
+                    self.record_source_failure_if_possible(
+                        source,
+                        discovered_source,
+                        code,
+                        transition_at,
+                    )?;
+                    let status = self
+                        .state
+                        .load_session_source(&source.source_key)?
+                        .map_or(default_status, |source| source.status);
+                    summaries.push(SourceScanSummary {
+                        source_key: source.source_key.clone(),
+                        session_key: Some(session_key(&self.domain_key, &metadata.root_thread_id)),
+                        status,
+                        error_code: Some(code),
+                        replay_resolution: ReplayResolution::Deferred(code),
+                        complete_byte_offset: self
+                            .state
+                            .load_current_session_scan_cursor(&source.source_key)?
+                            .map_or(0, |cursor| cursor.complete_byte_offset),
+                    });
+                    continue;
+                }
+            };
             if let ReplayResolution::Deferred(code) = replay.resolution {
                 self.record_source_failure_if_possible(
                     source,
@@ -818,8 +903,7 @@ impl CodexScanner {
                 );
                 summaries.push(SourceScanSummary {
                     source_key: source.source_key.clone(),
-                    root_thread_id: Some(metadata.root_thread_id.clone()),
-                    title: title_for(&titles, &metadata.root_thread_id),
+                    session_key: Some(session_key(&self.domain_key, &metadata.root_thread_id)),
                     status,
                     error_code: Some(code),
                     replay_resolution: ReplayResolution::Deferred(code),
@@ -1014,8 +1098,7 @@ impl CodexScanner {
             }
             summaries.push(SourceScanSummary {
                 source_key: source.source_key.clone(),
-                root_thread_id: Some(metadata.root_thread_id.clone()),
-                title: title_for(&titles, &metadata.root_thread_id),
+                session_key: Some(session_key(&self.domain_key, &metadata.root_thread_id)),
                 status: process.status,
                 error_code: process_error,
                 replay_resolution: if process_error
@@ -1032,7 +1115,7 @@ impl CodexScanner {
             }
         }
 
-        summaries.sort_by(|left, right| left.source_key.cmp(&right.source_key));
+        summaries.sort_unstable_by(|left, right| left.source_key.cmp(&right.source_key));
         Ok(CodexScanSummary {
             outcome: overall_outcome,
             advanced_sources,
@@ -1147,38 +1230,39 @@ impl CodexScanner {
         let mut file = source
             .open(&self.root, u64::MAX)
             .map_err(|_| SourceInspectionError::Read)?;
-        let scan = JsonlCursor::new(0, 1)
-            .scan_bounded(&mut file, METADATA_PROBE_RECORDS, MAX_JSONL_LINE_BYTES)
-            .map_err(SourceInspectionError::from)?;
-        self.metrics.metadata_probe_bytes = self
-            .metrics
-            .metadata_probe_bytes
-            .saturating_add(scan.read_bytes);
-        let mut meta: Option<CodexSessionMeta> = None;
-        for record in scan.records {
-            if record.status != JsonlRecordStatus::Valid {
-                continue;
-            }
-            let value = record.value();
-            if value.get("type").and_then(Value::as_str) != Some("session_meta") {
-                continue;
-            }
-            if let CodexStructuralRecord::SessionMeta(found) =
-                parse_codex_record(value).map_err(|_| SourceInspectionError::Parse)?
-            {
-                if meta.as_ref().is_some_and(|existing| existing != &found) {
-                    return Err(SourceInspectionError::Parse);
+        let mut reader = JsonlReader::new(JsonlCursor::new(0, 1));
+        for _ in 0..METADATA_PROBE_RECORDS {
+            let scan = reader
+                .scan_bounded(&mut file, 1, MAX_JSONL_LINE_BYTES)
+                .map_err(SourceInspectionError::from)?;
+            self.metrics.metadata_probe_bytes = self
+                .metrics
+                .metadata_probe_bytes
+                .saturating_add(scan.read_bytes);
+            let empty = scan.records.is_empty();
+            for record in scan.records {
+                if record.status != JsonlRecordStatus::Valid {
+                    continue;
                 }
-                meta = Some(found);
+                let value = record.value();
+                if value.get("type").and_then(Value::as_str) != Some("session_meta") {
+                    continue;
+                }
+                if let CodexStructuralRecord::SessionMeta(found) =
+                    parse_codex_record(value).map_err(|_| SourceInspectionError::Parse)?
+                {
+                    return Ok(SourceMetadata {
+                        root_thread_id: found.root_thread_id,
+                        created_at: found.created_at,
+                        parent_thread_id: found.parent_thread_id,
+                    });
+                }
+            }
+            if scan.reached_end || empty {
                 break;
             }
         }
-        let meta = meta.ok_or(SourceInspectionError::Parse)?;
-        Ok(SourceMetadata {
-            root_thread_id: meta.root_thread_id,
-            created_at: meta.created_at,
-            parent_thread_id: meta.parent_thread_id,
-        })
+        Err(SourceInspectionError::Parse)
     }
 
     fn resolve_replay(
@@ -1187,6 +1271,8 @@ impl CodexScanner {
         metadata: &SourceMetadata,
         inspected: &[InspectedSource],
         thread_sources: &HashMap<String, Vec<usize>>,
+        group_indices: &[usize],
+        cache: &mut ReplayGroupCache,
     ) -> Result<ReplayState, CodexScannerError> {
         let Some(parent_thread_id) = &metadata.parent_thread_id else {
             return Ok(ReplayState::not_forked());
@@ -1201,31 +1287,94 @@ impl CodexScanner {
                 SessionSourceErrorCode::SourceReplayParentAmbiguous,
             ));
         }
-        let parent = &inspected[parent_indices[0]];
-        let Some(parent_metadata) = parent.metadata.as_ref() else {
-            return Ok(ReplayState::deferred(
-                SessionSourceErrorCode::SourceReplayInconsistent,
-            ));
-        };
-        if parent_metadata.created_at > metadata.created_at {
+        let parent_index = parent_indices[0];
+        if cache.parent_index != Some(parent_index) {
+            self.load_replay_group(parent_index, inspected, group_indices, cache)?;
+        }
+        if cache.group_error.is_none()
+            && inspected[parent_index]
+                .metadata
+                .as_ref()
+                .is_none_or(|parent| parent.created_at > metadata.created_at)
+        {
             return Ok(ReplayState::deferred(
                 SessionSourceErrorCode::SourceReplayInconsistent,
             ));
         }
+        Ok(cache.resolution_for(work_index))
+    }
+
+    fn load_replay_group(
+        &mut self,
+        parent_index: usize,
+        inspected: &[InspectedSource],
+        group_indices: &[usize],
+        cache: &mut ReplayGroupCache,
+    ) -> Result<(), CodexScannerError> {
+        cache.reset(parent_index);
+        let parent = &inspected[parent_index];
+        let Some(parent_metadata) = parent.metadata.as_ref() else {
+            return Ok(());
+        };
+
+        let mut boundaries =
+            Vec::with_capacity(group_indices.len().min(MAX_REPLAY_CHILDREN_PER_PARENT));
+        for &work_index in group_indices {
+            #[cfg(test)]
+            test_hooks::note_replay_group_child_visit();
+            let child = &inspected[work_index];
+            let Some(metadata) = child.metadata.as_ref() else {
+                continue;
+            };
+            if metadata.parent_thread_id.as_deref() != Some(&parent_metadata.root_thread_id) {
+                continue;
+            }
+            if boundaries.len() == MAX_REPLAY_CHILDREN_PER_PARENT {
+                cache.group_error = Some(SessionSourceErrorCode::SourceReplayLimit);
+                self.metrics.maximum_replay_group_working_bytes =
+                    self.metrics.maximum_replay_group_working_bytes.max(
+                        boundaries
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<CachedReplayBoundary>()),
+                    );
+                return Ok(());
+            }
+            boundaries.push(CachedReplayBoundary {
+                work_index: u32::try_from(work_index).map_err(|_| CodexScannerError::Parse)?,
+                replayed_events: 0,
+                boundary_fingerprint: [0; 32],
+            });
+        }
+        boundaries.sort_unstable_by(|left, right| {
+            let left_index =
+                usize::try_from(left.work_index).expect("a cached replay work index fits usize");
+            let right_index =
+                usize::try_from(right.work_index).expect("a cached replay work index fits usize");
+            let left_created = &inspected[left_index]
+                .metadata
+                .as_ref()
+                .expect("replay requests have metadata")
+                .created_at;
+            let right_created = &inspected[right_index]
+                .metadata
+                .as_ref()
+                .expect("replay requests have metadata")
+                .created_at;
+            left_created
+                .cmp(right_created)
+                .then_with(|| left.work_index.cmp(&right.work_index))
+        });
+
         let Some(parent_state) = self.state.load_session_source(&parent.source_key)? else {
-            return Ok(ReplayState::deferred(
-                SessionSourceErrorCode::SourceReplayParentMissing,
-            ));
+            cache.group_error = Some(SessionSourceErrorCode::SourceReplayParentMissing);
+            return Ok(());
         };
         if parent_state.status != SessionSourceStatus::Available {
-            return Ok(ReplayState::deferred(
-                SessionSourceErrorCode::SourceReplayInconsistent,
-            ));
+            return Ok(());
         }
         let Some(parent_generation) = parent_state.current_generation else {
-            return Ok(ReplayState::deferred(
-                SessionSourceErrorCode::SourceReplayParentMissing,
-            ));
+            cache.group_error = Some(SessionSourceErrorCode::SourceReplayParentMissing);
+            return Ok(());
         };
         let parent_cursor = self
             .state
@@ -1234,80 +1383,104 @@ impl CodexScanner {
             .as_ref()
             .is_none_or(|cursor| cursor.result_code != Some(SessionScanResultCode::Advanced))
         {
-            return Ok(ReplayState::deferred(
-                SessionSourceErrorCode::SourceReplayInconsistent,
-            ));
+            return Ok(());
         }
-        let (replayed, fingerprint, indexed_events) =
-            self.parent_boundary_at(&parent.source_key, parent_generation, &metadata.created_at)?;
-        if parent_cursor
+        let expected_events = parent_cursor
             .as_ref()
-            .is_some_and(|cursor| cursor.parser_checkpoint.event_ordinal != indexed_events)
-        {
-            return Ok(ReplayState::deferred(
-                SessionSourceErrorCode::SourceReplayInconsistent,
-            ));
-        }
-
-        Ok(ReplayState::resolved(
-            parent.source_key.clone(),
-            parent_generation,
-            replayed,
-            fingerprint,
-        ))
-    }
-
-    fn parent_boundary_at(
-        &mut self,
-        parent_source_key: &str,
-        parent_generation: u64,
-        child_created_at: &str,
-    ) -> Result<(u64, [u8; 32], u64), CodexScannerError> {
+            .map_or(0, |cursor| cursor.parser_checkpoint.event_ordinal);
         let mut page_key: Option<ReplaySignaturePageKey> = None;
-        let mut replayed = 0u64;
         let mut indexed_events = 0u64;
-        let mut boundary_material = Vec::new();
-        let mut beyond_cutoff = false;
+        let mut request_index = 0usize;
+        let mut boundary_fingerprint = replay_chain_seed(&self.domain_key, parent_generation);
+        let retained_boundary_bytes = boundaries
+            .capacity()
+            .saturating_mul(std::mem::size_of::<CachedReplayBoundary>());
+        let working_bytes = retained_boundary_bytes.saturating_add(parent.source_key.len());
+        let maximum_page_bytes = maximum_replay_page_retained_bytes(REPLAY_GROUP_PAGE_SIZE);
+        if working_bytes.saturating_add(maximum_page_bytes) > MAX_REPLAY_GROUP_WORKING_BYTES {
+            cache.group_error = Some(SessionSourceErrorCode::SourceReplayLimit);
+            return Ok(());
+        }
+        self.metrics.maximum_replay_group_working_bytes = self
+            .metrics
+            .maximum_replay_group_working_bytes
+            .max(working_bytes.saturating_add(maximum_page_bytes));
         loop {
             let page = self.state.load_codex_replay_signature_page(
-                parent_source_key,
+                &parent.source_key,
                 parent_generation,
                 page_key.as_ref(),
-                REPLAY_PAGE_SIZE,
+                REPLAY_GROUP_PAGE_SIZE,
             )?;
             self.metrics.replay_pages_loaded = self.metrics.replay_pages_loaded.saturating_add(1);
             self.metrics.maximum_replay_page_rows =
                 self.metrics.maximum_replay_page_rows.max(page.items.len());
+            let page_working_bytes =
+                working_bytes.saturating_add(replay_page_retained_bytes(&page));
+            self.metrics.maximum_replay_group_working_bytes = self
+                .metrics
+                .maximum_replay_group_working_bytes
+                .max(page_working_bytes);
+            if page_working_bytes > MAX_REPLAY_GROUP_WORKING_BYTES {
+                cache.group_error = Some(SessionSourceErrorCode::SourceReplayLimit);
+                return Ok(());
+            }
             for signature in &page.items {
+                while request_index < boundaries.len()
+                    && inspected[usize::try_from(boundaries[request_index].work_index)
+                        .expect("a cached replay work index fits usize")]
+                    .metadata
+                    .as_ref()
+                    .expect("replay requests have metadata")
+                    .created_at
+                    .as_str()
+                        < signature.occurred_at.as_str()
+                {
+                    boundaries[request_index].replayed_events =
+                        u32::try_from(indexed_events).map_err(|_| CodexScannerError::Parse)?;
+                    boundaries[request_index].boundary_fingerprint = boundary_fingerprint;
+                    request_index += 1;
+                }
                 indexed_events = indexed_events
                     .checked_add(1)
                     .ok_or(CodexScannerError::Parse)?;
                 if indexed_events > self.replay_limit {
-                    return Err(CodexScannerError::ReplayLimit);
+                    cache.group_error = Some(SessionSourceErrorCode::SourceReplayLimit);
+                    return Ok(());
                 }
-                if beyond_cutoff || signature.occurred_at.as_str() > child_created_at {
-                    beyond_cutoff = true;
-                    continue;
+                if signature.token_event_ordinal != indexed_events {
+                    return Ok(());
                 }
-                replayed = replayed.checked_add(1).ok_or(CodexScannerError::Parse)?;
-                boundary_material.clear();
-                boundary_material.extend_from_slice(&signature.signature_hash);
+                boundary_fingerprint = replay_chain_step(
+                    &self.domain_key,
+                    parent_generation,
+                    indexed_events,
+                    boundary_fingerprint,
+                    signature.signature_hash,
+                );
             }
             page_key = page.next_page_key;
             if page_key.is_none() {
                 break;
             }
         }
-        Ok((
-            replayed,
-            replay_boundary_hash(
-                &self.domain_key,
-                parent_generation,
-                replayed,
-                &boundary_material,
-            ),
-            indexed_events,
-        ))
+        if indexed_events != expected_events {
+            return Ok(());
+        }
+        while request_index < boundaries.len() {
+            boundaries[request_index].replayed_events =
+                u32::try_from(indexed_events).map_err(|_| CodexScannerError::Parse)?;
+            boundaries[request_index].boundary_fingerprint = boundary_fingerprint;
+            request_index += 1;
+        }
+        boundaries.sort_unstable_by_key(|boundary| boundary.work_index);
+        cache.parent_source_key = Some(parent.source_key.clone());
+        cache.parent_generation = Some(parent_generation);
+        cache.initial_fingerprint = Some(replay_chain_seed(&self.domain_key, parent_generation));
+        cache.group_error = None;
+        cache.boundaries = boundaries;
+        debug_assert!(cache.retained_bytes() <= MAX_REPLAY_GROUP_WORKING_BYTES);
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1400,6 +1573,7 @@ impl CodexScanner {
                 && cursor.boundary_fingerprint == current_boundary
                 && lineage_matches
                 && !force_replay_rebuild
+                && cursor.parser_checkpoint.version == PARSER_CHECKPOINT_VERSION
                 && cursor.result_code == Some(SessionScanResultCode::Advanced)
                 && persisted_source.as_ref().is_none_or(|state| {
                     state.status == SessionSourceStatus::Available
@@ -1429,6 +1603,7 @@ impl CodexScanner {
         if let Some(cursor) = &current {
             if cursor.file_identity.as_str() != source.identity
                 || snapshot.size < cursor.complete_byte_offset
+                || cursor.parser_checkpoint.version != PARSER_CHECKPOINT_VERSION
                 || cursor.parent_source_key != replay.parent_source_key
                 || cursor.parent_generation != replay.parent_generation
                 || cursor.replay_boundary_fingerprint != replay.boundary_fingerprint
@@ -1530,21 +1705,14 @@ impl CodexScanner {
             .replayed_events
             .checked_sub(replay_verified)
             .ok_or(CodexScannerError::Parse)?;
-        let mut replay_page_key = if replay_verified == 0 {
-            None
-        } else {
-            Some(ReplaySignaturePageKey::new(
-                replay
-                    .parent_source_key
-                    .as_deref()
-                    .ok_or(CodexScannerError::ReplayInconsistent)?,
-                replay
-                    .parent_generation
-                    .ok_or(CodexScannerError::ReplayInconsistent)?,
-                replay_verified,
-            )?)
-        };
-        let mut expected_replay = VecDeque::new();
+        let mut replay_fingerprint = cursor.parser_checkpoint.structural_hash;
+        if replay.parent_source_key.is_some() {
+            if replay_fingerprint.is_none() {
+                return Err(CodexScannerError::ReplayInconsistent);
+            }
+        } else if replay_fingerprint.is_some() {
+            return Err(CodexScannerError::ReplayInconsistent);
+        }
         if replay_remaining > 0 {
             self.metrics.replay_child_scans = self.metrics.replay_child_scans.saturating_add(1);
         }
@@ -1560,11 +1728,10 @@ impl CodexScanner {
         );
         let mut pending_usage = Vec::new();
         let mut pending_replay = Vec::new();
+        let mut reader = JsonlReader::new(JsonlCursor::new(offset, record_ordinal));
 
         loop {
-            let scan = JsonlCursor::new(offset, record_ordinal)
-                .scan(&mut file)
-                .map_err(map_jsonl_scanner_error)?;
+            let scan = reader.scan(&mut file).map_err(map_jsonl_scanner_error)?;
             self.metrics.parser_read_bytes = self
                 .metrics
                 .parser_read_bytes
@@ -1628,33 +1795,21 @@ impl CodexScanner {
                         };
                         let signature_hash = token_signature_hash(&self.domain_key, &token, &model);
                         if replay_remaining > 0 {
-                            if expected_replay.is_empty() {
-                                let parent_source_key = replay
-                                    .parent_source_key
-                                    .as_deref()
-                                    .ok_or(CodexScannerError::ReplayInconsistent)?;
-                                let parent_generation = replay
-                                    .parent_generation
-                                    .ok_or(CodexScannerError::ReplayInconsistent)?;
-                                let page = self.state.load_codex_replay_signature_page(
-                                    parent_source_key,
-                                    parent_generation,
-                                    replay_page_key.as_ref(),
-                                    REPLAY_PAGE_SIZE,
-                                )?;
-                                self.metrics.replay_pages_loaded =
-                                    self.metrics.replay_pages_loaded.saturating_add(1);
-                                self.metrics.maximum_replay_page_rows =
-                                    self.metrics.maximum_replay_page_rows.max(page.items.len());
-                                replay_page_key = page.next_page_key;
-                                expected_replay.extend(page.items);
-                            }
-                            let expected = expected_replay
-                                .pop_front()
+                            let parent_generation = replay
+                                .parent_generation
                                 .ok_or(CodexScannerError::ReplayInconsistent)?;
-                            if signature_hash != expected.signature_hash {
-                                return Err(CodexScannerError::ReplayInconsistent);
-                            }
+                            let verified_ordinal = replay
+                                .replayed_events
+                                .checked_sub(replay_remaining)
+                                .and_then(|ordinal| ordinal.checked_add(1))
+                                .ok_or(CodexScannerError::ReplayInconsistent)?;
+                            replay_fingerprint = Some(replay_chain_step(
+                                &self.domain_key,
+                                parent_generation,
+                                verified_ordinal,
+                                replay_fingerprint.ok_or(CodexScannerError::ReplayInconsistent)?,
+                                signature_hash,
+                            ));
                         }
                         pending_replay.push(CodexReplaySignature {
                             parent_source_key: source.source_key.clone(),
@@ -1670,6 +1825,11 @@ impl CodexScanner {
                             replay_remaining = replay_remaining
                                 .checked_sub(1)
                                 .ok_or(CodexScannerError::ReplayInconsistent)?;
+                            if replay_remaining == 0
+                                && replay_fingerprint != replay.boundary_fingerprint
+                            {
+                                return Err(CodexScannerError::ReplayInconsistent);
+                            }
                         } else if let Some(delta) = delta {
                             usage_event_count = usage_event_count.saturating_add(1);
                             pending_usage.push(SessionUsageRecord {
@@ -1716,6 +1876,7 @@ impl CodexScanner {
                         &model,
                         event_ordinal,
                         replay.replayed_events - replay_remaining,
+                        replay_fingerprint,
                         replay,
                         transition_at,
                         is_candidate,
@@ -1764,6 +1925,9 @@ impl CodexScanner {
         if replay_remaining != 0 {
             return Err(CodexScannerError::ReplayInconsistent);
         }
+        if replay_fingerprint != replay.boundary_fingerprint {
+            return Err(CodexScannerError::ReplayInconsistent);
+        }
 
         let index = session_index(
             &self.domain_key,
@@ -1786,6 +1950,7 @@ impl CodexScanner {
             &model,
             event_ordinal,
             replay.replayed_events - replay_remaining,
+            replay_fingerprint,
             replay,
             transition_at,
             is_candidate,
@@ -1869,6 +2034,7 @@ impl CodexScanner {
             {
                 if staging.generation == generation
                     && staging.file_identity.as_str() == source.identity
+                    && staging.parser_checkpoint.version == PARSER_CHECKPOINT_VERSION
                     && snapshot.size >= staging.complete_byte_offset
                     && staging.parent_source_key == replay.parent_source_key
                     && staging.parent_generation == replay.parent_generation
@@ -1919,7 +2085,14 @@ impl CodexScanner {
                 modified_at: modified_at.to_owned(),
                 complete_byte_offset: 0,
                 stable_record_ordinal: 0,
-                parser_checkpoint: parser_checkpoint(TokenTotals::default(), None, 0, 0, replay),
+                parser_checkpoint: parser_checkpoint(
+                    TokenTotals::default(),
+                    None,
+                    0,
+                    0,
+                    replay.initial_fingerprint,
+                    replay,
+                ),
                 head_fingerprint,
                 boundary_fingerprint,
                 parent_source_key: replay.parent_source_key.clone(),
@@ -1958,6 +2131,7 @@ impl CodexScanner {
         model: &str,
         event_ordinal: u64,
         verified_replay_events: u64,
+        verified_replay_fingerprint: Option<[u8; 32]>,
         replay: &ReplayState,
         transition_at: &str,
         candidate: bool,
@@ -1979,6 +2153,7 @@ impl CodexScanner {
             Some(model.to_owned()),
             event_ordinal,
             verified_replay_events,
+            verified_replay_fingerprint,
             replay,
         );
         cursor.head_fingerprint = head_fingerprint;
@@ -2087,7 +2262,14 @@ impl CodexScanner {
             modified_at,
             complete_byte_offset: 0,
             stable_record_ordinal: 0,
-            parser_checkpoint: parser_checkpoint(TokenTotals::default(), None, 0, 0, &replay),
+            parser_checkpoint: parser_checkpoint(
+                TokenTotals::default(),
+                None,
+                0,
+                0,
+                replay.initial_fingerprint,
+                &replay,
+            ),
             head_fingerprint: head,
             boundary_fingerprint: boundary,
             parent_source_key: None,
@@ -2124,37 +2306,74 @@ impl CodexScanner {
         }
     }
 
-    fn read_titles(&mut self) -> HashMap<String, String> {
-        let mut titles = self.read_session_index_titles().unwrap_or_default();
-        if let Ok(database_titles) = self.read_immutable_database_titles() {
-            for (id, title) in database_titles {
-                titles.entry(id).or_insert(title);
+    pub fn title_for_source(
+        &mut self,
+        source_key: &str,
+    ) -> Result<Option<SessionTitle>, CodexScannerError> {
+        let Some(source_state) = self.state.load_session_source(source_key)? else {
+            return Ok(None);
+        };
+        if source_state.source_kind != SessionSourceKind::Codex {
+            return Ok(None);
+        }
+        let Some(cursor) = self.state.load_current_session_scan_cursor(source_key)? else {
+            return Ok(None);
+        };
+        let discovered = discover_codex_sessions(&self.root, self.discovery_limits)?;
+        let mut target = None;
+        for source in &discovered {
+            if opaque_file_identity(&self.domain_key, source.identity())
+                != cursor.file_identity.as_str()
+            {
+                continue;
+            }
+            if target.replace(source).is_some() {
+                return Err(StorageError::StableRecordConflict {
+                    record_kind: "Session title source",
+                }
+                .into());
             }
         }
-        titles
+        let Some(target) = target else {
+            return Ok(None);
+        };
+        let metadata = match self.inspect_source(target) {
+            Ok(metadata) => metadata,
+            Err(
+                SourceInspectionError::RecordTooLarge
+                | SourceInspectionError::Read
+                | SourceInspectionError::Parse,
+            ) => return Ok(None),
+        };
+        if let Some(title) = self.read_session_index_title(&metadata.root_thread_id)? {
+            return Ok(Some(title));
+        }
+        self.read_immutable_database_title(&metadata.root_thread_id)
     }
 
-    fn read_session_index_titles(&mut self) -> Result<HashMap<String, String>, CodexScannerError> {
+    fn read_session_index_title(
+        &mut self,
+        target_thread_id: &str,
+    ) -> Result<Option<SessionTitle>, CodexScannerError> {
         let mut file = match self
             .root
             .open_file("session_index.jsonl", TITLE_INDEX_LIMIT_BYTES)
         {
             Ok(file) => file,
-            Err(_) => return Ok(HashMap::new()),
+            Err(_) => return Ok(None),
         };
         self.metrics.source_opens = self.metrics.source_opens.saturating_add(1);
-        let mut output: HashMap<String, String> = HashMap::new();
-        let mut offset = 0;
-        let mut ordinal = 1;
+        let mut reader = JsonlReader::new(JsonlCursor::new(0, 1));
+        let mut output = None;
         let mut rows = 0usize;
         loop {
-            let scan = JsonlCursor::new(offset, ordinal)
+            let scan = reader
                 .scan(&mut file)
                 .map_err(|_| CodexScannerError::Read)?;
             let empty = scan.records.is_empty();
             for record in scan.records {
                 if rows >= TITLE_ROW_LIMIT {
-                    return Ok(HashMap::new());
+                    return Ok(None);
                 }
                 rows += 1;
                 if record.status != JsonlRecordStatus::Valid {
@@ -2170,17 +2389,11 @@ impl CodexScanner {
                 let Some(title) = object.get("thread_name").and_then(Value::as_str) else {
                     continue;
                 };
-                if id.is_empty()
-                    || id.len() > THREAD_ID_LIMIT_BYTES
-                    || title.is_empty()
-                    || title.len() > TITLE_LIMIT_BYTES
-                {
+                if id != target_thread_id || title.is_empty() || title.len() > TITLE_LIMIT_BYTES {
                     continue;
                 }
-                output.insert(id.to_owned(), title.to_owned());
+                output = Some(SessionTitle(title.to_owned()));
             }
-            offset = scan.complete_byte_offset;
-            ordinal = scan.next_record_ordinal;
             if scan.reached_end || empty {
                 break;
             }
@@ -2188,81 +2401,133 @@ impl CodexScanner {
         Ok(output)
     }
 
-    fn read_immutable_database_titles(&self) -> Result<HashMap<String, String>, CodexScannerError> {
-        let mut output = HashMap::new();
+    fn read_immutable_database_title(
+        &mut self,
+        target_thread_id: &str,
+    ) -> Result<Option<SessionTitle>, CodexScannerError> {
         for name in ["state_5.sqlite", "state.sqlite"] {
-            let path = self.root_path.join(name);
-            if !path.is_file() {
-                continue;
+            let mut pinned = match self.root.open_file(name, TITLE_DATABASE_LIMIT_BYTES) {
+                Ok(file) => file,
+                Err(_) => continue,
+            };
+            let identity = pinned.snapshot().identity;
+            if let Some(expected) = self.title_database_identities.get(name) {
+                if *expected != identity {
+                    continue;
+                }
+            } else {
+                self.title_database_identities
+                    .insert(name.to_owned(), identity);
             }
+            #[cfg(test)]
+            test_hooks::run_before_title_sqlite_open();
+            let path = self.root_path.join(name);
             let uri = immutable_sqlite_uri(&path);
             let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
                 | OpenFlags::SQLITE_OPEN_URI
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-            let connection =
-                Connection::open_with_flags(uri, flags).map_err(|_| CodexScannerError::Read)?;
-            connection
-                .pragma_update(None, "query_only", true)
+            let output = Connection::open_with_flags(uri, flags)
+                .ok()
+                .and_then(|connection| {
+                    query_indexed_title(&connection, target_thread_id, TITLE_SQLITE_VM_BUDGET)
+                        .ok()
+                        .flatten()
+                });
+            #[cfg(test)]
+            test_hooks::run_before_title_sqlite_revalidate();
+            pinned
+                .read_range_bounded(0, 0)
                 .map_err(|_| CodexScannerError::Read)?;
-            connection
-                .pragma_update(None, "cache_size", -256i64)
-                .map_err(|_| CodexScannerError::Read)?;
-            let exists = connection
-                .query_row(
-                    "SELECT EXISTS(
-                         SELECT 1 FROM sqlite_schema
-                         WHERE type='table' AND name='threads'
-                     )",
-                    [],
-                    |row| row.get::<_, bool>(0),
-                )
-                .unwrap_or(false);
-            if !exists {
-                continue;
-            }
-            let mut statement = match connection.prepare(
-                "SELECT id, title
-                     FROM (
-                         SELECT id, title, updated_at
-                         FROM threads
-                         ORDER BY updated_at DESC, id
-                         LIMIT ?3
-                     )
-                     WHERE typeof(id) = 'text'
-                       AND length(CAST(id AS BLOB)) BETWEEN 1 AND ?1
-                       AND typeof(title) = 'text'
-                       AND length(CAST(title AS BLOB)) BETWEEN 1 AND ?2
-                     ORDER BY updated_at DESC, id",
-            ) {
-                Ok(statement) => statement,
-                Err(_) => continue,
-            };
-            let rows = statement
-                .query_map(
-                    rusqlite::params![
-                        THREAD_ID_LIMIT_BYTES as i64,
-                        TITLE_LIMIT_BYTES as i64,
-                        TITLE_ROW_LIMIT as i64
-                    ],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-                )
-                .map_err(|_| CodexScannerError::Read)?;
-            for row in rows {
-                let (id, title) = row.map_err(|_| CodexScannerError::Read)?;
-                if !id.is_empty()
-                    && id.len() <= THREAD_ID_LIMIT_BYTES
-                    && !title.is_empty()
-                    && title.len() <= TITLE_LIMIT_BYTES
-                {
-                    output.entry(id).or_insert(title);
-                }
+            if output.is_some() {
+                return Ok(output);
             }
         }
-        Ok(output)
+        Ok(None)
     }
 }
 
-#[derive(Debug)]
+fn query_indexed_title(
+    connection: &Connection,
+    target_thread_id: &str,
+    vm_budget: usize,
+) -> rusqlite::Result<Option<SessionTitle>> {
+    connection.execute_batch(
+        "PRAGMA query_only = ON;
+         PRAGMA cache_size = -256;
+         PRAGMA automatic_index = OFF;
+         PRAGMA temp_store = MEMORY;",
+    )?;
+    connection.set_limit(Limit::SQLITE_LIMIT_LENGTH, TITLE_SQLITE_LENGTH_LIMIT_BYTES)?;
+    connection.set_limit(Limit::SQLITE_LIMIT_WORKER_THREADS, 0)?;
+    let progress_granularity = TITLE_SQLITE_VM_GRANULARITY.min(vm_budget.max(1));
+    let executed = Arc::new(AtomicUsize::new(0));
+    let progress = Arc::clone(&executed);
+    connection.progress_handler(
+        progress_granularity as i32,
+        Some(move || {
+            progress
+                .fetch_add(progress_granularity, AtomicOrdering::Relaxed)
+                .saturating_add(progress_granularity)
+                > vm_budget
+        }),
+    )?;
+
+    const TITLE_SQL: &str = "SELECT title
+         FROM threads
+         WHERE id = ?1
+           AND typeof(title) = 'text'
+           AND length(CAST(title AS BLOB)) BETWEEN 1 AND ?2
+         LIMIT 1";
+    let mut plan = connection.prepare(
+        "EXPLAIN QUERY PLAN
+         SELECT title
+         FROM threads
+         WHERE id = ?1
+           AND typeof(title) = 'text'
+           AND length(CAST(title AS BLOB)) BETWEEN 1 AND ?2
+         LIMIT 1",
+    )?;
+    let mut rows = plan.query(rusqlite::params![
+        target_thread_id,
+        TITLE_LIMIT_BYTES as i64
+    ])?;
+    let mut plan_rows = 0usize;
+    let mut indexed_lookup = false;
+    while let Some(row) = rows.next()? {
+        plan_rows += 1;
+        if plan_rows > TITLE_SQLITE_PLAN_ROW_LIMIT {
+            return Ok(None);
+        }
+        let detail = row.get::<_, String>(3)?;
+        if detail.len() > 1_024 {
+            return Ok(None);
+        }
+        let detail = detail.to_ascii_uppercase();
+        if detail.contains("SCAN") || detail.contains("TEMP B-TREE") {
+            return Ok(None);
+        }
+        if detail.contains("SEARCH THREADS") && detail.contains("ID=?") {
+            indexed_lookup = true;
+        }
+    }
+    drop(rows);
+    drop(plan);
+    if !indexed_lookup {
+        return Ok(None);
+    }
+
+    let title = connection
+        .query_row(
+            TITLE_SQL,
+            rusqlite::params![target_thread_id, TITLE_LIMIT_BYTES as i64],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(title
+        .filter(|title| !title.is_empty() && title.len() <= TITLE_LIMIT_BYTES)
+        .map(SessionTitle))
+}
+
 struct InspectedSource {
     discovered_index: usize,
     source_key: String,
@@ -2271,11 +2536,117 @@ struct InspectedSource {
     inspection_error: Option<SourceInspectionError>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct SourceMetadata {
     root_thread_id: String,
     created_at: String,
     parent_thread_id: Option<String>,
+}
+
+struct ReplayTopology {
+    depths: Vec<usize>,
+    errors: Vec<Option<SessionSourceErrorCode>>,
+}
+
+#[derive(Clone, Copy)]
+enum ReplayEdge {
+    Root,
+    Parent(usize),
+    Invalid(SessionSourceErrorCode),
+}
+
+impl ReplayTopology {
+    fn build(inspected: &[InspectedSource], thread_sources: &HashMap<String, Vec<usize>>) -> Self {
+        const UNRESOLVED: usize = usize::MAX;
+        const INVALID_DEPTH: usize = usize::MAX - 1;
+
+        let edge_for = |index: usize| {
+            let Some(metadata) = inspected[index].metadata.as_ref() else {
+                return ReplayEdge::Root;
+            };
+            let Some(parent_thread_id) = metadata.parent_thread_id.as_ref() else {
+                return ReplayEdge::Root;
+            };
+            let Some(parent_indices) = thread_sources.get(parent_thread_id) else {
+                return ReplayEdge::Invalid(SessionSourceErrorCode::SourceReplayParentMissing);
+            };
+            if parent_indices.len() != 1 || parent_indices[0] == index {
+                return ReplayEdge::Invalid(SessionSourceErrorCode::SourceReplayParentAmbiguous);
+            }
+            ReplayEdge::Parent(parent_indices[0])
+        };
+
+        let mut depths = vec![UNRESOLVED; inspected.len()];
+        let mut errors = vec![None; inspected.len()];
+        let mut visiting = vec![false; inspected.len()];
+        let mut path = Vec::new();
+        for start in 0..inspected.len() {
+            if depths[start] != UNRESOLVED {
+                continue;
+            }
+            path.clear();
+            let mut current = start;
+            loop {
+                if depths[current] != UNRESOLVED {
+                    break;
+                }
+                if visiting[current] {
+                    let cycle_start = path
+                        .iter()
+                        .position(|candidate| *candidate == current)
+                        .expect("a visiting replay node belongs to the current path");
+                    for &cycle_node in &path[cycle_start..] {
+                        depths[cycle_node] = INVALID_DEPTH;
+                        errors[cycle_node] = Some(SessionSourceErrorCode::SourceReplayInconsistent);
+                        visiting[cycle_node] = false;
+                    }
+                    break;
+                }
+                visiting[current] = true;
+                path.push(current);
+                match edge_for(current) {
+                    ReplayEdge::Root => {
+                        depths[current] = 0;
+                        visiting[current] = false;
+                        break;
+                    }
+                    ReplayEdge::Invalid(code) => {
+                        depths[current] = INVALID_DEPTH;
+                        errors[current] = Some(code);
+                        visiting[current] = false;
+                        break;
+                    }
+                    ReplayEdge::Parent(parent) => current = parent,
+                }
+            }
+
+            for &node in path.iter().rev() {
+                if depths[node] != UNRESOLVED {
+                    continue;
+                }
+                match edge_for(node) {
+                    ReplayEdge::Root => depths[node] = 0,
+                    ReplayEdge::Invalid(code) => {
+                        depths[node] = INVALID_DEPTH;
+                        errors[node] = Some(code);
+                    }
+                    ReplayEdge::Parent(parent) => {
+                        if errors[parent].is_some() {
+                            depths[node] = INVALID_DEPTH;
+                            errors[node] = Some(SessionSourceErrorCode::SourceReplayInconsistent);
+                        } else if let Some(depth) = depths[parent].checked_add(1) {
+                            depths[node] = depth;
+                        } else {
+                            depths[node] = INVALID_DEPTH;
+                            errors[node] = Some(SessionSourceErrorCode::SourceReplayInconsistent);
+                        }
+                    }
+                }
+                visiting[node] = false;
+            }
+        }
+        Self { depths, errors }
+    }
 }
 
 #[derive(Debug)]
@@ -2303,6 +2674,7 @@ struct ReplayState {
     parent_source_key: Option<String>,
     parent_generation: Option<u64>,
     boundary_fingerprint: Option<[u8; 32]>,
+    initial_fingerprint: Option<[u8; 32]>,
     replayed_events: u64,
 }
 
@@ -2313,6 +2685,7 @@ impl ReplayState {
             parent_source_key: None,
             parent_generation: None,
             boundary_fingerprint: None,
+            initial_fingerprint: None,
             replayed_events: 0,
         }
     }
@@ -2323,6 +2696,7 @@ impl ReplayState {
             parent_source_key: None,
             parent_generation: None,
             boundary_fingerprint: None,
+            initial_fingerprint: None,
             replayed_events: 0,
         }
     }
@@ -2332,14 +2706,128 @@ impl ReplayState {
         parent_generation: u64,
         replayed_events: u64,
         boundary_fingerprint: [u8; 32],
+        initial_fingerprint: [u8; 32],
     ) -> Self {
         Self {
             resolution: ReplayResolution::Resolved { replayed_events },
             parent_source_key: Some(parent_source_key),
             parent_generation: Some(parent_generation),
             boundary_fingerprint: Some(boundary_fingerprint),
+            initial_fingerprint: Some(initial_fingerprint),
             replayed_events,
         }
+    }
+}
+
+fn maximum_replay_page_retained_bytes(limit: usize) -> usize {
+    const OPAQUE_SOURCE_KEY_BYTES: usize = 64;
+    const CANONICAL_TIMESTAMP_BYTES: usize = 20;
+
+    std::mem::size_of::<CodexReplaySignaturePage>()
+        .saturating_add(
+            limit.saturating_add(1).saturating_mul(
+                std::mem::size_of::<CodexReplaySignature>()
+                    .saturating_add(OPAQUE_SOURCE_KEY_BYTES)
+                    .saturating_add(CANONICAL_TIMESTAMP_BYTES),
+            ),
+        )
+        .saturating_add(OPAQUE_SOURCE_KEY_BYTES)
+}
+
+fn replay_page_retained_bytes(page: &CodexReplaySignaturePage) -> usize {
+    std::mem::size_of_val(page)
+        .saturating_add(
+            page.items
+                .capacity()
+                .saturating_mul(std::mem::size_of::<CodexReplaySignature>()),
+        )
+        .saturating_add(page.items.iter().fold(0usize, |total, signature| {
+            total
+                .saturating_add(signature.parent_source_key.capacity())
+                .saturating_add(signature.occurred_at.capacity())
+        }))
+        .saturating_add(
+            page.next_page_key
+                .as_ref()
+                .map_or(0, |key| key.parent_source_key().len()),
+        )
+}
+
+struct CachedReplayBoundary {
+    work_index: u32,
+    replayed_events: u32,
+    boundary_fingerprint: [u8; 32],
+}
+
+struct ReplayGroupCache {
+    parent_index: Option<usize>,
+    parent_source_key: Option<String>,
+    parent_generation: Option<u64>,
+    initial_fingerprint: Option<[u8; 32]>,
+    group_error: Option<SessionSourceErrorCode>,
+    boundaries: Vec<CachedReplayBoundary>,
+}
+
+impl Default for ReplayGroupCache {
+    fn default() -> Self {
+        Self {
+            parent_index: None,
+            parent_source_key: None,
+            parent_generation: None,
+            initial_fingerprint: None,
+            group_error: Some(SessionSourceErrorCode::SourceReplayInconsistent),
+            boundaries: Vec::new(),
+        }
+    }
+}
+
+impl ReplayGroupCache {
+    fn reset(&mut self, parent_index: usize) {
+        self.parent_index = Some(parent_index);
+        self.parent_source_key = None;
+        self.parent_generation = None;
+        self.initial_fingerprint = None;
+        self.group_error = Some(SessionSourceErrorCode::SourceReplayInconsistent);
+        self.boundaries = Vec::new();
+    }
+
+    fn resolution_for(&self, work_index: usize) -> ReplayState {
+        if let Some(code) = self.group_error {
+            return ReplayState::deferred(code);
+        }
+        let Ok(work_index) = u32::try_from(work_index) else {
+            return ReplayState::deferred(SessionSourceErrorCode::SourceReplayInconsistent);
+        };
+        let Ok(boundary_index) = self
+            .boundaries
+            .binary_search_by_key(&work_index, |boundary| boundary.work_index)
+        else {
+            return ReplayState::deferred(SessionSourceErrorCode::SourceReplayInconsistent);
+        };
+        let boundary = &self.boundaries[boundary_index];
+        ReplayState::resolved(
+            self.parent_source_key
+                .as_ref()
+                .expect("resolved replay cache has one parent key")
+                .clone(),
+            self.parent_generation
+                .expect("resolved replay cache has one parent generation"),
+            u64::from(boundary.replayed_events),
+            boundary.boundary_fingerprint,
+            self.initial_fingerprint
+                .expect("resolved replay cache has one initial fingerprint"),
+        )
+    }
+
+    fn retained_bytes(&self) -> usize {
+        self.boundaries
+            .capacity()
+            .saturating_mul(std::mem::size_of::<CachedReplayBoundary>())
+            .saturating_add(
+                self.parent_source_key
+                    .as_ref()
+                    .map_or(0, |key| key.capacity()),
+            )
     }
 }
 
@@ -2364,10 +2852,11 @@ fn parser_checkpoint(
     model: Option<String>,
     event_ordinal: u64,
     verified_replay_events: u64,
+    verified_replay_fingerprint: Option<[u8; 32]>,
     replay: &ReplayState,
 ) -> ParserCheckpoint {
     ParserCheckpoint {
-        version: 1,
+        version: PARSER_CHECKPOINT_VERSION,
         previous_input_tokens: totals.input,
         previous_output_tokens: totals.output,
         previous_cache_read_tokens: totals.cache_read,
@@ -2378,7 +2867,7 @@ fn parser_checkpoint(
         lineage_source_key: replay.parent_source_key.clone(),
         lineage_generation: replay.parent_generation,
         lineage_record_ordinal: verified_replay_events,
-        structural_hash: replay.boundary_fingerprint,
+        structural_hash: verified_replay_fingerprint,
     }
 }
 
@@ -2405,10 +2894,6 @@ fn map_jsonl_scanner_error(error: JsonlError) -> CodexScannerError {
     }
 }
 
-fn title_for(titles: &HashMap<String, String>, thread_id: &str) -> Option<String> {
-    titles.get(thread_id).cloned()
-}
-
 fn session_index(
     key: &[u8; 32],
     source: &InspectedSource,
@@ -2433,10 +2918,19 @@ fn session_index(
 
 #[cfg(test)]
 mod test_hooks {
-    use std::{cell::RefCell, fs, path::PathBuf};
+    use std::{
+        cell::{Cell, RefCell},
+        fs,
+        path::PathBuf,
+    };
 
     thread_local! {
         static DELETE_AFTER_DISCOVERY: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+        static BEFORE_TITLE_SQLITE_OPEN: RefCell<Option<Box<dyn FnOnce()>>> =
+            const { RefCell::new(None) };
+        static BEFORE_TITLE_SQLITE_REVALIDATE: RefCell<Option<Box<dyn FnOnce()>>> =
+            const { RefCell::new(None) };
+        static REPLAY_GROUP_CHILD_VISITS: Cell<usize> = const { Cell::new(0) };
     }
 
     pub(super) fn delete_after_discovery(path: PathBuf) {
@@ -2452,18 +2946,146 @@ mod test_hooks {
             }
         });
     }
+
+    pub(super) fn before_title_sqlite_open(action: impl FnOnce() + 'static) {
+        BEFORE_TITLE_SQLITE_OPEN.with(|pending| {
+            assert!(pending.borrow_mut().replace(Box::new(action)).is_none());
+        });
+    }
+
+    pub(super) fn run_before_title_sqlite_open() {
+        BEFORE_TITLE_SQLITE_OPEN.with(|pending| {
+            if let Some(action) = pending.borrow_mut().take() {
+                action();
+            }
+        });
+    }
+
+    pub(super) fn before_title_sqlite_revalidate(action: impl FnOnce() + 'static) {
+        BEFORE_TITLE_SQLITE_REVALIDATE.with(|pending| {
+            assert!(pending.borrow_mut().replace(Box::new(action)).is_none());
+        });
+    }
+
+    pub(super) fn run_before_title_sqlite_revalidate() {
+        BEFORE_TITLE_SQLITE_REVALIDATE.with(|pending| {
+            if let Some(action) = pending.borrow_mut().take() {
+                action();
+            }
+        });
+    }
+
+    pub(super) fn reset_replay_group_child_visits() {
+        REPLAY_GROUP_CHILD_VISITS.set(0);
+    }
+
+    pub(super) fn note_replay_group_child_visit() {
+        REPLAY_GROUP_CHILD_VISITS.set(REPLAY_GROUP_CHILD_VISITS.get().saturating_add(1));
+    }
+
+    pub(super) fn replay_group_child_visits() -> usize {
+        REPLAY_GROUP_CHILD_VISITS.get()
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{
+        fs::{self, OpenOptions},
+        io::Write,
+        path::Path,
+        sync::{Arc, Mutex},
+    };
 
+    use rusqlite::Connection;
     use tempfile::TempDir;
 
     use super::{
-        CodexScanner, ScanControl, ScanOutcome, SessionSourceErrorCode, SessionSourceStatus,
-        test_hooks,
+        CodexScanSummary, CodexScanner, ScanControl, ScanOutcome, SessionSourceErrorCode,
+        SessionSourceStatus, session_key, test_hooks,
     };
+
+    const TEST_DOMAIN_KEY: [u8; 32] = [0x35; 32];
+    const NOW: &str = "2026-07-26T12:00:00Z";
+
+    fn scanner(root: &TempDir, state: &TempDir) -> CodexScanner {
+        CodexScanner::open(
+            root.path(),
+            state.path().join("state.sqlite3"),
+            TEST_DOMAIN_KEY,
+        )
+        .unwrap()
+    }
+
+    fn write_session(root: &Path, relative: &str, lines: &[serde_json::Value]) {
+        let path = root.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut bytes = Vec::new();
+        for line in lines {
+            serde_json::to_writer(&mut bytes, line).unwrap();
+            bytes.push(b'\n');
+        }
+        fs::write(path, bytes).unwrap();
+    }
+
+    fn meta(id: &str, timestamp: &str) -> serde_json::Value {
+        serde_json::json!({
+            "timestamp": timestamp,
+            "type": "session_meta",
+            "payload": {"id": id}
+        })
+    }
+
+    fn token(timestamp: &str, input: u64, output: u64) -> serde_json::Value {
+        serde_json::json!({
+            "timestamp": timestamp,
+            "type":"event_msg",
+            "payload":{"type":"token_count","info":{"total_token_usage":{
+                "input_tokens":input,
+                "output_tokens":output
+            }}}
+        })
+    }
+
+    fn find_session<'a>(
+        summary: &'a CodexScanSummary,
+        thread_id: &str,
+    ) -> &'a super::SourceScanSummary {
+        let expected = session_key(&TEST_DOMAIN_KEY, thread_id);
+        summary
+            .sources
+            .iter()
+            .find(|source| source.session_key.as_deref() == Some(expected.as_str()))
+            .unwrap()
+    }
+
+    fn write_title_database(path: &Path, thread_id: &str, title: &str) {
+        let connection = Connection::open(path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE threads (
+                    id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL
+                );",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO threads (id, title) VALUES (?1, ?2)",
+                rusqlite::params![thread_id, title],
+            )
+            .unwrap();
+    }
+
+    fn visible_title(
+        result: &Result<Option<super::SessionTitle>, super::CodexScannerError>,
+    ) -> Option<&str> {
+        result
+            .as_ref()
+            .ok()
+            .and_then(|title| title.as_ref())
+            .map(super::SessionTitle::as_str)
+    }
 
     #[test]
     fn source_disappearing_after_discovery_is_io_failed_and_does_not_stop_its_sibling() {
@@ -2488,9 +3110,12 @@ mod tests {
             ),
         )
         .unwrap();
-        let mut scanner =
-            CodexScanner::open(root.path(), state.path().join("state.sqlite3"), [0x35; 32])
-                .unwrap();
+        let mut scanner = CodexScanner::open(
+            root.path(),
+            state.path().join("state.sqlite3"),
+            TEST_DOMAIN_KEY,
+        )
+        .unwrap();
         test_hooks::delete_after_discovery(vanished);
 
         let summary = scanner
@@ -2512,10 +3137,428 @@ mod tests {
         let sibling = summary
             .sources
             .iter()
-            .find(|source| source.root_thread_id.as_deref() == Some("sibling"))
+            .find(|source| {
+                source.session_key.as_deref()
+                    == Some(session_key(&TEST_DOMAIN_KEY, "sibling").as_str())
+            })
             .unwrap();
         assert_eq!(sibling.status, SessionSourceStatus::Available);
         assert_eq!(sibling.error_code, None);
+    }
+
+    #[test]
+    fn replay_limit_is_a_stable_resource_outcome_without_a_public_test_api() {
+        let root = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        let mut lines = vec![meta("limited-rollout", NOW)];
+        for ordinal in 1..=4 {
+            lines.push(token("2026-07-26T12:00:01Z", ordinal, 1));
+        }
+        write_session(root.path(), "sessions/2026/07/26/limited.jsonl", &lines);
+        let mut scanner = scanner(&root, &state);
+        scanner.replay_limit = 3;
+
+        let summary = scanner.scan(NOW, ScanControl::default()).unwrap();
+        let source_summary = find_session(&summary, "limited-rollout");
+        assert_eq!(source_summary.status, SessionSourceStatus::ResourceLimited);
+        assert_eq!(
+            source_summary.error_code,
+            Some(SessionSourceErrorCode::SourceReplayLimit)
+        );
+        let persisted = scanner
+            .state()
+            .load_session_source(&source_summary.source_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.status, SessionSourceStatus::ResourceLimited);
+        assert_eq!(
+            persisted.error_code,
+            Some(SessionSourceErrorCode::SourceReplayLimit)
+        );
+        assert!(persisted.current_generation.is_none());
+    }
+
+    #[test]
+    fn replay_limit_keeps_a_current_generation_stale_without_a_public_test_api() {
+        let root = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        let relative = "sessions/2026/07/26/current-replay-limit.jsonl";
+        write_session(
+            root.path(),
+            relative,
+            &[
+                meta("current-replay-limit", NOW),
+                token("2026-07-26T12:00:01Z", 1, 1),
+                token("2026-07-26T12:00:02Z", 2, 2),
+            ],
+        );
+        let mut scanner = scanner(&root, &state);
+        scanner.replay_limit = 3;
+        let first = scanner.scan(NOW, ScanControl::default()).unwrap();
+        let key = find_session(&first, "current-replay-limit")
+            .source_key
+            .clone();
+        let mut writer = OpenOptions::new()
+            .append(true)
+            .open(root.path().join(relative))
+            .unwrap();
+        for ordinal in 3..=4 {
+            serde_json::to_writer(
+                &mut writer,
+                &token("2026-07-26T12:00:03Z", ordinal, ordinal),
+            )
+            .unwrap();
+            writer.write_all(b"\n").unwrap();
+        }
+        writer.flush().unwrap();
+        drop(writer);
+
+        let limited = scanner
+            .scan("2026-07-26T12:01:00Z", ScanControl::default())
+            .unwrap();
+        let source_summary = find_session(&limited, "current-replay-limit");
+        assert_eq!(source_summary.status, SessionSourceStatus::Stale);
+        assert_eq!(
+            source_summary.error_code,
+            Some(SessionSourceErrorCode::SourceReplayLimit)
+        );
+        let persisted = scanner.state().load_session_source(&key).unwrap().unwrap();
+        assert_eq!(persisted.status, SessionSourceStatus::Stale);
+        assert_eq!(
+            persisted.error_code,
+            Some(SessionSourceErrorCode::SourceReplayLimit)
+        );
+    }
+
+    #[test]
+    fn replay_resolution_resource_failure_is_contained_without_a_public_test_api() {
+        let root = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        let mut parent = vec![meta("contained-parent", NOW)];
+        for ordinal in 1..=4 {
+            parent.push(token(&format!("2026-07-26T12:00:0{ordinal}Z"), ordinal, 1));
+        }
+        write_session(root.path(), "sessions/2026/07/26/parent.jsonl", &parent);
+        let mut initial = scanner(&root, &state);
+        initial.scan(NOW, ScanControl::default()).unwrap();
+        drop(initial);
+
+        let mut child_meta = meta("contained-child", "2026-07-26T12:00:05Z");
+        child_meta["payload"]["parent_thread_id"] = serde_json::json!("contained-parent");
+        let mut child = vec![child_meta];
+        child.extend(parent.iter().skip(1).cloned());
+        child.push(token("2026-07-26T12:00:06Z", 9, 2));
+        write_session(root.path(), "sessions/2026/07/26/child.jsonl", &child);
+        write_session(
+            root.path(),
+            "sessions/2026/07/26/sibling.jsonl",
+            &[
+                meta("contained-sibling", NOW),
+                token("2026-07-26T12:00:01Z", 3, 1),
+            ],
+        );
+
+        let mut limited = scanner(&root, &state);
+        limited.replay_limit = 3;
+        let summary = limited.scan(NOW, ScanControl::default()).unwrap();
+        let child = find_session(&summary, "contained-child");
+        assert_eq!(child.status, SessionSourceStatus::ResourceLimited);
+        assert_eq!(
+            child.error_code,
+            Some(SessionSourceErrorCode::SourceReplayLimit)
+        );
+        let sibling = find_session(&summary, "contained-sibling");
+        assert_eq!(sibling.status, SessionSourceStatus::Available);
+        assert!(
+            limited
+                .state()
+                .load_current_generation(&sibling.source_key)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn sqlite_title_path_replacement_after_pin_never_exposes_replacement_content() {
+        const THREAD_ID: &str = "title-path-race";
+        const TRUSTED_TITLE: &str = "trusted-before-race";
+        const REPLACEMENT_CANARY: &str = "REPLACEMENT-TITLE-CANARY";
+
+        let root = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        write_session(
+            root.path(),
+            "sessions/2026/07/26/title-path-race.jsonl",
+            &[meta(THREAD_ID, NOW)],
+        );
+        let target = root.path().join("state_5.sqlite");
+        let replacement = root.path().join("replacement.sqlite");
+        let displaced = root.path().join("displaced.sqlite");
+        write_title_database(&target, THREAD_ID, TRUSTED_TITLE);
+        write_title_database(&replacement, THREAD_ID, REPLACEMENT_CANARY);
+
+        let mut scanner = scanner(&root, &state);
+        let summary = scanner.scan(NOW, ScanControl::default()).unwrap();
+        let source_key = find_session(&summary, THREAD_ID).source_key.clone();
+        let outcome = Arc::new(Mutex::new("pending"));
+        let hook_outcome = Arc::clone(&outcome);
+        let hook_target = target.clone();
+        let hook_replacement = replacement.clone();
+        let hook_displaced = displaced.clone();
+        test_hooks::before_title_sqlite_open(move || {
+            if fs::rename(&hook_target, &hook_displaced).is_err() {
+                *hook_outcome.lock().unwrap() = "refused";
+                return;
+            }
+            if fs::rename(&hook_replacement, &hook_target).is_err() {
+                fs::rename(&hook_displaced, &hook_target)
+                    .expect("the trusted database must be restored");
+                *hook_outcome.lock().unwrap() = "refused";
+                return;
+            }
+            *hook_outcome.lock().unwrap() = "replaced";
+        });
+
+        let raced = scanner.title_for_source(&source_key);
+        let outcome = *outcome.lock().unwrap();
+        assert_ne!(outcome, "pending", "the path-race hook must run after pin");
+        assert_ne!(visible_title(&raced), Some(REPLACEMENT_CANARY));
+        assert!(!format!("{raced:?}").contains(REPLACEMENT_CANARY));
+
+        if outcome == "refused" {
+            assert_eq!(visible_title(&raced), Some(TRUSTED_TITLE));
+            return;
+        }
+
+        let persistent = scanner.title_for_source(&source_key);
+        assert_ne!(
+            visible_title(&persistent),
+            Some(REPLACEMENT_CANARY),
+            "a persistent replacement must remain fail-closed for this scanner"
+        );
+        assert!(!format!("{persistent:?}").contains(REPLACEMENT_CANARY));
+
+        fs::rename(&target, &replacement).unwrap();
+        fs::rename(&displaced, &target).unwrap();
+        let before_aba = Arc::new(Mutex::new(false));
+        let before_aba_hit = Arc::clone(&before_aba);
+        let before_target = target.clone();
+        let before_replacement = replacement.clone();
+        let before_displaced = displaced.clone();
+        test_hooks::before_title_sqlite_open(move || {
+            fs::rename(&before_target, &before_displaced).unwrap();
+            fs::rename(&before_replacement, &before_target).unwrap();
+            *before_aba_hit.lock().unwrap() = true;
+        });
+        let after_aba = Arc::new(Mutex::new(false));
+        let after_aba_hit = Arc::clone(&after_aba);
+        let after_target = target.clone();
+        let after_replacement = replacement.clone();
+        let after_displaced = displaced.clone();
+        test_hooks::before_title_sqlite_revalidate(move || {
+            fs::rename(&after_target, &after_replacement).unwrap();
+            fs::rename(&after_displaced, &after_target).unwrap();
+            *after_aba_hit.lock().unwrap() = true;
+        });
+
+        let aba = scanner.title_for_source(&source_key);
+        assert!(*before_aba.lock().unwrap());
+        assert!(
+            *after_aba.lock().unwrap(),
+            "the ABA hook must run after SQLite releases the path"
+        );
+        assert_ne!(visible_title(&aba), Some(REPLACEMENT_CANARY));
+        assert!(!format!("{aba:?}").contains(REPLACEMENT_CANARY));
+    }
+
+    #[test]
+    fn sqlite_title_vm_budget_interrupts_without_exposing_the_target_value() {
+        const THREAD_ID: &str = "title-vm-budget";
+        const TITLE_CANARY: &str = "VM-BUDGET-TITLE-CANARY";
+
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE threads (
+                    id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL
+                );",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO threads (id, title) VALUES (?1, ?2)",
+                rusqlite::params![THREAD_ID, TITLE_CANARY],
+            )
+            .unwrap();
+
+        let result = super::query_indexed_title(&connection, THREAD_ID, 0);
+        assert!(result.is_err(), "a zero VM budget must fail closed");
+        assert!(!format!("{result:?}").contains(TITLE_CANARY));
+    }
+
+    #[test]
+    fn replay_child_group_hard_limit_is_contained_to_one_parent() {
+        fn inspected(
+            source_key: String,
+            thread_id: String,
+            parent_thread_id: Option<String>,
+        ) -> super::InspectedSource {
+            super::InspectedSource {
+                discovered_index: 0,
+                source_key,
+                identity: "test-identity".to_owned(),
+                metadata: Some(super::SourceMetadata {
+                    root_thread_id: thread_id,
+                    created_at: NOW.to_owned(),
+                    parent_thread_id,
+                }),
+                inspection_error: None,
+            }
+        }
+
+        let root = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        let mut scanner = scanner(&root, &state);
+        let limited_parent = "limited-parent".to_owned();
+        let other_parent = "other-parent".to_owned();
+        let mut sources = Vec::with_capacity(super::MAX_REPLAY_CHILDREN_PER_PARENT + 4);
+        sources.push(inspected("a".repeat(64), limited_parent.clone(), None));
+        for child in 0..=super::MAX_REPLAY_CHILDREN_PER_PARENT {
+            sources.push(inspected(
+                format!("limited-child-key-{child:04}"),
+                format!("limited-child-{child:04}"),
+                Some(limited_parent.clone()),
+            ));
+        }
+        let other_parent_index = sources.len();
+        sources.push(inspected("b".repeat(64), other_parent.clone(), None));
+        let other_child_index = sources.len();
+        sources.push(inspected(
+            "other-child-key".to_owned(),
+            "other-child".to_owned(),
+            Some(other_parent),
+        ));
+
+        let mut cache = super::ReplayGroupCache {
+            boundaries: Vec::with_capacity(super::MAX_REPLAY_CHILDREN_PER_PARENT),
+            ..super::ReplayGroupCache::default()
+        };
+        let limited_group = (1..=super::MAX_REPLAY_CHILDREN_PER_PARENT + 1).collect::<Vec<_>>();
+        scanner
+            .load_replay_group(0, &sources, &limited_group, &mut cache)
+            .unwrap();
+        assert_eq!(
+            cache.boundaries.capacity(),
+            0,
+            "switching groups must release the previous retained allocation"
+        );
+        assert_eq!(
+            cache.resolution_for(1).resolution,
+            super::ReplayResolution::Deferred(SessionSourceErrorCode::SourceReplayLimit)
+        );
+        assert_eq!(
+            cache
+                .resolution_for(super::MAX_REPLAY_CHILDREN_PER_PARENT)
+                .resolution,
+            super::ReplayResolution::Deferred(SessionSourceErrorCode::SourceReplayLimit)
+        );
+        assert!(
+            scanner.metrics.maximum_replay_group_working_bytes
+                <= super::MAX_REPLAY_GROUP_WORKING_BYTES
+        );
+
+        scanner
+            .load_replay_group(
+                other_parent_index,
+                &sources,
+                &[other_child_index],
+                &mut cache,
+            )
+            .unwrap();
+        assert_eq!(
+            cache.resolution_for(other_child_index).resolution,
+            super::ReplayResolution::Deferred(SessionSourceErrorCode::SourceReplayParentMissing),
+            "a different parent group must not inherit the hard-limit result"
+        );
+    }
+
+    #[test]
+    fn replay_group_child_discovery_is_linear_across_many_parents() {
+        let root = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        for group in 0..64 {
+            let parent_id = format!("linear-parent-{group:02}");
+            let child_id = format!("linear-child-{group:02}");
+            let parent = vec![meta(&parent_id, NOW), token("2026-07-26T12:00:01Z", 1, 1)];
+            write_session(
+                root.path(),
+                &format!("sessions/2026/07/26/linear-parent-{group:02}.jsonl"),
+                &parent,
+            );
+            let mut child_meta = meta(&child_id, "2026-07-26T12:00:02Z");
+            child_meta["payload"]["parent_thread_id"] = serde_json::json!(parent_id);
+            write_session(
+                root.path(),
+                &format!("sessions/2026/07/26/linear-child-{group:02}.jsonl"),
+                &[child_meta, parent[1].clone()],
+            );
+        }
+        let mut scanner = scanner(&root, &state);
+        test_hooks::reset_replay_group_child_visits();
+
+        scanner.scan(NOW, ScanControl::default()).unwrap();
+
+        assert!(
+            test_hooks::replay_group_child_visits() <= 128,
+            "64 one-child groups must visit O(N) children, observed {} visits",
+            test_hooks::replay_group_child_visits()
+        );
+    }
+
+    #[test]
+    fn maximum_replay_group_page_and_compact_boundaries_fit_the_hard_cap() {
+        assert_eq!(
+            std::mem::size_of::<super::CachedReplayBoundary>(),
+            40,
+            "the boundary cache must remain compact on the supported 64-bit targets"
+        );
+        let parent_key = "a".repeat(64);
+        let mut items = Vec::with_capacity(super::REPLAY_GROUP_PAGE_SIZE + 1);
+        for ordinal in 1..=super::REPLAY_GROUP_PAGE_SIZE {
+            items.push(super::CodexReplaySignature {
+                parent_source_key: parent_key.clone(),
+                parent_generation: 1,
+                token_event_ordinal: ordinal as u64,
+                occurred_at: NOW.to_owned(),
+                signature_hash: [0x5a; 32],
+            });
+        }
+        let page = super::CodexReplaySignaturePage {
+            items,
+            next_page_key: Some(
+                super::ReplaySignaturePageKey::new(
+                    parent_key,
+                    1,
+                    super::REPLAY_GROUP_PAGE_SIZE as u64,
+                )
+                .unwrap(),
+            ),
+        };
+        let boundary_bytes = super::MAX_REPLAY_CHILDREN_PER_PARENT
+            .saturating_mul(std::mem::size_of::<super::CachedReplayBoundary>());
+        let working_bytes = boundary_bytes
+            .saturating_add(64)
+            .saturating_add(super::replay_page_retained_bytes(&page));
+
+        assert!(
+            working_bytes <= super::MAX_REPLAY_GROUP_WORKING_BYTES,
+            "maximum replay group retains {working_bytes} bytes"
+        );
+        assert!(
+            super::maximum_replay_page_retained_bytes(super::REPLAY_GROUP_PAGE_SIZE)
+                >= super::replay_page_retained_bytes(&page)
+        );
     }
 }
 
@@ -2559,19 +3602,29 @@ fn session_key(key: &[u8; 32], root_thread_id: &str) -> String {
     )
 }
 
-fn replay_boundary_hash(
+fn replay_chain_seed(key: &[u8; 32], generation: u64) -> [u8; 32] {
+    opaque_hash(
+        key,
+        b"wokcore.codex.replay-chain-seed.v2",
+        &[&generation.to_be_bytes()],
+    )
+}
+
+fn replay_chain_step(
     key: &[u8; 32],
     generation: u64,
-    replayed: u64,
-    signature: &[u8],
+    ordinal: u64,
+    previous: [u8; 32],
+    signature: [u8; 32],
 ) -> [u8; 32] {
     opaque_hash(
         key,
-        b"wokcore.codex.replay-boundary.v1",
+        b"wokcore.codex.replay-chain-step.v2",
         &[
             &generation.to_be_bytes(),
-            &replayed.to_be_bytes(),
-            signature,
+            &ordinal.to_be_bytes(),
+            &previous,
+            &signature,
         ],
     )
 }

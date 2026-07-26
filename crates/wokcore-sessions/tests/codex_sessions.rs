@@ -5,11 +5,12 @@ use std::{
     time::SystemTime,
 };
 
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use wokcore_sessions::{
     codex::{
-        CodexScanner, CodexStructuralRecord, ScanControl, ScanOutcome, normalize_model,
-        parse_codex_record, parse_timestamp_utc,
+        CodexScanner, CodexStructuralRecord, ScanControl, ScanOutcome, SourceScanSummary,
+        normalize_model, parse_codex_record, parse_timestamp_utc,
     },
     model::{ReplayResolution, TokenTotals},
 };
@@ -92,6 +93,25 @@ fn scanner(root: &TempDir, state: &TempDir) -> CodexScanner {
     .unwrap()
 }
 
+fn expected_session_key(thread_id: &str) -> String {
+    let domain = b"wokcore.codex.session-key.v1";
+    let mut hasher = Sha256::new();
+    hasher.update((domain.len() as u64).to_be_bytes());
+    hasher.update(domain);
+    hasher.update(TEST_DOMAIN_KEY);
+    hasher.update((thread_id.len() as u64).to_be_bytes());
+    hasher.update(thread_id.as_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn is_session(source: &SourceScanSummary, thread_id: &str) -> bool {
+    source.session_key.as_deref() == Some(expected_session_key(thread_id).as_str())
+}
+
 #[test]
 fn synthetic_fixture_files_cover_basic_and_forked_rollouts() {
     let root = TempDir::new().unwrap();
@@ -120,7 +140,7 @@ fn synthetic_fixture_files_cover_basic_and_forked_rollouts() {
     let basic = summary
         .sources
         .iter()
-        .find(|source| source.root_thread_id.as_deref() == Some("fixture-basic"))
+        .find(|source| is_session(source, "fixture-basic"))
         .unwrap();
     let basic_index = codex_scanner
         .state()
@@ -134,7 +154,7 @@ fn synthetic_fixture_files_cover_basic_and_forked_rollouts() {
     let child = summary
         .sources
         .iter()
-        .find(|source| source.root_thread_id.as_deref() == Some("fixture-child"))
+        .find(|source| is_session(source, "fixture-child"))
         .unwrap();
     assert_eq!(
         child.replay_resolution,
@@ -412,6 +432,77 @@ fn model_normalization_does_not_assume_provider() {
     assert_eq!(normalize_model(" openai/GPT-5.6-CODEX "), "gpt-5.6-codex");
     assert_eq!(normalize_model("custom::模型-A"), "custom::模型-a");
     assert_eq!(normalize_model(""), "unknown");
+    assert_eq!(normalize_model("openai/"), "unknown");
+    assert_eq!(normalize_model("openai/gpt\0secret"), "unknown");
+    assert_eq!(normalize_model("openai/gpt\nsecret"), "unknown");
+    assert_eq!(normalize_model("openai/gpt\u{0085}secret"), "unknown");
+}
+
+#[test]
+fn unsafe_provider_model_suffixes_are_contained_while_a_sibling_advances() {
+    let root = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    write_session(
+        root.path(),
+        "sessions/2026/07/26/a-empty-model-suffix.jsonl",
+        &[
+            meta(
+                "empty-model-suffix",
+                serde_json::json!("2026-07-26T12:00:00Z"),
+            ),
+            turn("openai/"),
+            token("2026-07-26T12:00:01Z", 3, 1, 0),
+        ],
+    );
+    write_session(
+        root.path(),
+        "sessions/2026/07/26/b-control-model-suffix.jsonl",
+        &[
+            meta(
+                "control-model-suffix",
+                serde_json::json!("2026-07-26T12:00:00Z"),
+            ),
+            turn("openai/gpt\0secret"),
+            token("2026-07-26T12:00:01Z", 4, 1, 0),
+        ],
+    );
+    write_session(
+        root.path(),
+        "sessions/2026/07/26/z-model-sibling.jsonl",
+        &[
+            meta("model-sibling", serde_json::json!("2026-07-26T12:00:00Z")),
+            turn("openai/gpt-5.6-codex"),
+            token("2026-07-26T12:00:01Z", 5, 2, 0),
+        ],
+    );
+
+    let mut codex_scanner = scanner(&root, &state);
+    let summary = codex_scanner.scan(NOW, ScanControl::default()).unwrap();
+    let empty_model = summary
+        .sources
+        .iter()
+        .find(|source| is_session(source, "empty-model-suffix"))
+        .unwrap();
+    let sibling = summary
+        .sources
+        .iter()
+        .find(|source| is_session(source, "model-sibling"))
+        .unwrap();
+    let control_model = summary
+        .sources
+        .iter()
+        .find(|source| is_session(source, "control-model-suffix"))
+        .unwrap();
+    assert_eq!(empty_model.status, SessionSourceStatus::Available);
+    assert_eq!(control_model.status, SessionSourceStatus::Available);
+    assert_eq!(sibling.status, SessionSourceStatus::Available);
+    for source in [empty_model, control_model] {
+        let usage = codex_scanner
+            .state()
+            .load_current_session_usage_page(&source.source_key, None, 1)
+            .unwrap();
+        assert_eq!(usage.items[0].model, "unknown");
+    }
 }
 
 #[test]
@@ -462,6 +553,252 @@ fn scanner_reconstructs_usage_and_restart_is_write_free_when_unchanged() {
     assert_eq!(second.unchanged_sources, 1);
     assert_eq!(second.metrics.full_source_scans, 0);
     assert_eq!(snapshot_tree(state.path()), before);
+}
+
+#[test]
+fn legacy_replay_checkpoint_rebuilds_once_then_restart_is_write_free() {
+    let root = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let parent = vec![
+        meta(
+            "checkpoint-v2-parent",
+            serde_json::json!("2026-07-26T12:00:00Z"),
+        ),
+        token("2026-07-26T12:00:01Z", 4, 1, 0),
+        token("2026-07-26T12:00:02Z", 8, 2, 0),
+    ];
+    write_session(
+        root.path(),
+        "sessions/2026/07/26/checkpoint-parent.jsonl",
+        &parent,
+    );
+    let mut child_meta = meta(
+        "checkpoint-v2-child",
+        serde_json::json!("2026-07-26T12:00:03Z"),
+    );
+    child_meta["payload"]["parent_thread_id"] = serde_json::json!("checkpoint-v2-parent");
+    let mut child = vec![child_meta];
+    child.extend(parent.iter().skip(1).cloned());
+    child.push(token("2026-07-26T12:00:04Z", 10, 3, 0));
+    write_session(
+        root.path(),
+        "sessions/2026/07/26/checkpoint-child.jsonl",
+        &child,
+    );
+
+    let mut initial = scanner(&root, &state);
+    let first = initial.scan(NOW, ScanControl::default()).unwrap();
+    let child_key = first
+        .sources
+        .iter()
+        .find(|source| is_session(source, "checkpoint-v2-child"))
+        .unwrap()
+        .source_key
+        .clone();
+    assert_eq!(
+        initial.state().load_current_generation(&child_key).unwrap(),
+        Some(1)
+    );
+    drop(initial);
+
+    let state_path = state.path().join("state.sqlite3");
+    let direct = rusqlite::Connection::open(&state_path).unwrap();
+    let mut checkpoint = direct
+        .query_row(
+            "SELECT parser_checkpoint
+             FROM session_scan_cursors
+             WHERE source_key = ?1 AND generation = 1",
+            [&child_key],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .unwrap();
+    assert_eq!(checkpoint.first(), Some(&b'2'));
+    checkpoint[0] = b'1';
+    assert_eq!(
+        direct
+            .execute(
+                "UPDATE session_scan_cursors
+                 SET parser_checkpoint = ?1
+                 WHERE source_key = ?2 AND generation = 1",
+                rusqlite::params![checkpoint, &child_key],
+            )
+            .unwrap(),
+        1
+    );
+    drop(direct);
+
+    let mut restarted = scanner(&root, &state);
+    let upgraded = restarted
+        .scan("2026-07-26T12:01:00Z", ScanControl::default())
+        .unwrap();
+    let child_summary = upgraded
+        .sources
+        .iter()
+        .find(|source| is_session(source, "checkpoint-v2-child"))
+        .unwrap();
+    assert_eq!(child_summary.status, SessionSourceStatus::Available);
+    assert_eq!(
+        restarted
+            .state()
+            .load_current_generation(&child_key)
+            .unwrap(),
+        Some(2)
+    );
+    let upgraded_cursor = restarted
+        .state()
+        .load_current_session_scan_cursor(&child_key)
+        .unwrap()
+        .unwrap();
+    assert_eq!(upgraded_cursor.parser_checkpoint.version, 2);
+
+    let before = snapshot_tree(state.path());
+    let unchanged = restarted
+        .scan("2026-07-26T12:02:00Z", ScanControl::default())
+        .unwrap();
+    assert_eq!(unchanged.advanced_sources, 0);
+    assert_eq!(unchanged.unchanged_sources, 2);
+    assert_eq!(snapshot_tree(state.path()), before);
+}
+
+#[test]
+fn nested_fork_parent_failure_defers_its_child_in_the_same_scan() {
+    let root = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let grandparent = vec![
+        meta("z-grandparent", serde_json::json!("2026-07-26T12:00:00Z")),
+        token("2026-07-26T12:00:01Z", 2, 1, 0),
+    ];
+    write_session(
+        root.path(),
+        "sessions/2026/07/26/nested-grandparent.jsonl",
+        &grandparent,
+    );
+    let mut parent_meta = meta("a-parent", serde_json::json!("2026-07-26T12:00:02Z"));
+    parent_meta["payload"]["parent_thread_id"] = serde_json::json!("z-grandparent");
+    let parent = vec![
+        parent_meta.clone(),
+        grandparent[1].clone(),
+        token("2026-07-26T12:00:03Z", 4, 2, 0),
+    ];
+    write_session(
+        root.path(),
+        "sessions/2026/07/26/nested-parent.jsonl",
+        &parent,
+    );
+    let mut child_meta = meta("nested-child", serde_json::json!("2026-07-26T12:00:04Z"));
+    child_meta["payload"]["parent_thread_id"] = serde_json::json!("a-parent");
+    write_session(
+        root.path(),
+        "sessions/2026/07/26/nested-child.jsonl",
+        &[
+            child_meta,
+            grandparent[1].clone(),
+            parent[2].clone(),
+            token("2026-07-26T12:00:05Z", 6, 3, 0),
+        ],
+    );
+
+    let mut scanner = scanner(&root, &state);
+    scanner.scan(NOW, ScanControl::default()).unwrap();
+    let second = scanner
+        .scan("2026-07-26T12:01:00Z", ScanControl::default())
+        .unwrap();
+    assert!(matches!(
+        second
+            .sources
+            .iter()
+            .find(|source| is_session(source, "nested-child"))
+            .unwrap()
+            .replay_resolution,
+        ReplayResolution::Resolved { .. }
+    ));
+
+    let mut invalid_parent_meta = parent_meta;
+    invalid_parent_meta["timestamp"] = serde_json::json!("2026-07-26T12:00:02Z");
+    write_session(
+        root.path(),
+        "sessions/2026/07/26/nested-parent.jsonl",
+        &[
+            invalid_parent_meta,
+            meta(
+                "different-parent-id",
+                serde_json::json!("2026-07-26T12:00:03Z"),
+            ),
+        ],
+    );
+    let failed = scanner
+        .scan("2026-07-26T12:02:00Z", ScanControl::default())
+        .unwrap();
+    let parent_summary = failed
+        .sources
+        .iter()
+        .find(|source| is_session(source, "a-parent"))
+        .unwrap();
+    assert_eq!(parent_summary.status, SessionSourceStatus::Stale);
+    assert_eq!(
+        parent_summary.error_code,
+        Some(SessionSourceErrorCode::SourceParseInvalid)
+    );
+    let child_summary = failed
+        .sources
+        .iter()
+        .find(|source| is_session(source, "nested-child"))
+        .unwrap();
+    assert_eq!(child_summary.status, SessionSourceStatus::Stale);
+    assert_eq!(
+        child_summary.replay_resolution,
+        ReplayResolution::Deferred(SessionSourceErrorCode::SourceReplayInconsistent)
+    );
+}
+
+#[test]
+fn replay_cycle_with_old_current_generations_is_fail_closed() {
+    let root = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    for (relative, id, input) in [
+        ("cycle-a.jsonl", "cycle-a", 2),
+        ("cycle-b.jsonl", "cycle-b", 3),
+    ] {
+        write_session(
+            root.path(),
+            &format!("sessions/2026/07/26/{relative}"),
+            &[
+                meta(id, serde_json::json!("2026-07-26T12:00:00Z")),
+                token("2026-07-26T12:00:01Z", input, 1, 0),
+            ],
+        );
+    }
+    let mut scanner = scanner(&root, &state);
+    scanner.scan(NOW, ScanControl::default()).unwrap();
+
+    for (relative, id, parent, input) in [
+        ("cycle-a.jsonl", "cycle-a", "cycle-b", 2),
+        ("cycle-b.jsonl", "cycle-b", "cycle-a", 3),
+    ] {
+        let mut cycle_meta = meta(id, serde_json::json!("2026-07-26T12:00:00Z"));
+        cycle_meta["payload"]["parent_thread_id"] = serde_json::json!(parent);
+        write_session(
+            root.path(),
+            &format!("sessions/2026/07/26/{relative}"),
+            &[cycle_meta, token("2026-07-26T12:00:01Z", input, 1, 0)],
+        );
+    }
+
+    let cycled = scanner
+        .scan("2026-07-26T12:01:00Z", ScanControl::default())
+        .unwrap();
+    for id in ["cycle-a", "cycle-b"] {
+        let source = cycled
+            .sources
+            .iter()
+            .find(|source| is_session(source, id))
+            .unwrap();
+        assert_eq!(source.status, SessionSourceStatus::Stale);
+        assert_eq!(
+            source.replay_resolution,
+            ReplayResolution::Deferred(SessionSourceErrorCode::SourceReplayInconsistent)
+        );
+    }
 }
 
 #[test]
@@ -683,7 +1020,7 @@ fn fork_replay_resolves_and_late_missing_ambiguous_inconsistent_are_stable() {
     let child = scan
         .sources
         .iter()
-        .find(|item| item.root_thread_id.as_deref() == Some("child"))
+        .find(|item| is_session(item, "child"))
         .unwrap();
     assert!(matches!(
         child.replay_resolution,
@@ -821,11 +1158,11 @@ fn late_ambiguous_zero_prefix_and_incomplete_children_have_stable_replay_outcome
         .scan(NOW, ScanControl::default())
         .unwrap();
     assert!(incomplete.sources.iter().any(|source| {
-        source.root_thread_id.as_deref() == Some("incomplete-child")
+        is_session(source, "incomplete-child")
             && source.replay_resolution == ReplayResolution::Resolved { replayed_events: 0 }
     }));
     assert!(incomplete.sources.iter().any(|source| {
-        source.root_thread_id.as_deref() == Some("missing-prefix-child")
+        is_session(source, "missing-prefix-child")
             && source.replay_resolution
                 == ReplayResolution::Deferred(SessionSourceErrorCode::SourceReplayInconsistent)
     }));
@@ -859,14 +1196,14 @@ fn parent_generation_change_invalidates_and_rebuilds_child_lineage() {
     let parent_key = first
         .sources
         .iter()
-        .find(|source| source.root_thread_id.as_deref() == Some("changing-parent"))
+        .find(|source| is_session(source, "changing-parent"))
         .unwrap()
         .source_key
         .clone();
     let child_key = first
         .sources
         .iter()
-        .find(|source| source.root_thread_id.as_deref() == Some("changing-child"))
+        .find(|source| is_session(source, "changing-child"))
         .unwrap()
         .source_key
         .clone();
@@ -928,7 +1265,7 @@ fn rewritten_child_replay_prefix_is_revalidated_before_generation_rebuild() {
     let child = initial
         .sources
         .iter()
-        .find(|source| source.root_thread_id.as_deref() == Some("rewritten-prefix-child"))
+        .find(|source| is_session(source, "rewritten-prefix-child"))
         .unwrap();
     let child_key = child.source_key.clone();
     let old_modified = fs::metadata(&child_path).unwrap().modified().unwrap();
@@ -952,7 +1289,7 @@ fn rewritten_child_replay_prefix_is_revalidated_before_generation_rebuild() {
     let child = rewritten
         .sources
         .iter()
-        .find(|source| source.root_thread_id.as_deref() == Some("rewritten-prefix-child"))
+        .find(|source| is_session(source, "rewritten-prefix-child"))
         .unwrap();
     assert_eq!(
         child.replay_resolution,
@@ -1002,7 +1339,7 @@ fn long_parent_pages_survive_restart_and_multiple_late_children_reuse_them() {
     let mut first = scanner(&root, &state);
     let initial = first.scan(NOW, ScanControl::default()).unwrap();
     assert_eq!(initial.metrics.parent_index_builds, 1);
-    assert_eq!(initial.metrics.maximum_replay_page_rows, 512);
+    assert_eq!(initial.metrics.maximum_replay_page_rows, 400);
     assert_eq!(initial.metrics.full_source_scans, 2);
     drop(first);
 
@@ -1021,7 +1358,81 @@ fn long_parent_pages_survive_restart_and_multiple_late_children_reuse_them() {
     assert_eq!(late.metrics.parent_index_builds, 0);
     assert_eq!(late.metrics.full_source_scans, 2);
     assert_eq!(late.metrics.replay_child_scans, 2);
-    assert_eq!(late.metrics.maximum_replay_page_rows, 512);
+    assert_eq!(late.metrics.maximum_replay_page_rows, 400);
+}
+
+#[test]
+fn one_parent_signature_stream_resolves_and_validates_many_changed_children() {
+    let root = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let mut parent = vec![meta(
+        "group-parent",
+        serde_json::json!("2026-07-26T12:00:00Z"),
+    )];
+    for ordinal in 1..=1_200 {
+        parent.push(token("2026-07-26T12:00:01Z", ordinal, ordinal, 0));
+    }
+    write_session(
+        root.path(),
+        "sessions/2026/07/26/group-parent.jsonl",
+        &parent,
+    );
+    let mut initial = scanner(&root, &state);
+    let parent_scan = initial.scan(NOW, ScanControl::default()).unwrap();
+    let parent_key = parent_scan.sources[0].source_key.clone();
+    drop(initial);
+
+    for child_index in 0..8 {
+        let mut child_meta = meta(
+            &format!("group-child-{child_index}"),
+            serde_json::json!("2026-07-26T12:00:02Z"),
+        );
+        child_meta["payload"]["parent_thread_id"] = serde_json::json!("group-parent");
+        let mut child = Vec::with_capacity(parent.len() + 1);
+        child.push(child_meta);
+        child.extend(parent.iter().skip(1).cloned());
+        child.push(token(
+            "2026-07-26T12:00:03Z",
+            1_201 + child_index,
+            1_201 + child_index,
+            0,
+        ));
+        write_session(
+            root.path(),
+            &format!("sessions/2026/07/26/group-child-{child_index}.jsonl"),
+            &child,
+        );
+    }
+
+    let mut grouped = scanner(&root, &state);
+    let summary = grouped.scan(NOW, ScanControl::default()).unwrap();
+    assert_eq!(summary.metrics.replay_child_scans, 8);
+    assert_eq!(
+        summary.metrics.replay_pages_loaded, 3,
+        "1,200 parent signatures must be streamed once in three bounded pages"
+    );
+    assert!(
+        summary.metrics.maximum_replay_group_working_bytes >= 64 * 1024,
+        "group peak must include the retained replay page"
+    );
+    assert!(
+        summary.metrics.maximum_replay_group_working_bytes <= 256 * 1024,
+        "group resolver retained {} bytes",
+        summary.metrics.maximum_replay_group_working_bytes
+    );
+    let children = summary
+        .sources
+        .iter()
+        .filter(|source| source.source_key != parent_key)
+        .collect::<Vec<_>>();
+    assert_eq!(children.len(), 8);
+    for child in children {
+        let usage = grouped
+            .state()
+            .load_current_session_usage_page(&child.source_key, None, 10)
+            .unwrap();
+        assert_eq!(usage.items.len(), 1);
+    }
 }
 
 #[test]
@@ -1071,12 +1482,11 @@ fn parent_index_with_a_middle_ordinal_gap_is_rebuilt_once_then_all_children_use_
     assert_eq!(rebuilt.metrics.parent_index_builds, 1);
     assert_eq!(rebuilt.metrics.full_source_scans, 3);
     assert_eq!(rebuilt.metrics.maximum_replay_page_rows, 3);
-    for child in rebuilt.sources.iter().filter(|source| {
-        source
-            .root_thread_id
-            .as_deref()
-            .is_some_and(|thread| thread.starts_with("lease-child-"))
-    }) {
+    for child in rebuilt
+        .sources
+        .iter()
+        .filter(|source| is_session(source, "lease-child-1") || is_session(source, "lease-child-2"))
+    {
         let usage = rebuild
             .state()
             .load_current_session_usage_page(&child.source_key, None, 500)
@@ -1138,11 +1548,50 @@ fn immutable_title_sources_are_bounded_and_zero_write_with_active_wal() {
     let before = snapshot_tree(root.path());
     let mut scanner = scanner(&root, &state);
     let scan = scanner.scan(NOW, ScanControl::default()).unwrap();
-    let title = scan.sources[0].title.as_deref();
-    assert!(matches!(
-        title,
-        Some("Explicit title") | Some("checkpointed") | None
-    ));
+    let source_key = scan.sources[0].source_key.clone();
+    let title = scanner.title_for_source(&source_key).unwrap().unwrap();
+    assert_eq!(title.as_str(), "Explicit title");
+    assert!(!format!("{title:?}").contains("Explicit title"));
+    assert_eq!(snapshot_tree(root.path()), before);
+    drop(connection);
+}
+
+#[test]
+fn active_wal_title_lookup_reads_only_checkpointed_main_without_writes() {
+    let root = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    write_session(
+        root.path(),
+        "sessions/2026/07/26/wal-title.jsonl",
+        &[meta("wal-title", serde_json::json!("2026-07-26T12:00:00Z"))],
+    );
+    let db = root.path().join("state_5.sqlite");
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE threads(id TEXT PRIMARY KEY, title TEXT NOT NULL);
+             INSERT INTO threads VALUES('wal-title', 'checkpointed-title');
+             PRAGMA wal_checkpoint(TRUNCATE);",
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE threads SET title='WAL-ONLY-TITLE-CANARY' WHERE id='wal-title'",
+            [],
+        )
+        .unwrap();
+    let mut codex_scanner = scanner(&root, &state);
+    let summary = codex_scanner.scan(NOW, ScanControl::default()).unwrap();
+    let before = snapshot_tree(root.path());
+
+    let title = codex_scanner
+        .title_for_source(&summary.sources[0].source_key)
+        .unwrap()
+        .unwrap();
+    assert_eq!(title.as_str(), "checkpointed-title");
+    assert!(!format!("{title:?}").contains("WAL-ONLY-TITLE-CANARY"));
     assert_eq!(snapshot_tree(root.path()), before);
     drop(connection);
 }
@@ -1184,13 +1633,122 @@ fn immutable_title_query_filters_oversized_fields_within_its_candidate_window() 
 
     let mut codex_scanner = scanner(&root, &state);
     let summary = codex_scanner.scan(NOW, ScanControl::default()).unwrap();
-    assert_eq!(summary.sources[0].title.as_deref(), Some("Bounded title"));
+    let title = codex_scanner
+        .title_for_source(&summary.sources[0].source_key)
+        .unwrap()
+        .unwrap();
+    assert_eq!(title.as_str(), "Bounded title");
     assert!(!format!("{summary:?}").contains(&"x".repeat(1024)));
     assert!(!format!("{summary:?}").contains(&"y".repeat(1024)));
 }
 
 #[test]
-fn immutable_title_query_does_not_search_beyond_its_candidate_window() {
+fn sqlite_title_lookup_rejects_unindexed_tables_and_oversized_target_values() {
+    let root = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    write_session(
+        root.path(),
+        "sessions/2026/07/26/unindexed-title.jsonl",
+        &[meta(
+            "unindexed-title",
+            serde_json::json!("2026-07-26T12:00:00Z"),
+        )],
+    );
+    let db = root.path().join("state_5.sqlite");
+    let mut connection = rusqlite::Connection::open(&db).unwrap();
+    connection
+        .execute_batch("CREATE TABLE threads(id TEXT NOT NULL, title TEXT NOT NULL);")
+        .unwrap();
+    let transaction = connection.transaction().unwrap();
+    for ordinal in 0..8_192 {
+        transaction
+            .execute(
+                "INSERT INTO threads VALUES(?1, 'decoy')",
+                [format!("decoy-{ordinal:05}")],
+            )
+            .unwrap();
+    }
+    transaction
+        .execute(
+            "INSERT INTO threads VALUES('unindexed-title', 'UNINDEXED-TITLE-CANARY')",
+            [],
+        )
+        .unwrap();
+    transaction.commit().unwrap();
+    drop(connection);
+
+    let mut codex_scanner = scanner(&root, &state);
+    let summary = codex_scanner.scan(NOW, ScanControl::default()).unwrap();
+    assert!(
+        codex_scanner
+            .title_for_source(&summary.sources[0].source_key)
+            .unwrap()
+            .is_none()
+    );
+
+    fs::remove_file(&db).unwrap();
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE threads(id TEXT PRIMARY KEY, title TEXT NOT NULL);
+             INSERT INTO threads VALUES('unindexed-title', 'x');",
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE threads SET title=?1 WHERE id='unindexed-title'",
+            ["OVERSIZED-TITLE-CANARY-".repeat(32)],
+        )
+        .unwrap();
+    drop(connection);
+    assert!(
+        codex_scanner
+            .title_for_source(&summary.sources[0].source_key)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn sqlite_title_lookup_rejects_a_database_above_the_fixed_file_cap() {
+    let root = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    write_session(
+        root.path(),
+        "sessions/2026/07/26/oversized-db-title.jsonl",
+        &[meta(
+            "oversized-db-title",
+            serde_json::json!("2026-07-26T12:00:00Z"),
+        )],
+    );
+    let db = root.path().join("state_5.sqlite");
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE threads(id TEXT PRIMARY KEY, title TEXT NOT NULL);
+             INSERT INTO threads VALUES('oversized-db-title', 'MUST-NOT-BE-READ');",
+        )
+        .unwrap();
+    drop(connection);
+    OpenOptions::new()
+        .write(true)
+        .open(&db)
+        .unwrap()
+        .set_len(64 * 1024 * 1024 + 1)
+        .unwrap();
+
+    let mut codex_scanner = scanner(&root, &state);
+    let summary = codex_scanner.scan(NOW, ScanControl::default()).unwrap();
+    assert!(
+        codex_scanner
+            .title_for_source(&summary.sources[0].source_key)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn indexed_title_query_does_not_scan_unrelated_large_rows() {
     let root = TempDir::new().unwrap();
     let state = TempDir::new().unwrap();
     write_session(
@@ -1232,7 +1790,11 @@ fn immutable_title_query_does_not_search_beyond_its_candidate_window() {
 
     let mut codex_scanner = scanner(&root, &state);
     let summary = codex_scanner.scan(NOW, ScanControl::default()).unwrap();
-    assert_eq!(summary.sources[0].title, None);
+    let title = codex_scanner
+        .title_for_source(&summary.sources[0].source_key)
+        .unwrap()
+        .unwrap();
+    assert_eq!(title.as_str(), "Outside budget");
 }
 
 #[test]
@@ -1263,7 +1825,12 @@ fn oversized_title_index_falls_back_instead_of_returning_an_old_entry() {
     fs::write(root.path().join("session_index.jsonl"), bytes).unwrap();
     let mut codex_scanner = scanner(&root, &state);
     let summary = codex_scanner.scan(NOW, ScanControl::default()).unwrap();
-    assert_eq!(summary.sources[0].title, None);
+    assert!(
+        codex_scanner
+            .title_for_source(&summary.sources[0].source_key)
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
@@ -1362,6 +1929,51 @@ fn snapshot_tree(root: &Path) -> Vec<(String, u64, Option<SystemTime>, Vec<u8>)>
 }
 
 #[test]
+fn scan_and_structural_debug_hide_identifiers_titles_and_skip_eager_title_io() {
+    let root = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let thread_canary = "THREAD-CANARY-PRIVATE-8871";
+    let title_canary = "TITLE-CANARY-PRIVATE-4419";
+    write_session(
+        root.path(),
+        "sessions/2026/07/26/private-summary.jsonl",
+        &[
+            meta(thread_canary, serde_json::json!("2026-07-26T12:00:00Z")),
+            token("2026-07-26T12:00:01Z", 4, 1, 0),
+        ],
+    );
+    fs::write(
+        root.path().join("session_index.jsonl"),
+        serde_json::to_vec(&serde_json::json!({
+            "id":thread_canary,
+            "thread_name":title_canary
+        }))
+        .unwrap()
+        .into_iter()
+        .chain(*b"\n")
+        .collect::<Vec<_>>(),
+    )
+    .unwrap();
+
+    let mut codex_scanner = scanner(&root, &state);
+    let summary = codex_scanner.scan(NOW, ScanControl::default()).unwrap();
+    let summary_debug = format!("{summary:?}");
+    assert!(!summary_debug.contains(thread_canary));
+    assert!(!summary_debug.contains(title_canary));
+    assert_eq!(
+        summary.metrics.source_opens, 2,
+        "scan opens only the target once for metadata and once for processing"
+    );
+
+    let structural = parse_codex_record(&meta(
+        thread_canary,
+        serde_json::json!("2026-07-26T12:00:00Z"),
+    ))
+    .unwrap();
+    assert!(!format!("{structural:?}").contains(thread_canary));
+}
+
+#[test]
 fn source_failure_retains_last_promoted_aggregate() {
     let root = TempDir::new().unwrap();
     let state = TempDir::new().unwrap();
@@ -1434,7 +2046,7 @@ fn malformed_sources_are_contained_idempotently_while_a_sibling_advances() {
     let bad_key = initial
         .sources
         .iter()
-        .find(|source| source.root_thread_id.as_deref() == Some("bad-current"))
+        .find(|source| is_session(source, "bad-current"))
         .unwrap()
         .source_key
         .clone();
@@ -1489,7 +2101,7 @@ fn malformed_sources_are_contained_idempotently_while_a_sibling_advances() {
     let bad = failed
         .sources
         .iter()
-        .find(|source| source.root_thread_id.as_deref() == Some("bad-current"))
+        .find(|source| is_session(source, "bad-current"))
         .unwrap();
     assert_eq!(bad.status, SessionSourceStatus::Stale);
     assert_eq!(
@@ -1499,7 +2111,7 @@ fn malformed_sources_are_contained_idempotently_while_a_sibling_advances() {
     let initial_bad = failed
         .sources
         .iter()
-        .find(|source| source.root_thread_id.as_deref() == Some("initial-malformed"))
+        .find(|source| is_session(source, "initial-malformed"))
         .unwrap();
     assert_eq!(initial_bad.status, SessionSourceStatus::Unavailable);
     assert_eq!(
@@ -1509,7 +2121,7 @@ fn malformed_sources_are_contained_idempotently_while_a_sibling_advances() {
     let sibling = failed
         .sources
         .iter()
-        .find(|source| source.root_thread_id.as_deref() == Some("good-sibling"))
+        .find(|source| is_session(source, "good-sibling"))
         .unwrap();
     assert_eq!(sibling.status, SessionSourceStatus::Available);
     assert_eq!(
@@ -1527,8 +2139,7 @@ fn malformed_sources_are_contained_idempotently_while_a_sibling_advances() {
         .scan("2026-07-26T12:01:00Z", ScanControl::default())
         .unwrap();
     assert!(repeated.sources.iter().any(|source| {
-        source.root_thread_id.as_deref() == Some("good-sibling")
-            && source.status == SessionSourceStatus::Available
+        is_session(source, "good-sibling") && source.status == SessionSourceStatus::Available
     }));
     assert_eq!(snapshot_tree(state.path()), before_repeat);
 }
@@ -1680,12 +2291,12 @@ fn archived_old_inode_and_new_live_inode_at_the_same_path_receive_distinct_stabl
     let archived = split
         .sources
         .iter()
-        .find(|source| source.root_thread_id.as_deref() == Some("archived-a"))
+        .find(|source| is_session(source, "archived-a"))
         .unwrap();
     let live = split
         .sources
         .iter()
-        .find(|source| source.root_thread_id.as_deref() == Some("new-live-b"))
+        .find(|source| is_session(source, "new-live-b"))
         .unwrap();
     assert_eq!(archived.source_key, old_key);
     assert_ne!(live.source_key, old_key);
@@ -1974,8 +2585,7 @@ fn retired_replay_history_cleanup_advances_one_bounded_batch_per_scan() {
     assert!(original_rows - after_first_cleanup <= MAX_SESSION_BATCH_ROWS);
     assert!(after_first_cleanup > 0);
     assert!(replacement.sources.iter().any(|source| {
-        source.root_thread_id.as_deref() == Some("z-cleanup-sibling")
-            && source.status == SessionSourceStatus::Available
+        is_session(source, "z-cleanup-sibling") && source.status == SessionSourceStatus::Available
     }));
 
     let mut previous = after_first_cleanup;
@@ -2178,6 +2788,36 @@ fn large_append_tail_is_streamed_once_during_incremental_processing() {
         scan.metrics.parser_read_bytes <= appended_bytes + 256 * 1024,
         "append bytes={appended_bytes}, parser bytes={}",
         scan.metrics.parser_read_bytes
+    );
+}
+
+#[test]
+fn many_tiny_records_are_physically_read_once_plus_one_bounded_chunk() {
+    let root = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let relative = "sessions/2026/07/26/tiny-records.jsonl";
+    let path = root.path().join(relative);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut bytes = serde_json::to_vec(&meta(
+        "tiny-records",
+        serde_json::json!("2026-07-26T12:00:00Z"),
+    ))
+    .unwrap();
+    bytes.push(b'\n');
+    for ordinal in 0..10_000 {
+        serde_json::to_writer(&mut bytes, &serde_json::json!({"n":ordinal})).unwrap();
+        bytes.push(b'\n');
+    }
+    let logical_bytes = bytes.len() as u64;
+    fs::write(path, bytes).unwrap();
+
+    let mut codex_scanner = scanner(&root, &state);
+    let result = codex_scanner.scan(NOW, ScanControl::default()).unwrap();
+    assert_eq!(result.advanced_sources, 1);
+    assert!(
+        result.metrics.parser_read_bytes <= logical_bytes + 64 * 1024,
+        "logical bytes={logical_bytes}, physical parser bytes={}",
+        result.metrics.parser_read_bytes
     );
 }
 
@@ -2462,171 +3102,21 @@ fn metadata_probe_reports_actual_bounded_read_bytes() {
     ))
     .unwrap();
     bytes.push(b'\n');
-    bytes.extend(std::iter::repeat_n(b'x', 512 * 1024));
-    let expected_read_bytes = bytes.len() as u64;
+    let metadata_bytes = bytes.len() as u64;
+    bytes.extend(std::iter::repeat_n(b'x', 8 * 1024 * 1024));
     fs::write(path, bytes).unwrap();
 
     let mut codex_scanner = scanner(&root, &state);
     let result = codex_scanner.scan(NOW, ScanControl::default()).unwrap();
     assert_eq!(result.advanced_sources, 1);
-    assert_eq!(
-        result.metrics.metadata_probe_bytes, expected_read_bytes,
-        "the metric must include read-ahead beyond the complete metadata record"
-    );
-}
-
-#[test]
-fn replay_limit_is_an_end_to_end_stable_resource_outcome() {
-    let root = TempDir::new().unwrap();
-    let state = TempDir::new().unwrap();
-    let mut lines = vec![meta(
-        "limited-rollout",
-        serde_json::json!("2026-07-26T12:00:00Z"),
-    )];
-    for ordinal in 1..=4 {
-        lines.push(token("2026-07-26T12:00:01Z", ordinal, 1, 0));
-    }
-    write_session(root.path(), "sessions/2026/07/26/limited.jsonl", &lines);
-    let mut codex_scanner = scanner(&root, &state);
-    codex_scanner.set_test_replay_limit(3);
-    let result = codex_scanner.scan(NOW, ScanControl::default()).unwrap();
-    assert_eq!(
-        result.sources[0].status,
-        SessionSourceStatus::ResourceLimited
-    );
-    let source = codex_scanner
-        .state()
-        .load_session_source(&result.sources[0].source_key)
-        .unwrap()
-        .unwrap();
-    assert_eq!(source.status, SessionSourceStatus::ResourceLimited);
-    assert_eq!(
-        source.error_code,
-        Some(SessionSourceErrorCode::SourceReplayLimit)
-    );
-    assert!(source.current_generation.is_none());
-}
-
-#[test]
-fn replay_limit_on_a_current_generation_reports_the_persisted_error_while_stale() {
-    let root = TempDir::new().unwrap();
-    let state = TempDir::new().unwrap();
-    let relative = "sessions/2026/07/26/current-replay-limit.jsonl";
-    write_session(
-        root.path(),
-        relative,
-        &[
-            meta(
-                "current-replay-limit",
-                serde_json::json!("2026-07-26T12:00:00Z"),
-            ),
-            token("2026-07-26T12:00:01Z", 1, 1, 0),
-            token("2026-07-26T12:00:02Z", 2, 2, 0),
-        ],
-    );
-    let mut codex_scanner = scanner(&root, &state);
-    codex_scanner.set_test_replay_limit(3);
-    let first = codex_scanner.scan(NOW, ScanControl::default()).unwrap();
-    let key = first.sources[0].source_key.clone();
-    let mut writer = OpenOptions::new()
-        .append(true)
-        .open(root.path().join(relative))
-        .unwrap();
-    for ordinal in 3..=4 {
-        serde_json::to_writer(
-            &mut writer,
-            &token("2026-07-26T12:00:03Z", ordinal, ordinal, 0),
-        )
-        .unwrap();
-        writer.write_all(b"\n").unwrap();
-    }
-    writer.flush().unwrap();
-    drop(writer);
-
-    let limited = codex_scanner
-        .scan("2026-07-26T12:01:00Z", ScanControl::default())
-        .unwrap();
-    assert_eq!(limited.sources[0].status, SessionSourceStatus::Stale);
-    assert_eq!(
-        limited.sources[0].error_code,
-        Some(SessionSourceErrorCode::SourceReplayLimit)
-    );
-    let source = codex_scanner
-        .state()
-        .load_session_source(&key)
-        .unwrap()
-        .unwrap();
-    assert_eq!(source.status, SessionSourceStatus::Stale);
-    assert_eq!(
-        source.error_code,
-        Some(SessionSourceErrorCode::SourceReplayLimit)
-    );
-}
-
-#[test]
-fn replay_resolution_resource_failure_is_contained_to_one_child_source() {
-    let root = TempDir::new().unwrap();
-    let state = TempDir::new().unwrap();
-    let mut parent = vec![meta(
-        "contained-parent",
-        serde_json::json!("2026-07-26T12:00:00Z"),
-    )];
-    for ordinal in 1..=4 {
-        parent.push(token(
-            &format!("2026-07-26T12:00:0{ordinal}Z"),
-            ordinal,
-            1,
-            0,
-        ));
-    }
-    write_session(root.path(), "sessions/2026/07/26/parent.jsonl", &parent);
-    let mut initial = scanner(&root, &state);
-    initial.scan(NOW, ScanControl::default()).unwrap();
-    drop(initial);
-
-    let mut child_meta = meta("contained-child", serde_json::json!("2026-07-26T12:00:05Z"));
-    child_meta["payload"]["parent_thread_id"] = serde_json::json!("contained-parent");
-    let mut child = vec![child_meta];
-    child.extend(parent.iter().skip(1).cloned());
-    child.push(token("2026-07-26T12:00:06Z", 9, 2, 0));
-    write_session(root.path(), "sessions/2026/07/26/child.jsonl", &child);
-    write_session(
-        root.path(),
-        "sessions/2026/07/26/sibling.jsonl",
-        &[
-            meta(
-                "contained-sibling",
-                serde_json::json!("2026-07-26T12:00:00Z"),
-            ),
-            token("2026-07-26T12:00:01Z", 3, 1, 0),
-        ],
-    );
-
-    let mut limited = scanner(&root, &state);
-    limited.set_test_replay_limit(3);
-    let summary = limited.scan(NOW, ScanControl::default()).unwrap();
-    let child = summary
-        .sources
-        .iter()
-        .find(|source| source.root_thread_id.as_deref() == Some("contained-child"))
-        .unwrap();
-    assert_eq!(child.status, SessionSourceStatus::ResourceLimited);
-    assert_eq!(
-        child.error_code,
-        Some(SessionSourceErrorCode::SourceReplayLimit)
-    );
-    let sibling = summary
-        .sources
-        .iter()
-        .find(|source| source.root_thread_id.as_deref() == Some("contained-sibling"))
-        .unwrap();
-    assert_eq!(sibling.status, SessionSourceStatus::Available);
     assert!(
-        limited
-            .state()
-            .load_current_generation(&sibling.source_key)
-            .unwrap()
-            .is_some()
+        result.metrics.metadata_probe_bytes >= metadata_bytes,
+        "the complete metadata record must be read"
+    );
+    assert!(
+        result.metrics.metadata_probe_bytes <= metadata_bytes + 64 * 1024,
+        "metadata probe must stop after the first valid meta plus one chunk; read {} bytes",
+        result.metrics.metadata_probe_bytes
     );
 }
 
@@ -2662,7 +3152,7 @@ fn child_defers_and_keeps_its_current_generation_stale_when_parent_is_nontermina
     let child_key = first
         .sources
         .iter()
-        .find(|source| source.root_thread_id.as_deref() == Some("nonterminal-child"))
+        .find(|source| is_session(source, "nonterminal-child"))
         .unwrap()
         .source_key
         .clone();
@@ -2690,13 +3180,13 @@ fn child_defers_and_keeps_its_current_generation_stale_when_parent_is_nontermina
     let parent_summary = failed
         .sources
         .iter()
-        .find(|source| source.root_thread_id.as_deref() == Some("nonterminal-parent"))
+        .find(|source| is_session(source, "nonterminal-parent"))
         .unwrap();
     assert_eq!(parent_summary.status, SessionSourceStatus::Stale);
     let child_summary = failed
         .sources
         .iter()
-        .find(|source| source.root_thread_id.as_deref() == Some("nonterminal-child"))
+        .find(|source| is_session(source, "nonterminal-child"))
         .unwrap();
     assert_eq!(child_summary.status, SessionSourceStatus::Stale);
     assert_eq!(
@@ -2763,7 +3253,7 @@ fn child_with_a_current_generation_becomes_stale_when_parent_disappears() {
     let child = missing
         .sources
         .iter()
-        .find(|source| source.root_thread_id.as_deref() == Some("missing-parent-child"))
+        .find(|source| is_session(source, "missing-parent-child"))
         .unwrap();
     assert_eq!(child.status, SessionSourceStatus::Stale);
     assert_eq!(

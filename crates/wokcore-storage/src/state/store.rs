@@ -2738,47 +2738,46 @@ impl StateStore {
                  LIMIT ?4",
             )
             .map_err(map_database_error)?;
-        let raw = statement
-            .query_map(
-                params![
-                    parent_source_key,
-                    to_i64(parent_generation, "generation")?,
-                    to_i64(after_ordinal, "replay ordinal")?,
-                    usize_to_i64(limit + 1, "page limit")?,
-                ],
-                |row| {
-                    let generation = row.get::<_, Option<i64>>(0)?;
-                    let signature = row
-                        .get::<_, Option<String>>(1)?
-                        .map(|parent_source_key| {
-                            Ok::<ReplayDatabaseRow, rusqlite::Error>((
-                                parent_source_key,
-                                row.get(2)?,
-                                row.get(3)?,
-                                row.get(4)?,
-                                row.get(5)?,
-                            ))
-                        })
-                        .transpose()?;
-                    Ok((generation, signature))
-                },
-            )
-            .map_err(map_database_error)?
-            .collect::<Result<Vec<_>, _>>()
+        let mut rows = statement
+            .query(params![
+                parent_source_key,
+                to_i64(parent_generation, "generation")?,
+                to_i64(after_ordinal, "replay ordinal")?,
+                usize_to_i64(limit + 1, "page limit")?,
+            ])
             .map_err(map_database_error)?;
-        let current_generation = raw
-            .first()
-            .and_then(|(generation, _)| *generation)
-            .map(|generation| database_u64(generation, "current generation"))
-            .transpose()?;
+        let mut current_generation = None;
+        let mut items = Vec::with_capacity(limit.saturating_add(1));
+        while let Some(row) = rows.next().map_err(map_database_error)? {
+            let generation = row.get::<_, Option<i64>>(0).map_err(map_database_error)?;
+            if current_generation.is_none() {
+                current_generation = generation
+                    .map(|generation| database_u64(generation, "current generation"))
+                    .transpose()?;
+            }
+            let signature = row
+                .get::<_, Option<String>>(1)
+                .map_err(map_database_error)?
+                .map(|parent_source_key| {
+                    Ok::<ReplayDatabaseRow, rusqlite::Error>((
+                        parent_source_key,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                })
+                .transpose()
+                .map_err(map_database_error)?;
+            if let Some(signature) = signature {
+                items.push(replay_signature_from_database(signature)?);
+            }
+        }
+        drop(rows);
+        drop(statement);
         if current_generation != Some(parent_generation) {
             return Err(StorageError::StalePageKey);
         }
-        let mut items = raw
-            .into_iter()
-            .filter_map(|(_, signature)| signature)
-            .map(replay_signature_from_database)
-            .collect::<Result<Vec<_>, _>>()?;
         let has_more = items.len() > limit;
         items.truncate(limit);
         let next_page_key = has_more.then(|| {
