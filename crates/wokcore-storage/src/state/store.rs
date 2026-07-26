@@ -300,6 +300,182 @@ impl SessionSourceErrorCode {
     }
 }
 
+macro_rules! correlation_id {
+    ($name:ident, $label:literal) => {
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct $name(String);
+
+        impl $name {
+            pub fn new(value: impl Into<String>) -> Result<Self, StorageError> {
+                let value = value.into();
+                validate_correlation_id($label, &value)?;
+                Ok(Self(value))
+            }
+
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+
+            fn from_database(value: String) -> Result<Self, StorageError> {
+                Self::new(value).map_err(|_| StorageError::StateDatabaseCorrupt {
+                    message: concat!($label, " is invalid").to_owned(),
+                })
+            }
+        }
+    };
+}
+
+correlation_id!(RequestId, "request identifier");
+correlation_id!(AttemptId, "attempt identifier");
+correlation_id!(TraceId, "trace identifier");
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OpaqueFingerprint(String);
+
+impl OpaqueFingerprint {
+    pub fn new(value: impl Into<String>) -> Result<Self, StorageError> {
+        let value = value.into();
+        validate_opaque_key("fingerprint", &value)?;
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    fn from_database(value: String) -> Result<Self, StorageError> {
+        Self::new(value).map_err(|_| StorageError::StateDatabaseCorrupt {
+            message: "supplemental metadata contains an invalid fingerprint".to_owned(),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionFileIdentity(String);
+
+impl SessionFileIdentity {
+    pub fn new(value: impl Into<String>) -> Result<Self, StorageError> {
+        let value = value.into();
+        validate_opaque_key("file identity", &value)?;
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    fn from_database(value: String) -> Result<Self, StorageError> {
+        Self::new(value).map_err(|_| StorageError::StateDatabaseCorrupt {
+            message: "Session scan cursor contains an invalid file identity".to_owned(),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionScanResultCode {
+    Advanced,
+    Unchanged,
+    Deferred,
+}
+
+impl SessionScanResultCode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Advanced => "advanced",
+            Self::Unchanged => "unchanged",
+            Self::Deferred => "deferred",
+        }
+    }
+
+    fn from_database(value: &str) -> Result<Self, StorageError> {
+        match value {
+            "advanced" => Ok(Self::Advanced),
+            "unchanged" => Ok(Self::Unchanged),
+            "deferred" => Ok(Self::Deferred),
+            _ => Err(StorageError::StateDatabaseCorrupt {
+                message: "Session scan cursor contains an invalid result code".to_owned(),
+            }),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SupplementalRetryDecision {
+    None,
+    Retry,
+    Exhausted,
+}
+
+impl SupplementalRetryDecision {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Retry => "retry",
+            Self::Exhausted => "exhausted",
+        }
+    }
+
+    fn from_database(value: &str) -> Result<Self, StorageError> {
+        match value {
+            "none" => Ok(Self::None),
+            "retry" => Ok(Self::Retry),
+            "exhausted" => Ok(Self::Exhausted),
+            _ => Err(StorageError::StateDatabaseCorrupt {
+                message: "supplemental metadata contains an invalid retry decision".to_owned(),
+            }),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SupplementalFailoverDecision {
+    None,
+    Failover,
+    Unavailable,
+}
+
+impl SupplementalFailoverDecision {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Failover => "failover",
+            Self::Unavailable => "unavailable",
+        }
+    }
+
+    fn from_database(value: &str) -> Result<Self, StorageError> {
+        match value {
+            "none" => Ok(Self::None),
+            "failover" => Ok(Self::Failover),
+            "unavailable" => Ok(Self::Unavailable),
+            _ => Err(StorageError::StateDatabaseCorrupt {
+                message: "supplemental metadata contains an invalid failover decision".to_owned(),
+            }),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SupplementalErrorCode(String);
+
+impl SupplementalErrorCode {
+    pub fn new(value: impl Into<String>) -> Result<Self, StorageError> {
+        let value = value.into();
+        validate_stable_code("supplemental error code", &value)?;
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    fn from_database(value: String) -> Result<Self, StorageError> {
+        Self::new(value).map_err(|_| StorageError::StateDatabaseCorrupt {
+            message: "supplemental metadata contains an invalid error code".to_owned(),
+        })
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionSourceState {
     pub source_key: String,
@@ -354,7 +530,7 @@ pub struct SessionScanCursor {
     pub source_kind: SessionSourceKind,
     pub generation: u64,
     pub generation_state: SessionGenerationState,
-    pub file_identity: String,
+    pub file_identity: SessionFileIdentity,
     pub observed_size: u64,
     pub modified_at: String,
     pub complete_byte_offset: u64,
@@ -365,7 +541,7 @@ pub struct SessionScanCursor {
     pub parent_source_key: Option<String>,
     pub parent_generation: Option<u64>,
     pub replay_boundary_fingerprint: Option<[u8; 32]>,
-    pub result_code: Option<String>,
+    pub result_code: Option<SessionScanResultCode>,
     pub result_changed_at: Option<String>,
 }
 
@@ -410,15 +586,15 @@ pub struct CodexReplaySignature {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RequestSupplementalMetadata {
-    pub request_id: String,
-    pub attempt_id: String,
-    pub trace_id: String,
+    pub request_id: RequestId,
+    pub attempt_id: AttemptId,
+    pub trace_id: TraceId,
     pub occurred_at: String,
-    pub route_fingerprint: String,
-    pub provider_fingerprint: String,
-    pub account_fingerprint: Option<String>,
-    pub retry_decision: String,
-    pub failover_decision: String,
+    pub route_fingerprint: OpaqueFingerprint,
+    pub provider_fingerprint: OpaqueFingerprint,
+    pub account_fingerprint: Option<OpaqueFingerprint>,
+    pub retry_decision: SupplementalRetryDecision,
+    pub failover_decision: SupplementalFailoverDecision,
     pub queue_ms: u64,
     pub connect_ms: u64,
     pub first_byte_ms: u64,
@@ -426,7 +602,7 @@ pub struct RequestSupplementalMetadata {
     pub request_bytes: u64,
     pub response_bytes: u64,
     pub status_code: Option<u16>,
-    pub error_code: Option<String>,
+    pub error_code: Option<SupplementalErrorCode>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -460,6 +636,30 @@ pub struct SessionIndexPage {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionSourcePageKey {
+    source_key: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionSourcePage {
+    pub items: Vec<SessionSourceState>,
+    pub next_page_key: Option<SessionSourcePageKey>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GlobalSessionIndexPageKey {
+    last_active_at: String,
+    session_key: String,
+    source_key: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GlobalSessionIndexPage {
+    pub items: Vec<SessionIndexRecord>,
+    pub next_page_key: Option<GlobalSessionIndexPageKey>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionUsagePageKey {
     source_key: String,
     generation: u64,
@@ -471,6 +671,19 @@ pub struct SessionUsagePageKey {
 pub struct SessionUsagePage {
     pub items: Vec<SessionUsageRecord>,
     pub next_page_key: Option<SessionUsagePageKey>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GlobalSessionUsagePageKey {
+    occurred_at: String,
+    usage_id: String,
+    source_key: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GlobalSessionUsagePage {
+    pub items: Vec<SessionUsageRecord>,
+    pub next_page_key: Option<GlobalSessionUsagePageKey>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1000,6 +1213,10 @@ impl StateStore {
                             && persisted.file_identity == cursor.file_identity
                             && persisted.head_fingerprint == cursor.head_fingerprint
                             && persisted.boundary_fingerprint == cursor.boundary_fingerprint
+                            && persisted.parent_source_key == cursor.parent_source_key
+                            && persisted.parent_generation == cursor.parent_generation
+                            && persisted.replay_boundary_fingerprint
+                                == cursor.replay_boundary_fingerprint
                             && cursor.observed_size >= persisted.complete_byte_offset
                         {
                             CandidateBeginOutcome::Resumed(Box::new(persisted))
@@ -1012,13 +1229,18 @@ impl StateStore {
                 } else if current == Some(cursor.generation) {
                     return Err(StorageError::CandidateStateConflict);
                 } else {
-                    transaction
+                    let changed = transaction
                         .execute(
                             "UPDATE session_sources SET staging_generation = ?2
-                             WHERE source_key = ?1",
+                             WHERE source_key = ?1
+                               AND staging_generation IS NULL
+                               AND retired_generation IS NULL",
                             params![cursor.source_key, to_i64(cursor.generation, "generation")?],
                         )
                         .map_err(map_database_error)?;
+                    if changed != 1 {
+                        return Err(StorageError::CandidateStateConflict);
+                    }
                     insert_cursor(&transaction, cursor)?;
                     CandidateBeginOutcome::Started
                 }
@@ -1096,11 +1318,21 @@ impl StateStore {
         for record in &batch.usage_records {
             write_usage_record(&transaction, record)?;
         }
-        for signature in &batch.replay_signatures {
-            write_replay_signature(&transaction, signature)?;
+        let pending_replay_signatures =
+            pending_replay_signatures(&transaction, &batch.replay_signatures)?;
+        for signature in pending_replay_signatures {
+            insert_replay_signature(&transaction, signature)?;
         }
-        for metadata in &batch.supplemental_metadata {
-            write_supplemental_metadata(&transaction, metadata)?;
+        let (pending_supplemental, pending_supplemental_bytes) =
+            pending_supplemental_metadata(&transaction, &batch.supplemental_metadata)?;
+        if supplemental_batch_fits(
+            &transaction,
+            pending_supplemental.len(),
+            pending_supplemental_bytes,
+        )? {
+            for metadata in pending_supplemental {
+                write_supplemental_metadata(&transaction, metadata)?;
+            }
         }
         transaction.commit().map_err(map_database_error)
     }
@@ -1153,22 +1385,30 @@ impl StateStore {
             return Err(StorageError::CandidateStateConflict);
         }
         if let Some(current) = current {
-            transaction
+            let changed = transaction
                 .execute(
                     "UPDATE session_scan_cursors SET generation_state = 'retired'
-                     WHERE source_key = ?1 AND generation = ?2",
+                     WHERE source_key = ?1 AND generation = ?2
+                       AND generation_state = 'current'",
                     params![source_key, to_i64(current, "generation")?],
                 )
                 .map_err(map_database_error)?;
+            if changed != 1 {
+                return Err(StorageError::CandidateStateConflict);
+            }
         }
-        transaction
+        let changed = transaction
             .execute(
                 "UPDATE session_scan_cursors SET generation_state = 'current'
-                 WHERE source_key = ?1 AND generation = ?2",
+                 WHERE source_key = ?1 AND generation = ?2
+                   AND generation_state = 'staging'",
                 params![source_key, to_i64(generation, "generation")?],
             )
             .map_err(map_database_error)?;
-        transaction
+        if changed != 1 {
+            return Err(StorageError::CandidateStateConflict);
+        }
+        let changed = transaction
             .execute(
                 "UPDATE session_sources
                  SET current_generation = ?2,
@@ -1177,10 +1417,23 @@ impl StateStore {
                      status = 'available',
                      error_code = NULL,
                      last_transition_at = ?3
-                 WHERE source_key = ?1",
-                params![source_key, to_i64(generation, "generation")?, transition_at],
+                 WHERE source_key = ?1
+                   AND current_generation IS ?4
+                   AND staging_generation = ?2
+                   AND retired_generation IS NULL",
+                params![
+                    source_key,
+                    to_i64(generation, "generation")?,
+                    transition_at,
+                    current
+                        .map(|generation| to_i64(generation, "generation"))
+                        .transpose()?,
+                ],
             )
             .map_err(map_database_error)?;
+        if changed != 1 {
+            return Err(StorageError::CandidateStateConflict);
+        }
         transaction.commit().map_err(map_database_error)
     }
 
@@ -1199,50 +1452,39 @@ impl StateStore {
         optional_u64(generation, "current generation")
     }
 
+    pub fn load_current_session_scan_cursor(
+        &self,
+        source_key: &str,
+    ) -> Result<Option<SessionScanCursor>, StorageError> {
+        validate_opaque_key("source key", source_key)?;
+        self.connection
+            .query_row(
+                "SELECT c.source_key, c.source_kind, c.generation, c.generation_state,
+                        c.file_identity, c.observed_size, c.modified_at,
+                        c.complete_byte_offset, c.stable_record_ordinal,
+                        c.parser_checkpoint, c.head_fingerprint, c.boundary_fingerprint,
+                        c.parent_source_key, c.parent_generation,
+                        c.replay_boundary_fingerprint, c.result_code, c.result_changed_at
+                 FROM session_sources s
+                 JOIN session_scan_cursors c
+                   ON c.source_key = s.source_key
+                  AND c.generation = s.current_generation
+                 WHERE s.source_key = ?1",
+                [source_key],
+                cursor_database_row,
+            )
+            .optional()
+            .map_err(map_database_error)?
+            .map(cursor_from_database)
+            .transpose()
+    }
+
     pub fn load_session_source(
         &self,
         source_key: &str,
     ) -> Result<Option<SessionSourceState>, StorageError> {
         validate_opaque_key("source key", source_key)?;
-        let raw = self
-            .connection
-            .query_row(
-                "SELECT source_key, source_kind, current_generation, staging_generation,
-                        retired_generation, status, error_code, last_transition_at
-                 FROM session_sources WHERE source_key = ?1",
-                [source_key],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, Option<i64>>(2)?,
-                        row.get::<_, Option<i64>>(3)?,
-                        row.get::<_, Option<i64>>(4)?,
-                        row.get::<_, String>(5)?,
-                        row.get::<_, Option<String>>(6)?,
-                        row.get::<_, Option<String>>(7)?,
-                    ))
-                },
-            )
-            .optional()
-            .map_err(map_database_error)?;
-        raw.map(|raw| {
-            Ok(SessionSourceState {
-                source_key: raw.0,
-                source_kind: SessionSourceKind::from_database(&raw.1)?,
-                current_generation: optional_u64(raw.2, "current generation")?,
-                staging_generation: optional_u64(raw.3, "staging generation")?,
-                retired_generation: optional_u64(raw.4, "retired generation")?,
-                status: SessionSourceStatus::from_database(&raw.5)?,
-                error_code: raw
-                    .6
-                    .as_deref()
-                    .map(SessionSourceErrorCode::from_database)
-                    .transpose()?,
-                last_transition_at: raw.7,
-            })
-        })
-        .transpose()
+        query_session_source(&self.connection, source_key)
     }
 
     pub fn fail_candidate(
@@ -1255,8 +1497,11 @@ impl StateStore {
         validate_opaque_key("source key", source_key)?;
         validate_generation(generation)?;
         validate_timestamp("source transition timestamp", transition_at)?;
-        let source = self
-            .load_session_source(source_key)?
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_database_error)?;
+        let source = query_session_source(&transaction, source_key)?
             .ok_or(StorageError::CandidateStateConflict)?;
         if source.current_generation != Some(generation)
             && source.staging_generation != Some(generation)
@@ -1271,48 +1516,86 @@ impl StateStore {
             SessionSourceStatus::Unavailable
         };
         if source.status == status && source.error_code == Some(error_code) {
+            transaction.commit().map_err(map_database_error)?;
             return Ok(false);
         }
-        self.connection
+        let changed = transaction
             .execute(
                 "UPDATE session_sources
                  SET status = ?2, error_code = ?3, last_transition_at = ?4
-                 WHERE source_key = ?1",
+                 WHERE source_key = ?1
+                   AND current_generation IS ?5
+                   AND staging_generation IS ?6
+                   AND status = ?7
+                   AND error_code IS ?8",
                 params![
                     source_key,
                     status.as_str(),
                     error_code.as_str(),
-                    transition_at
+                    transition_at,
+                    source
+                        .current_generation
+                        .map(|generation| to_i64(generation, "generation"))
+                        .transpose()?,
+                    source
+                        .staging_generation
+                        .map(|generation| to_i64(generation, "generation"))
+                        .transpose()?,
+                    source.status.as_str(),
+                    source.error_code.map(SessionSourceErrorCode::as_str),
                 ],
             )
             .map_err(map_database_error)?;
+        if changed != 1 {
+            return Err(StorageError::CandidateStateConflict);
+        }
+        transaction.commit().map_err(map_database_error)?;
         Ok(true)
     }
 
     pub fn record_source_success(
         &mut self,
         source_key: &str,
+        generation: u64,
         transition_at: &str,
     ) -> Result<bool, StorageError> {
         validate_opaque_key("source key", source_key)?;
+        validate_generation(generation)?;
         validate_timestamp("source transition timestamp", transition_at)?;
-        let source = self
-            .load_session_source(source_key)?
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_database_error)?;
+        let source = query_session_source(&transaction, source_key)?
             .ok_or(StorageError::CandidateStateConflict)?;
-        if source.current_generation.is_none() {
+        if source.current_generation != Some(generation) {
             return Err(StorageError::CandidateStateConflict);
         }
         if source.status == SessionSourceStatus::Available && source.error_code.is_none() {
+            transaction.commit().map_err(map_database_error)?;
             return Ok(false);
         }
-        self.connection
+        let changed = transaction
             .execute(
                 "UPDATE session_sources
                  SET status = 'available', error_code = NULL, last_transition_at = ?2
-                 WHERE source_key = ?1",
-                params![source_key, transition_at],
+                 WHERE source_key = ?1
+                   AND current_generation = ?3
+                   AND status = ?4
+                   AND error_code IS ?5",
+                params![
+                    source_key,
+                    transition_at,
+                    to_i64(generation, "generation")?,
+                    source.status.as_str(),
+                    source.error_code.map(SessionSourceErrorCode::as_str),
+                ],
             )
             .map_err(map_database_error)?;
+        if changed != 1 {
+            return Err(StorageError::CandidateStateConflict);
+        }
+        transaction.commit().map_err(map_database_error)?;
         Ok(true)
     }
 
@@ -1341,37 +1624,8 @@ impl StateStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_database_error)?;
-        let mut pending: Vec<&RequestSupplementalMetadata> = Vec::with_capacity(metadata.len());
-        let mut pending_bytes = 0_usize;
-        for row in metadata {
-            if let Some(previous) = pending.iter().copied().find(|previous| {
-                previous.request_id == row.request_id && previous.attempt_id == row.attempt_id
-            }) {
-                if *previous == *row {
-                    continue;
-                }
-                return Err(StorageError::StableRecordConflict {
-                    record_kind: "request supplemental metadata",
-                });
-            }
-            match query_supplemental_metadata(&transaction, &row.request_id, &row.attempt_id)? {
-                Some(existing) if existing == *row => continue,
-                Some(_) => {
-                    return Err(StorageError::StableRecordConflict {
-                        record_kind: "request supplemental metadata",
-                    });
-                }
-                None => {
-                    pending_bytes =
-                        pending_bytes.saturating_add(validate_supplemental_metadata(row)?);
-                    pending.push(row);
-                }
-            }
-        }
-        let stats = supplemental_stats(&transaction)?;
-        if stats.rows.saturating_add(pending.len()) > MAX_SUPPLEMENTAL_ROWS
-            || stats.logical_bytes.saturating_add(pending_bytes) > MAX_SUPPLEMENTAL_BYTES
-        {
+        let (pending, pending_bytes) = pending_supplemental_metadata(&transaction, metadata)?;
+        if !supplemental_batch_fits(&transaction, pending.len(), pending_bytes)? {
             return Ok(SupplementalBatchOutcome {
                 inserted_rows: 0,
                 dropped_rows: pending.len(),
@@ -1537,17 +1791,23 @@ impl StateStore {
             .prepare(
                 "SELECT table_kind, row_id, logical_bytes FROM (
                     SELECT 1 AS table_kind, rowid AS row_id,
-                           length(session_key) + length(source_key) + length(created_at)
-                           + length(last_active_at) + 40 AS logical_bytes
+                           length(CAST(session_key AS BLOB))
+                           + length(CAST(source_key AS BLOB))
+                           + length(CAST(created_at AS BLOB))
+                           + length(CAST(last_active_at AS BLOB)) + 40 AS logical_bytes
                     FROM session_index WHERE source_key = ?1 AND generation = ?2
                     UNION ALL
                     SELECT 2, rowid,
-                           length(usage_id) + length(session_key) + length(source_key)
-                           + length(model) + length(occurred_at) + 64
+                           length(CAST(usage_id AS BLOB))
+                           + length(CAST(session_key AS BLOB))
+                           + length(CAST(source_key AS BLOB))
+                           + length(CAST(model AS BLOB))
+                           + length(CAST(occurred_at AS BLOB)) + 64
                     FROM session_usage_records WHERE source_key = ?1 AND generation = ?2
                     UNION ALL
                     SELECT 3, rowid,
-                           length(parent_source_key) + length(occurred_at) + 48
+                           length(CAST(parent_source_key AS BLOB))
+                           + length(CAST(occurred_at AS BLOB)) + 48
                     FROM codex_replay_signatures
                     WHERE parent_source_key = ?1 AND parent_generation = ?2
                  )
@@ -1617,7 +1877,9 @@ impl StateStore {
             .map_err(map_database_error)?;
         let cursor_bytes = transaction
             .query_row(
-                "SELECT length(source_key) + length(file_identity) + length(modified_at)
+                "SELECT length(CAST(source_key AS BLOB))
+                        + length(CAST(file_identity AS BLOB))
+                        + length(CAST(modified_at AS BLOB))
                         + length(parser_checkpoint) + 128
                  FROM session_scan_cursors WHERE source_key = ?1 AND generation = ?2",
                 params![source_key, generation],
@@ -1671,6 +1933,202 @@ impl StateStore {
         })
     }
 
+    pub fn load_session_sources_page(
+        &self,
+        after: Option<&SessionSourcePageKey>,
+        limit: usize,
+    ) -> Result<SessionSourcePage, StorageError> {
+        validate_page_limit(limit, MAX_SESSION_BATCH_ROWS)?;
+        let after_source_key = after.map_or("", |key| key.source_key.as_str());
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT source_key, source_kind, current_generation, staging_generation,
+                        retired_generation, status, error_code, last_transition_at
+                 FROM session_sources
+                 WHERE source_key > ?1
+                 ORDER BY source_key
+                 LIMIT ?2",
+            )
+            .map_err(map_database_error)?;
+        let raw = statement
+            .query_map(
+                params![after_source_key, usize_to_i64(limit + 1, "page limit")?],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )
+            .map_err(map_database_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_database_error)?;
+        let mut items = raw
+            .into_iter()
+            .map(session_source_from_database)
+            .collect::<Result<Vec<_>, _>>()?;
+        let has_more = items.len() > limit;
+        items.truncate(limit);
+        let next_page_key = has_more.then(|| SessionSourcePageKey {
+            source_key: items
+                .last()
+                .expect("a source page with more rows is not empty")
+                .source_key
+                .clone(),
+        });
+        Ok(SessionSourcePage {
+            items,
+            next_page_key,
+        })
+    }
+
+    pub fn load_global_current_session_index_page(
+        &self,
+        after: Option<&GlobalSessionIndexPageKey>,
+        limit: usize,
+    ) -> Result<GlobalSessionIndexPage, StorageError> {
+        validate_page_limit(limit, 200)?;
+        let (sql, values): (&str, Vec<rusqlite::types::Value>) = match after {
+            None => (
+                "SELECT i.session_key, i.source_key, i.generation, i.source_kind,
+                        i.created_at, i.last_active_at, i.message_count,
+                        i.usage_event_count, i.availability
+                 FROM session_sources s
+                 JOIN session_index i
+                   ON i.source_key = s.source_key
+                  AND i.generation = s.current_generation
+                 ORDER BY i.last_active_at DESC, i.session_key, i.source_key
+                 LIMIT ?1",
+                vec![usize_to_i64(limit + 1, "page limit")?.into()],
+            ),
+            Some(key) => (
+                "SELECT i.session_key, i.source_key, i.generation, i.source_kind,
+                        i.created_at, i.last_active_at, i.message_count,
+                        i.usage_event_count, i.availability
+                 FROM session_sources s
+                 JOIN session_index i
+                   ON i.source_key = s.source_key
+                  AND i.generation = s.current_generation
+                 WHERE i.last_active_at < ?1
+                    OR (i.last_active_at = ?1 AND i.session_key > ?2)
+                    OR (i.last_active_at = ?1 AND i.session_key = ?2
+                        AND i.source_key > ?3)
+                 ORDER BY i.last_active_at DESC, i.session_key, i.source_key
+                 LIMIT ?4",
+                vec![
+                    key.last_active_at.clone().into(),
+                    key.session_key.clone().into(),
+                    key.source_key.clone().into(),
+                    usize_to_i64(limit + 1, "page limit")?.into(),
+                ],
+            ),
+        };
+        let mut statement = self.connection.prepare(sql).map_err(map_database_error)?;
+        let raw = statement
+            .query_map(rusqlite::params_from_iter(values), index_database_row)
+            .map_err(map_database_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_database_error)?;
+        let mut items = raw
+            .into_iter()
+            .map(index_record_from_database)
+            .collect::<Result<Vec<_>, _>>()?;
+        let has_more = items.len() > limit;
+        items.truncate(limit);
+        let next_page_key = has_more.then(|| {
+            let last = items
+                .last()
+                .expect("a global index page with more rows is not empty");
+            GlobalSessionIndexPageKey {
+                last_active_at: last.last_active_at.clone(),
+                session_key: last.session_key.clone(),
+                source_key: last.source_key.clone(),
+            }
+        });
+        Ok(GlobalSessionIndexPage {
+            items,
+            next_page_key,
+        })
+    }
+
+    pub fn load_global_current_session_usage_page(
+        &self,
+        after: Option<&GlobalSessionUsagePageKey>,
+        limit: usize,
+    ) -> Result<GlobalSessionUsagePage, StorageError> {
+        validate_page_limit(limit, 500)?;
+        let (sql, values): (&str, Vec<rusqlite::types::Value>) = match after {
+            None => (
+                "SELECT u.usage_id, u.session_key, u.source_key, u.generation,
+                        u.source_kind, u.model, u.occurred_at, u.input_tokens,
+                        u.output_tokens, u.cache_read_tokens, u.cache_write_tokens,
+                        u.reasoning_tokens, u.record_revision
+                 FROM session_sources s
+                 JOIN session_usage_records u
+                   ON u.source_key = s.source_key
+                  AND u.generation = s.current_generation
+                 ORDER BY u.occurred_at, u.usage_id, u.source_key
+                 LIMIT ?1",
+                vec![usize_to_i64(limit + 1, "page limit")?.into()],
+            ),
+            Some(key) => (
+                "SELECT u.usage_id, u.session_key, u.source_key, u.generation,
+                        u.source_kind, u.model, u.occurred_at, u.input_tokens,
+                        u.output_tokens, u.cache_read_tokens, u.cache_write_tokens,
+                        u.reasoning_tokens, u.record_revision
+                 FROM session_sources s
+                 JOIN session_usage_records u
+                   ON u.source_key = s.source_key
+                  AND u.generation = s.current_generation
+                 WHERE u.occurred_at > ?1
+                    OR (u.occurred_at = ?1 AND u.usage_id > ?2)
+                    OR (u.occurred_at = ?1 AND u.usage_id = ?2
+                        AND u.source_key > ?3)
+                 ORDER BY u.occurred_at, u.usage_id, u.source_key
+                 LIMIT ?4",
+                vec![
+                    key.occurred_at.clone().into(),
+                    key.usage_id.clone().into(),
+                    key.source_key.clone().into(),
+                    usize_to_i64(limit + 1, "page limit")?.into(),
+                ],
+            ),
+        };
+        let mut statement = self.connection.prepare(sql).map_err(map_database_error)?;
+        let raw = statement
+            .query_map(rusqlite::params_from_iter(values), usage_database_row)
+            .map_err(map_database_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_database_error)?;
+        let mut items = raw
+            .into_iter()
+            .map(usage_record_from_database)
+            .collect::<Result<Vec<_>, _>>()?;
+        let has_more = items.len() > limit;
+        items.truncate(limit);
+        let next_page_key = has_more.then(|| {
+            let last = items
+                .last()
+                .expect("a global usage page with more rows is not empty");
+            GlobalSessionUsagePageKey {
+                occurred_at: last.occurred_at.clone(),
+                usage_id: last.usage_id.clone(),
+                source_key: last.source_key.clone(),
+            }
+        });
+        Ok(GlobalSessionUsagePage {
+            items,
+            next_page_key,
+        })
+    }
+
     pub fn load_current_session_index_page(
         &self,
         source_key: &str,
@@ -1678,7 +2136,79 @@ impl StateStore {
         limit: usize,
     ) -> Result<SessionIndexPage, StorageError> {
         validate_page_limit(limit, 200)?;
-        let Some(generation) = self.load_current_generation(source_key)? else {
+        validate_opaque_key("source key", source_key)?;
+        if after.is_some_and(|key| key.source_key != source_key) {
+            return Err(StorageError::StalePageKey);
+        }
+        let (sql, values): (&str, Vec<rusqlite::types::Value>) = match after {
+            None => (
+                "SELECT s.current_generation, i.session_key, i.source_key, i.generation,
+                        i.source_kind, i.created_at, i.last_active_at, i.message_count,
+                        i.usage_event_count, i.availability
+                 FROM session_sources s
+                 LEFT JOIN session_index i
+                   ON i.source_key = s.source_key
+                  AND i.generation = s.current_generation
+                 WHERE s.source_key = ?1
+                 ORDER BY i.last_active_at DESC, i.session_key
+                 LIMIT ?2",
+                vec![
+                    source_key.to_owned().into(),
+                    usize_to_i64(limit + 1, "page limit")?.into(),
+                ],
+            ),
+            Some(key) => (
+                "SELECT s.current_generation, i.session_key, i.source_key, i.generation,
+                        i.source_kind, i.created_at, i.last_active_at, i.message_count,
+                        i.usage_event_count, i.availability
+                 FROM session_sources s
+                 LEFT JOIN session_index i
+                   ON i.source_key = s.source_key
+                  AND i.generation = s.current_generation
+                  AND (i.last_active_at < ?2
+                       OR (i.last_active_at = ?2 AND i.session_key > ?3))
+                 WHERE s.source_key = ?1
+                 ORDER BY i.last_active_at DESC, i.session_key
+                 LIMIT ?4",
+                vec![
+                    source_key.to_owned().into(),
+                    key.last_active_at.clone().into(),
+                    key.session_key.clone().into(),
+                    usize_to_i64(limit + 1, "page limit")?.into(),
+                ],
+            ),
+        };
+        let mut statement = self.connection.prepare(sql).map_err(map_database_error)?;
+        let rows = statement
+            .query_map(rusqlite::params_from_iter(values), |row| {
+                let generation = row.get::<_, Option<i64>>(0)?;
+                let record = row
+                    .get::<_, Option<String>>(1)?
+                    .map(|session_key| {
+                        Ok::<IndexDatabaseRow, rusqlite::Error>((
+                            session_key,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                            row.get(7)?,
+                            row.get(8)?,
+                            row.get(9)?,
+                        ))
+                    })
+                    .transpose()?;
+                Ok((generation, record))
+            })
+            .map_err(map_database_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_database_error)?;
+        let generation = rows
+            .first()
+            .and_then(|(generation, _)| *generation)
+            .map(|generation| database_u64(generation, "current generation"))
+            .transpose()?;
+        let Some(generation) = generation else {
             if after.is_some() {
                 return Err(StorageError::StalePageKey);
             }
@@ -1687,10 +2217,13 @@ impl StateStore {
                 next_page_key: None,
             });
         };
-        if after.is_some_and(|key| key.source_key != source_key || key.generation != generation) {
+        if after.is_some_and(|key| key.generation != generation) {
             return Err(StorageError::StalePageKey);
         }
-        let raw = query_index_rows(&self.connection, source_key, generation, after, limit + 1)?;
+        let raw = rows
+            .into_iter()
+            .filter_map(|(_, record)| record)
+            .collect::<Vec<_>>();
         let mut items = raw
             .into_iter()
             .map(index_record_from_database)
@@ -1719,7 +2252,85 @@ impl StateStore {
         limit: usize,
     ) -> Result<SessionUsagePage, StorageError> {
         validate_page_limit(limit, 500)?;
-        let Some(generation) = self.load_current_generation(source_key)? else {
+        validate_opaque_key("source key", source_key)?;
+        if after.is_some_and(|key| key.source_key != source_key) {
+            return Err(StorageError::StalePageKey);
+        }
+        let (sql, values): (&str, Vec<rusqlite::types::Value>) = match after {
+            None => (
+                "SELECT s.current_generation, u.usage_id, u.session_key, u.source_key,
+                        u.generation, u.source_kind, u.model, u.occurred_at,
+                        u.input_tokens, u.output_tokens, u.cache_read_tokens,
+                        u.cache_write_tokens, u.reasoning_tokens, u.record_revision
+                 FROM session_sources s
+                 LEFT JOIN session_usage_records u
+                   ON u.source_key = s.source_key
+                  AND u.generation = s.current_generation
+                 WHERE s.source_key = ?1
+                 ORDER BY u.occurred_at, u.usage_id
+                 LIMIT ?2",
+                vec![
+                    source_key.to_owned().into(),
+                    usize_to_i64(limit + 1, "page limit")?.into(),
+                ],
+            ),
+            Some(key) => (
+                "SELECT s.current_generation, u.usage_id, u.session_key, u.source_key,
+                        u.generation, u.source_kind, u.model, u.occurred_at,
+                        u.input_tokens, u.output_tokens, u.cache_read_tokens,
+                        u.cache_write_tokens, u.reasoning_tokens, u.record_revision
+                 FROM session_sources s
+                 LEFT JOIN session_usage_records u
+                   ON u.source_key = s.source_key
+                  AND u.generation = s.current_generation
+                  AND (u.occurred_at > ?2
+                       OR (u.occurred_at = ?2 AND u.usage_id > ?3))
+                 WHERE s.source_key = ?1
+                 ORDER BY u.occurred_at, u.usage_id
+                 LIMIT ?4",
+                vec![
+                    source_key.to_owned().into(),
+                    key.occurred_at.clone().into(),
+                    key.usage_id.clone().into(),
+                    usize_to_i64(limit + 1, "page limit")?.into(),
+                ],
+            ),
+        };
+        let mut statement = self.connection.prepare(sql).map_err(map_database_error)?;
+        let rows = statement
+            .query_map(rusqlite::params_from_iter(values), |row| {
+                let generation = row.get::<_, Option<i64>>(0)?;
+                let record = row
+                    .get::<_, Option<String>>(1)?
+                    .map(|usage_id| {
+                        Ok::<UsageDatabaseRow, rusqlite::Error>((
+                            usage_id,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                            row.get(7)?,
+                            row.get(8)?,
+                            row.get(9)?,
+                            row.get(10)?,
+                            row.get(11)?,
+                            row.get(12)?,
+                            row.get(13)?,
+                        ))
+                    })
+                    .transpose()?;
+                Ok((generation, record))
+            })
+            .map_err(map_database_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_database_error)?;
+        let generation = rows
+            .first()
+            .and_then(|(generation, _)| *generation)
+            .map(|generation| database_u64(generation, "current generation"))
+            .transpose()?;
+        let Some(generation) = generation else {
             if after.is_some() {
                 return Err(StorageError::StalePageKey);
             }
@@ -1728,10 +2339,13 @@ impl StateStore {
                 next_page_key: None,
             });
         };
-        if after.is_some_and(|key| key.source_key != source_key || key.generation != generation) {
+        if after.is_some_and(|key| key.generation != generation) {
             return Err(StorageError::StalePageKey);
         }
-        let raw = query_usage_rows(&self.connection, source_key, generation, after, limit + 1)?;
+        let raw = rows
+            .into_iter()
+            .filter_map(|(_, record)| record)
+            .collect::<Vec<_>>();
         let mut items = raw
             .into_iter()
             .map(usage_record_from_database)
@@ -1761,24 +2375,26 @@ impl StateStore {
         limit: usize,
     ) -> Result<CodexReplaySignaturePage, StorageError> {
         validate_page_limit(limit, MAX_SESSION_BATCH_ROWS)?;
-        if self.load_current_generation(parent_source_key)? != Some(parent_generation)
-            || after.is_some_and(|key| {
-                key.parent_source_key != parent_source_key
-                    || key.parent_generation != parent_generation
-            })
-        {
+        validate_opaque_key("parent source key", parent_source_key)?;
+        if after.is_some_and(|key| {
+            key.parent_source_key != parent_source_key || key.parent_generation != parent_generation
+        }) {
             return Err(StorageError::StalePageKey);
         }
         let after_ordinal = after.map_or(0, |key| key.token_event_ordinal);
         let mut statement = self
             .connection
             .prepare(
-                "SELECT parent_source_key, parent_generation, token_event_ordinal,
-                        occurred_at, signature_hash
-                 FROM codex_replay_signatures
-                 WHERE parent_source_key = ?1 AND parent_generation = ?2
-                   AND token_event_ordinal > ?3
-                 ORDER BY token_event_ordinal
+                "SELECT s.current_generation, r.parent_source_key, r.parent_generation,
+                        r.token_event_ordinal, r.occurred_at, r.signature_hash
+                 FROM session_sources s
+                 LEFT JOIN codex_replay_signatures r
+                   ON r.parent_source_key = s.source_key
+                  AND r.parent_generation = s.current_generation
+                  AND r.parent_generation = ?2
+                  AND r.token_event_ordinal > ?3
+                 WHERE s.source_key = ?1
+                 ORDER BY r.token_event_ordinal
                  LIMIT ?4",
             )
             .map_err(map_database_error)?;
@@ -1791,20 +2407,36 @@ impl StateStore {
                     usize_to_i64(limit + 1, "page limit")?,
                 ],
                 |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, i64>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, Vec<u8>>(4)?,
-                    ))
+                    let generation = row.get::<_, Option<i64>>(0)?;
+                    let signature = row
+                        .get::<_, Option<String>>(1)?
+                        .map(|parent_source_key| {
+                            Ok::<ReplayDatabaseRow, rusqlite::Error>((
+                                parent_source_key,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                                row.get(5)?,
+                            ))
+                        })
+                        .transpose()?;
+                    Ok((generation, signature))
                 },
             )
             .map_err(map_database_error)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(map_database_error)?;
+        let current_generation = raw
+            .first()
+            .and_then(|(generation, _)| *generation)
+            .map(|generation| database_u64(generation, "current generation"))
+            .transpose()?;
+        if current_generation != Some(parent_generation) {
+            return Err(StorageError::StalePageKey);
+        }
         let mut items = raw
             .into_iter()
+            .filter_map(|(_, signature)| signature)
             .map(replay_signature_from_database)
             .collect::<Result<Vec<_>, _>>()?;
         let has_more = items.len() > limit;
@@ -1935,6 +2567,57 @@ type UsageDatabaseRow = (
 
 type ReplayDatabaseRow = (String, i64, i64, String, Vec<u8>);
 
+type SupplementalDatabaseRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    String,
+    String,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    Option<i64>,
+    Option<String>,
+);
+
+type SourceDatabaseRow = (
+    String,
+    String,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    String,
+    Option<String>,
+    Option<String>,
+);
+
+type CursorDatabaseRow = (
+    String,
+    String,
+    i64,
+    String,
+    String,
+    i64,
+    String,
+    i64,
+    i64,
+    Vec<u8>,
+    Vec<u8>,
+    Vec<u8>,
+    Option<String>,
+    Option<i64>,
+    Option<Vec<u8>>,
+    Option<String>,
+    Option<String>,
+);
+
 fn invalid_state(message: &str) -> StorageError {
     StorageError::InvalidStateRecord {
         message: message.to_owned(),
@@ -1986,10 +2669,7 @@ fn validate_session_batch(batch: &SessionBatch) -> Result<(), StorageError> {
 fn validate_cursor(cursor: &SessionScanCursor) -> Result<(), StorageError> {
     validate_opaque_key("source key", &cursor.source_key)?;
     validate_generation(cursor.generation)?;
-    validate_bounded_text("file identity", &cursor.file_identity, 256, false)?;
-    if cursor.file_identity.contains(['/', '\\']) {
-        return Err(invalid_state("file identity must be opaque"));
-    }
+    validate_opaque_key("file identity", cursor.file_identity.as_str())?;
     validate_timestamp("cursor modification timestamp", &cursor.modified_at)?;
     to_i64(cursor.observed_size, "observed size")?;
     to_i64(cursor.complete_byte_offset, "complete byte offset")?;
@@ -2016,8 +2696,15 @@ fn validate_cursor(cursor: &SessionScanCursor) -> Result<(), StorageError> {
             ));
         }
     }
+    if cursor.parser_checkpoint.lineage_source_key != cursor.parent_source_key
+        || cursor.parser_checkpoint.lineage_generation != cursor.parent_generation
+    {
+        return Err(invalid_state(
+            "parser checkpoint lineage must match the cursor parent lineage",
+        ));
+    }
     if let Some(result_code) = &cursor.result_code {
-        validate_bounded_text("result code", result_code, 128, false)?;
+        validate_stable_code("result code", result_code.as_str())?;
     }
     match (&cursor.result_code, &cursor.result_changed_at) {
         (None, None) => {}
@@ -2143,33 +2830,26 @@ fn validate_replay_signature(
 fn validate_supplemental_metadata(
     metadata: &RequestSupplementalMetadata,
 ) -> Result<usize, StorageError> {
-    for (name, value, maximum) in [
-        ("request identifier", metadata.request_id.as_str(), 256),
-        ("attempt identifier", metadata.attempt_id.as_str(), 256),
-        ("trace identifier", metadata.trace_id.as_str(), 256),
-        ("route fingerprint", metadata.route_fingerprint.as_str(), 64),
-        (
-            "provider fingerprint",
-            metadata.provider_fingerprint.as_str(),
-            64,
-        ),
-        ("retry decision", metadata.retry_decision.as_str(), 256),
-        (
-            "failover decision",
-            metadata.failover_decision.as_str(),
-            256,
-        ),
-    ] {
-        validate_bounded_text(name, value, maximum, false)?;
-    }
+    validate_correlation_id("request identifier", metadata.request_id.as_str())?;
+    validate_correlation_id("attempt identifier", metadata.attempt_id.as_str())?;
+    validate_correlation_id("trace identifier", metadata.trace_id.as_str())?;
     validate_timestamp("supplemental timestamp", &metadata.occurred_at)?;
-    validate_opaque_key("route fingerprint", &metadata.route_fingerprint)?;
-    validate_opaque_key("provider fingerprint", &metadata.provider_fingerprint)?;
+    validate_opaque_key("route fingerprint", metadata.route_fingerprint.as_str())?;
+    validate_opaque_key(
+        "provider fingerprint",
+        metadata.provider_fingerprint.as_str(),
+    )?;
     if let Some(account) = &metadata.account_fingerprint {
-        validate_opaque_key("account fingerprint", account)?;
+        validate_opaque_key("account fingerprint", account.as_str())?;
     }
     if let Some(error_code) = &metadata.error_code {
-        validate_bounded_text("supplemental error code", error_code, 256, false)?;
+        validate_stable_code("supplemental error code", error_code.as_str())?;
+    }
+    if metadata
+        .status_code
+        .is_some_and(|status| !(100..=599).contains(&status))
+    {
+        return Err(invalid_state("HTTP status is outside 100 through 599"));
     }
     for (name, value) in [
         ("queue duration", metadata.queue_ms),
@@ -2228,9 +2908,77 @@ fn validate_generation(generation: u64) -> Result<(), StorageError> {
 }
 
 fn validate_timestamp(name: &str, value: &str) -> Result<(), StorageError> {
-    validate_bounded_text(name, value, 64, false)?;
-    if !value.ends_with('Z') || !value.contains('T') {
-        return Err(invalid_state(&format!("{name} must be normalized UTC")));
+    let bytes = value.as_bytes();
+    if bytes.len() != 20
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || bytes[19] != b'Z'
+        || bytes.iter().enumerate().any(|(index, byte)| {
+            !matches!(index, 4 | 7 | 10 | 13 | 16 | 19) && !byte.is_ascii_digit()
+        })
+    {
+        return Err(invalid_state(&format!(
+            "{name} must use YYYY-MM-DDTHH:MM:SSZ"
+        )));
+    }
+    let year = parse_timestamp_component(&bytes[0..4]);
+    let month = parse_timestamp_component(&bytes[5..7]);
+    let day = parse_timestamp_component(&bytes[8..10]);
+    let hour = parse_timestamp_component(&bytes[11..13]);
+    let minute = parse_timestamp_component(&bytes[14..16]);
+    let second = parse_timestamp_component(&bytes[17..19]);
+    let maximum_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => 0,
+    };
+    if year == 0 || day == 0 || day > maximum_day || hour > 23 || minute > 59 || second > 59 {
+        return Err(invalid_state(&format!(
+            "{name} contains an impossible UTC date or time"
+        )));
+    }
+    Ok(())
+}
+
+fn parse_timestamp_component(bytes: &[u8]) -> u32 {
+    bytes
+        .iter()
+        .fold(0, |value, byte| value * 10 + u32::from(byte - b'0'))
+}
+
+const fn is_leap_year(year: u32) -> bool {
+    year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400))
+}
+
+fn validate_correlation_id(name: &str, value: &str) -> Result<(), StorageError> {
+    if value.is_empty()
+        || value.len() > 256
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(invalid_state(&format!(
+            "{name} must be an opaque correlation identifier"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_stable_code(name: &str, value: &str) -> Result<(), StorageError> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        return Err(invalid_state(&format!(
+            "{name} must be a lowercase stable code"
+        )));
     }
     Ok(())
 }
@@ -2259,9 +3007,12 @@ fn validate_page_limit(limit: usize, maximum: usize) -> Result<(), StorageError>
 
 fn cursor_logical_bytes(cursor: &SessionScanCursor) -> usize {
     cursor.source_key.len()
-        + cursor.file_identity.len()
+        + cursor.file_identity.as_str().len()
         + cursor.modified_at.len()
-        + cursor.result_code.as_ref().map_or(0, String::len)
+        + cursor
+            .result_code
+            .as_ref()
+            .map_or(0, |code| code.as_str().len())
         + cursor.result_changed_at.as_ref().map_or(0, String::len)
         + cursor.parent_source_key.as_ref().map_or(0, String::len)
         + encode_checkpoint(&cursor.parser_checkpoint).map_or(usize::MAX, |bytes| bytes.len())
@@ -2290,16 +3041,22 @@ fn replay_logical_bytes(signature: &CodexReplaySignature) -> usize {
 }
 
 fn supplemental_logical_bytes(metadata: &RequestSupplementalMetadata) -> usize {
-    metadata.request_id.len()
-        + metadata.attempt_id.len()
-        + metadata.trace_id.len()
+    metadata.request_id.as_str().len()
+        + metadata.attempt_id.as_str().len()
+        + metadata.trace_id.as_str().len()
         + metadata.occurred_at.len()
-        + metadata.route_fingerprint.len()
-        + metadata.provider_fingerprint.len()
-        + metadata.account_fingerprint.as_ref().map_or(0, String::len)
-        + metadata.retry_decision.len()
-        + metadata.failover_decision.len()
-        + metadata.error_code.as_ref().map_or(0, String::len)
+        + metadata.route_fingerprint.as_str().len()
+        + metadata.provider_fingerprint.as_str().len()
+        + metadata
+            .account_fingerprint
+            .as_ref()
+            .map_or(0, |fingerprint| fingerprint.as_str().len())
+        + metadata.retry_decision.as_str().len()
+        + metadata.failover_decision.as_str().len()
+        + metadata
+            .error_code
+            .as_ref()
+            .map_or(0, |code| code.as_str().len())
         + 64
 }
 
@@ -2443,7 +3200,7 @@ fn insert_cursor(connection: &Connection, cursor: &SessionScanCursor) -> Result<
                 to_i64(cursor.generation, "generation")?,
                 cursor.source_kind.as_str(),
                 cursor.generation_state.as_str(),
-                cursor.file_identity,
+                cursor.file_identity.as_str(),
                 to_i64(cursor.observed_size, "observed size")?,
                 cursor.modified_at,
                 to_i64(cursor.complete_byte_offset, "complete byte offset")?,
@@ -2460,7 +3217,7 @@ fn insert_cursor(connection: &Connection, cursor: &SessionScanCursor) -> Result<
                     .replay_boundary_fingerprint
                     .as_ref()
                     .map(<[u8; 32]>::as_slice),
-                cursor.result_code,
+                cursor.result_code.map(SessionScanResultCode::as_str),
                 cursor.result_changed_at,
             ],
         )
@@ -2477,8 +3234,21 @@ fn upsert_cursor(connection: &Connection, cursor: &SessionScanCursor) -> Result<
                 && existing.generation_state == cursor.generation_state
                 && existing.file_identity == cursor.file_identity
                 && existing.head_fingerprint == cursor.head_fingerprint
+                && existing.parent_source_key == cursor.parent_source_key
+                && existing.parent_generation == cursor.parent_generation
+                && existing.replay_boundary_fingerprint == cursor.replay_boundary_fingerprint
+                && cursor.observed_size >= existing.observed_size
+                && cursor.modified_at >= existing.modified_at
                 && cursor.complete_byte_offset >= existing.complete_byte_offset
-                && cursor.stable_record_ordinal >= existing.stable_record_ordinal =>
+                && cursor.stable_record_ordinal >= existing.stable_record_ordinal
+                && !(existing.result_code.is_some() && cursor.result_code.is_none())
+                && (!matches!(
+                    (&existing.result_changed_at, &cursor.result_changed_at),
+                    (Some(existing), Some(current)) if current < existing
+                ))
+                && (cursor.boundary_fingerprint == existing.boundary_fingerprint
+                    || cursor.complete_byte_offset > existing.complete_byte_offset
+                    || cursor.stable_record_ordinal > existing.stable_record_ordinal) =>
         {
             let checkpoint = encode_checkpoint(&cursor.parser_checkpoint)?;
             connection
@@ -2508,7 +3278,7 @@ fn upsert_cursor(connection: &Connection, cursor: &SessionScanCursor) -> Result<
                             .replay_boundary_fingerprint
                             .as_ref()
                             .map(<[u8; 32]>::as_slice),
-                        cursor.result_code,
+                        cursor.result_code.map(SessionScanResultCode::as_str),
                         cursor.result_changed_at,
                     ],
                 )
@@ -2535,39 +3305,102 @@ fn query_cursor(
                     result_code, result_changed_at
              FROM session_scan_cursors WHERE source_key = ?1 AND generation = ?2",
             params![source_key, to_i64(generation, "generation")?],
+            cursor_database_row,
+        )
+        .optional()
+        .map_err(map_database_error)?;
+    raw.map(cursor_from_database).transpose()
+}
+
+fn query_session_source(
+    connection: &Connection,
+    source_key: &str,
+) -> Result<Option<SessionSourceState>, StorageError> {
+    let raw = connection
+        .query_row(
+            "SELECT source_key, source_kind, current_generation, staging_generation,
+                    retired_generation, status, error_code, last_transition_at
+             FROM session_sources WHERE source_key = ?1",
+            [source_key],
             |row| {
                 Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, i64>(5)?,
-                    row.get::<_, String>(6)?,
-                    row.get::<_, i64>(7)?,
-                    row.get::<_, i64>(8)?,
-                    row.get::<_, Vec<u8>>(9)?,
-                    row.get::<_, Vec<u8>>(10)?,
-                    row.get::<_, Vec<u8>>(11)?,
-                    row.get::<_, Option<String>>(12)?,
-                    row.get::<_, Option<i64>>(13)?,
-                    row.get::<_, Option<Vec<u8>>>(14)?,
-                    row.get::<_, Option<String>>(15)?,
-                    row.get::<_, Option<String>>(16)?,
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
                 ))
             },
         )
         .optional()
         .map_err(map_database_error)?;
-    let Some(raw) = raw else {
-        return Ok(None);
+    raw.map(session_source_from_database).transpose()
+}
+
+fn session_source_from_database(
+    raw: SourceDatabaseRow,
+) -> Result<SessionSourceState, StorageError> {
+    let source = SessionSourceState {
+        source_key: raw.0,
+        source_kind: SessionSourceKind::from_database(&raw.1)?,
+        current_generation: optional_u64(raw.2, "current generation")?,
+        staging_generation: optional_u64(raw.3, "staging generation")?,
+        retired_generation: optional_u64(raw.4, "retired generation")?,
+        status: SessionSourceStatus::from_database(&raw.5)?,
+        error_code: raw
+            .6
+            .as_deref()
+            .map(SessionSourceErrorCode::from_database)
+            .transpose()?,
+        last_transition_at: raw.7,
     };
+    validate_opaque_key("source key", &source.source_key).map_err(|_| {
+        StorageError::StateDatabaseCorrupt {
+            message: "Session source contains an invalid source key".to_owned(),
+        }
+    })?;
+    if let Some(timestamp) = &source.last_transition_at {
+        validate_timestamp("source transition timestamp", timestamp).map_err(|_| {
+            StorageError::StateDatabaseCorrupt {
+                message: "Session source contains an invalid transition timestamp".to_owned(),
+            }
+        })?;
+    }
+    Ok(source)
+}
+
+fn cursor_database_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CursorDatabaseRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+        row.get(10)?,
+        row.get(11)?,
+        row.get(12)?,
+        row.get(13)?,
+        row.get(14)?,
+        row.get(15)?,
+        row.get(16)?,
+    ))
+}
+
+fn cursor_from_database(raw: CursorDatabaseRow) -> Result<SessionScanCursor, StorageError> {
     let cursor = SessionScanCursor {
         source_key: raw.0,
         source_kind: SessionSourceKind::from_database(&raw.1)?,
         generation: database_u64(raw.2, "generation")?,
         generation_state: SessionGenerationState::from_database(&raw.3)?,
-        file_identity: raw.4,
+        file_identity: SessionFileIdentity::from_database(raw.4)?,
         observed_size: database_u64(raw.5, "observed size")?,
         modified_at: raw.6,
         complete_byte_offset: database_u64(raw.7, "complete byte offset")?,
@@ -2581,13 +3414,17 @@ fn query_cursor(
             .14
             .map(|bytes| vec_to_array(bytes, "replay boundary fingerprint"))
             .transpose()?,
-        result_code: raw.15,
+        result_code: raw
+            .15
+            .as_deref()
+            .map(SessionScanResultCode::from_database)
+            .transpose()?,
         result_changed_at: raw.16,
     };
     validate_cursor(&cursor).map_err(|_| StorageError::StateDatabaseCorrupt {
         message: "Session scan cursor violates its typed bounds".to_owned(),
     })?;
-    Ok(Some(cursor))
+    Ok(cursor)
 }
 
 fn write_index_record(
@@ -2613,6 +3450,31 @@ fn write_index_record(
         .transpose()?;
     match existing {
         Some(existing) if existing == *record => return Ok(()),
+        Some(existing)
+            if existing.source_kind == record.source_kind
+                && existing.created_at == record.created_at
+                && existing.availability == record.availability
+                && record.last_active_at >= existing.last_active_at
+                && record.message_count >= existing.message_count
+                && record.usage_event_count >= existing.usage_event_count =>
+        {
+            connection
+                .execute(
+                    "UPDATE session_index SET
+                        last_active_at = ?4, message_count = ?5, usage_event_count = ?6
+                     WHERE source_key = ?1 AND generation = ?2 AND session_key = ?3",
+                    params![
+                        record.source_key,
+                        to_i64(record.generation, "generation")?,
+                        record.session_key,
+                        record.last_active_at,
+                        to_i64(record.message_count, "message count")?,
+                        to_i64(record.usage_event_count, "usage event count")?,
+                    ],
+                )
+                .map_err(map_database_error)?;
+            return Ok(());
+        }
         Some(_) => {
             return Err(StorageError::StableRecordConflict {
                 record_kind: "Session index",
@@ -2727,11 +3589,11 @@ fn write_usage_record(
     Ok(())
 }
 
-fn write_replay_signature(
+fn query_replay_signature(
     connection: &Connection,
     signature: &CodexReplaySignature,
-) -> Result<(), StorageError> {
-    let existing = connection
+) -> Result<Option<CodexReplaySignature>, StorageError> {
+    connection
         .query_row(
             "SELECT parent_source_key, parent_generation, token_event_ordinal,
                     occurred_at, signature_hash
@@ -2756,30 +3618,13 @@ fn write_replay_signature(
         .optional()
         .map_err(map_database_error)?
         .map(replay_signature_from_database)
-        .transpose()?;
-    match existing {
-        Some(existing) if existing == *signature => return Ok(()),
-        Some(_) => {
-            return Err(StorageError::StableRecordConflict {
-                record_kind: "Codex replay signature",
-            });
-        }
-        None => {}
-    }
-    let count = connection
-        .query_row(
-            "SELECT COUNT(*) FROM codex_replay_signatures
-             WHERE parent_source_key = ?1 AND parent_generation = ?2",
-            params![
-                signature.parent_source_key,
-                to_i64(signature.parent_generation, "generation")?
-            ],
-            |row| row.get::<_, i64>(0),
-        )
-        .map_err(map_database_error)?;
-    if database_u64(count, "replay signature count")? >= MAX_CODEX_REPLAY_SIGNATURES {
-        return Err(StorageError::ReplaySignatureLimitExceeded);
-    }
+        .transpose()
+}
+
+fn insert_replay_signature(
+    connection: &Connection,
+    signature: &CodexReplaySignature,
+) -> Result<(), StorageError> {
     connection
         .execute(
             "INSERT INTO codex_replay_signatures(
@@ -2803,8 +3648,11 @@ fn write_supplemental_metadata(
     metadata: &RequestSupplementalMetadata,
 ) -> Result<(), StorageError> {
     let logical_bytes = validate_supplemental_metadata(metadata)?;
-    let existing =
-        query_supplemental_metadata(connection, &metadata.request_id, &metadata.attempt_id)?;
+    let existing = query_supplemental_metadata(
+        connection,
+        metadata.request_id.as_str(),
+        metadata.attempt_id.as_str(),
+    )?;
     match existing {
         Some(existing) if existing == *metadata => return Ok(()),
         Some(_) => {
@@ -2823,17 +3671,20 @@ fn write_supplemental_metadata(
                 status_code, error_code, logical_bytes
              ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18
-             )",
+            )",
             params![
-                metadata.request_id,
-                metadata.attempt_id,
-                metadata.trace_id,
+                metadata.request_id.as_str(),
+                metadata.attempt_id.as_str(),
+                metadata.trace_id.as_str(),
                 metadata.occurred_at,
-                metadata.route_fingerprint,
-                metadata.provider_fingerprint,
-                metadata.account_fingerprint,
-                metadata.retry_decision,
-                metadata.failover_decision,
+                metadata.route_fingerprint.as_str(),
+                metadata.provider_fingerprint.as_str(),
+                metadata
+                    .account_fingerprint
+                    .as_ref()
+                    .map(OpaqueFingerprint::as_str),
+                metadata.retry_decision.as_str(),
+                metadata.failover_decision.as_str(),
                 to_i64(metadata.queue_ms, "queue duration")?,
                 to_i64(metadata.connect_ms, "connect duration")?,
                 to_i64(metadata.first_byte_ms, "first-byte duration")?,
@@ -2841,7 +3692,10 @@ fn write_supplemental_metadata(
                 to_i64(metadata.request_bytes, "request size")?,
                 to_i64(metadata.response_bytes, "response size")?,
                 metadata.status_code.map(i64::from),
-                metadata.error_code,
+                metadata
+                    .error_code
+                    .as_ref()
+                    .map(SupplementalErrorCode::as_str),
                 usize_to_i64(logical_bytes, "logical bytes")?,
             ],
         )
@@ -2854,45 +3708,78 @@ fn query_supplemental_metadata(
     request_id: &str,
     attempt_id: &str,
 ) -> Result<Option<RequestSupplementalMetadata>, StorageError> {
-    connection
+    let raw = connection
         .query_row(
             "SELECT request_id, attempt_id, trace_id, occurred_at, route_fingerprint,
                     provider_fingerprint, account_fingerprint, retry_decision,
                     failover_decision, queue_ms, connect_ms, first_byte_ms, total_ms,
                     request_bytes, response_bytes, status_code, error_code
              FROM request_supplemental_metadata
-             WHERE request_id = ?1 AND attempt_id = ?2",
+            WHERE request_id = ?1 AND attempt_id = ?2",
             params![request_id, attempt_id],
             |row| {
-                Ok(RequestSupplementalMetadata {
-                    request_id: row.get(0)?,
-                    attempt_id: row.get(1)?,
-                    trace_id: row.get(2)?,
-                    occurred_at: row.get(3)?,
-                    route_fingerprint: row.get(4)?,
-                    provider_fingerprint: row.get(5)?,
-                    account_fingerprint: row.get(6)?,
-                    retry_decision: row.get(7)?,
-                    failover_decision: row.get(8)?,
-                    queue_ms: database_u64_sql(row.get(9)?)?,
-                    connect_ms: database_u64_sql(row.get(10)?)?,
-                    first_byte_ms: database_u64_sql(row.get(11)?)?,
-                    total_ms: database_u64_sql(row.get(12)?)?,
-                    request_bytes: database_u64_sql(row.get(13)?)?,
-                    response_bytes: database_u64_sql(row.get(14)?)?,
-                    status_code: row
-                        .get::<_, Option<i64>>(15)?
-                        .map(|value| {
-                            u16::try_from(value)
-                                .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(15, value))
-                        })
-                        .transpose()?,
-                    error_code: row.get(16)?,
-                })
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                    row.get(12)?,
+                    row.get(13)?,
+                    row.get(14)?,
+                    row.get(15)?,
+                    row.get(16)?,
+                ))
             },
         )
         .optional()
-        .map_err(map_database_error)
+        .map_err(map_database_error)?;
+    raw.map(supplemental_from_database).transpose()
+}
+
+fn supplemental_from_database(
+    raw: SupplementalDatabaseRow,
+) -> Result<RequestSupplementalMetadata, StorageError> {
+    let status_code =
+        raw.15
+            .map(u16::try_from)
+            .transpose()
+            .map_err(|_| StorageError::StateDatabaseCorrupt {
+                message: "supplemental metadata contains an invalid HTTP status".to_owned(),
+            })?;
+    let metadata = RequestSupplementalMetadata {
+        request_id: RequestId::from_database(raw.0)?,
+        attempt_id: AttemptId::from_database(raw.1)?,
+        trace_id: TraceId::from_database(raw.2)?,
+        occurred_at: raw.3,
+        route_fingerprint: OpaqueFingerprint::from_database(raw.4)?,
+        provider_fingerprint: OpaqueFingerprint::from_database(raw.5)?,
+        account_fingerprint: raw.6.map(OpaqueFingerprint::from_database).transpose()?,
+        retry_decision: SupplementalRetryDecision::from_database(&raw.7)?,
+        failover_decision: SupplementalFailoverDecision::from_database(&raw.8)?,
+        queue_ms: database_u64(raw.9, "queue duration")?,
+        connect_ms: database_u64(raw.10, "connect duration")?,
+        first_byte_ms: database_u64(raw.11, "first-byte duration")?,
+        total_ms: database_u64(raw.12, "total duration")?,
+        request_bytes: database_u64(raw.13, "request size")?,
+        response_bytes: database_u64(raw.14, "response size")?,
+        status_code,
+        error_code: raw
+            .16
+            .map(SupplementalErrorCode::from_database)
+            .transpose()?,
+    };
+    validate_supplemental_metadata(&metadata).map_err(|_| StorageError::StateDatabaseCorrupt {
+        message: "supplemental metadata violates its typed bounds".to_owned(),
+    })?;
+    Ok(metadata)
 }
 
 fn supplemental_stats(connection: &Connection) -> Result<SupplementalStorageStats, StorageError> {
@@ -2923,98 +3810,110 @@ fn supplemental_stats(connection: &Connection) -> Result<SupplementalStorageStat
     })
 }
 
-fn query_index_rows(
+fn pending_replay_signatures<'a>(
     connection: &Connection,
-    source_key: &str,
-    generation: u64,
-    after: Option<&SessionIndexPageKey>,
-    limit: usize,
-) -> Result<Vec<IndexDatabaseRow>, StorageError> {
-    let (sql, values): (&str, Vec<rusqlite::types::Value>) = match after {
-        None => (
-            "SELECT session_key, source_key, generation, source_kind, created_at,
-                    last_active_at, message_count, usage_event_count, availability
-             FROM session_index
-             WHERE source_key = ?1 AND generation = ?2
-             ORDER BY last_active_at DESC, session_key
-             LIMIT ?3",
-            vec![
-                source_key.to_owned().into(),
-                to_i64(generation, "generation")?.into(),
-                usize_to_i64(limit, "page limit")?.into(),
+    signatures: &'a [CodexReplaySignature],
+) -> Result<Vec<&'a CodexReplaySignature>, StorageError> {
+    if signatures.is_empty() {
+        return Ok(Vec::new());
+    }
+    let first = &signatures[0];
+    let count = connection
+        .query_row(
+            "SELECT COUNT(*) FROM codex_replay_signatures
+             WHERE parent_source_key = ?1 AND parent_generation = ?2",
+            params![
+                first.parent_source_key,
+                to_i64(first.parent_generation, "generation")?
             ],
-        ),
-        Some(key) => (
-            "SELECT session_key, source_key, generation, source_kind, created_at,
-                    last_active_at, message_count, usage_event_count, availability
-             FROM session_index
-             WHERE source_key = ?1 AND generation = ?2
-               AND (last_active_at < ?3 OR (last_active_at = ?3 AND session_key > ?4))
-             ORDER BY last_active_at DESC, session_key
-             LIMIT ?5",
-            vec![
-                source_key.to_owned().into(),
-                to_i64(generation, "generation")?.into(),
-                key.last_active_at.clone().into(),
-                key.session_key.clone().into(),
-                usize_to_i64(limit, "page limit")?.into(),
-            ],
-        ),
-    };
-    let mut statement = connection.prepare(sql).map_err(map_database_error)?;
-    statement
-        .query_map(rusqlite::params_from_iter(values), index_database_row)
-        .map_err(map_database_error)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(map_database_error)
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(map_database_error)?;
+    let existing_count = database_u64(count, "replay signature count")?;
+    let mut pending = Vec::with_capacity(signatures.len());
+    for signature in signatures {
+        if let Some(previous) = pending
+            .iter()
+            .copied()
+            .find(|previous: &&CodexReplaySignature| {
+                previous.token_event_ordinal == signature.token_event_ordinal
+            })
+        {
+            if *previous == *signature {
+                continue;
+            }
+            return Err(StorageError::StableRecordConflict {
+                record_kind: "Codex replay signature",
+            });
+        }
+        match query_replay_signature(connection, signature)? {
+            Some(existing) if existing == *signature => continue,
+            Some(_) => {
+                return Err(StorageError::StableRecordConflict {
+                    record_kind: "Codex replay signature",
+                });
+            }
+            None => pending.push(signature),
+        }
+    }
+    if existing_count.saturating_add(pending.len() as u64) > MAX_CODEX_REPLAY_SIGNATURES {
+        return Err(StorageError::ReplaySignatureLimitExceeded);
+    }
+    Ok(pending)
 }
 
-fn query_usage_rows(
+fn pending_supplemental_metadata<'a>(
     connection: &Connection,
-    source_key: &str,
-    generation: u64,
-    after: Option<&SessionUsagePageKey>,
-    limit: usize,
-) -> Result<Vec<UsageDatabaseRow>, StorageError> {
-    let (sql, values): (&str, Vec<rusqlite::types::Value>) = match after {
-        None => (
-            "SELECT usage_id, session_key, source_key, generation, source_kind, model,
-                    occurred_at, input_tokens, output_tokens, cache_read_tokens,
-                    cache_write_tokens, reasoning_tokens, record_revision
-             FROM session_usage_records
-             WHERE source_key = ?1 AND generation = ?2
-             ORDER BY occurred_at, usage_id
-             LIMIT ?3",
-            vec![
-                source_key.to_owned().into(),
-                to_i64(generation, "generation")?.into(),
-                usize_to_i64(limit, "page limit")?.into(),
-            ],
-        ),
-        Some(key) => (
-            "SELECT usage_id, session_key, source_key, generation, source_kind, model,
-                    occurred_at, input_tokens, output_tokens, cache_read_tokens,
-                    cache_write_tokens, reasoning_tokens, record_revision
-             FROM session_usage_records
-             WHERE source_key = ?1 AND generation = ?2
-               AND (occurred_at > ?3 OR (occurred_at = ?3 AND usage_id > ?4))
-             ORDER BY occurred_at, usage_id
-             LIMIT ?5",
-            vec![
-                source_key.to_owned().into(),
-                to_i64(generation, "generation")?.into(),
-                key.occurred_at.clone().into(),
-                key.usage_id.clone().into(),
-                usize_to_i64(limit, "page limit")?.into(),
-            ],
-        ),
-    };
-    let mut statement = connection.prepare(sql).map_err(map_database_error)?;
-    statement
-        .query_map(rusqlite::params_from_iter(values), usage_database_row)
-        .map_err(map_database_error)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(map_database_error)
+    metadata: &'a [RequestSupplementalMetadata],
+) -> Result<(Vec<&'a RequestSupplementalMetadata>, usize), StorageError> {
+    let mut pending = Vec::with_capacity(metadata.len());
+    let mut pending_bytes = 0_usize;
+    for row in metadata {
+        if let Some(previous) =
+            pending
+                .iter()
+                .copied()
+                .find(|previous: &&RequestSupplementalMetadata| {
+                    previous.request_id == row.request_id && previous.attempt_id == row.attempt_id
+                })
+        {
+            if *previous == *row {
+                continue;
+            }
+            return Err(StorageError::StableRecordConflict {
+                record_kind: "request supplemental metadata",
+            });
+        }
+        match query_supplemental_metadata(
+            connection,
+            row.request_id.as_str(),
+            row.attempt_id.as_str(),
+        )? {
+            Some(existing) if existing == *row => continue,
+            Some(_) => {
+                return Err(StorageError::StableRecordConflict {
+                    record_kind: "request supplemental metadata",
+                });
+            }
+            None => {
+                pending_bytes = pending_bytes.saturating_add(validate_supplemental_metadata(row)?);
+                pending.push(row);
+            }
+        }
+    }
+    Ok((pending, pending_bytes))
+}
+
+fn supplemental_batch_fits(
+    connection: &Connection,
+    pending_rows: usize,
+    pending_bytes: usize,
+) -> Result<bool, StorageError> {
+    let stats = supplemental_stats(connection)?;
+    Ok(
+        stats.rows.saturating_add(pending_rows) <= MAX_SUPPLEMENTAL_ROWS
+            && stats.logical_bytes.saturating_add(pending_bytes) <= MAX_SUPPLEMENTAL_BYTES,
+    )
 }
 
 fn index_database_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IndexDatabaseRow> {
@@ -3105,10 +4004,6 @@ fn database_u64(value: i64, name: &str) -> Result<u64, StorageError> {
     u64::try_from(value).map_err(|_| StorageError::StateDatabaseCorrupt {
         message: format!("Session state contains an invalid {name}"),
     })
-}
-
-fn database_u64_sql(value: i64) -> rusqlite::Result<u64> {
-    u64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, value))
 }
 
 fn optional_u64(value: Option<i64>, name: &str) -> Result<Option<u64>, StorageError> {

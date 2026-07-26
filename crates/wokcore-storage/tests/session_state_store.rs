@@ -9,12 +9,14 @@ use std::{
 use rusqlite::{Connection, params};
 use wokcore_core::id::ClientId;
 use wokcore_storage::{
-    CandidateBeginOutcome, ClientTokenMetadata, ClientTokenScope, CodexReplaySignature,
+    AttemptId, CandidateBeginOutcome, ClientTokenMetadata, ClientTokenScope, CodexReplaySignature,
     MAX_CODEX_REPLAY_SIGNATURES, MAX_SESSION_BATCH_BYTES, MAX_SESSION_BATCH_ROWS,
-    MAX_SUPPLEMENTAL_ROWS, ParserCheckpoint, ReadOnlyStateStore, RequestSupplementalMetadata,
-    SessionAvailability, SessionBatch, SessionGenerationState, SessionIndexRecord,
-    SessionScanCursor, SessionSourceErrorCode, SessionSourceKind, SessionSourceStatus,
-    SessionUsageRecord, StateStore, StorageError,
+    MAX_SUPPLEMENTAL_ROWS, OpaqueFingerprint, ParserCheckpoint, ReadOnlyStateStore, RequestId,
+    RequestSupplementalMetadata, SessionAvailability, SessionBatch, SessionFileIdentity,
+    SessionGenerationState, SessionIndexRecord, SessionScanCursor, SessionScanResultCode,
+    SessionSourceErrorCode, SessionSourceKind, SessionSourceStatus, SessionUsageRecord, StateStore,
+    StorageError, SupplementalErrorCode, SupplementalFailoverDecision, SupplementalRetryDecision,
+    TraceId,
 };
 
 const NOW: &str = "2026-07-26T00:00:00Z";
@@ -67,7 +69,7 @@ fn cursor(source_key: &str, generation: u64, offset: u64) -> SessionScanCursor {
         source_kind: SessionSourceKind::Codex,
         generation,
         generation_state: SessionGenerationState::Staging,
-        file_identity: "volume-1:file-2".to_owned(),
+        file_identity: SessionFileIdentity::new(opaque(400)).unwrap(),
         observed_size: offset + 128,
         modified_at: NOW.to_owned(),
         complete_byte_offset: offset,
@@ -78,7 +80,7 @@ fn cursor(source_key: &str, generation: u64, offset: u64) -> SessionScanCursor {
         parent_source_key: Some(opaque(99)),
         parent_generation: Some(4),
         replay_boundary_fingerprint: Some([0x33; 32]),
-        result_code: Some("advanced".to_owned()),
+        result_code: Some(SessionScanResultCode::Advanced),
         result_changed_at: Some(NOW.to_owned()),
     }
 }
@@ -133,15 +135,15 @@ fn replay_signature(source_key: &str, generation: u64, ordinal: u64) -> CodexRep
 
 fn supplemental(request_id: &str) -> RequestSupplementalMetadata {
     RequestSupplementalMetadata {
-        request_id: request_id.to_owned(),
-        attempt_id: "attempt-1".to_owned(),
-        trace_id: "trace-1".to_owned(),
+        request_id: RequestId::new(request_id).unwrap(),
+        attempt_id: AttemptId::new("attempt-1").unwrap(),
+        trace_id: TraceId::new("trace-1").unwrap(),
         occurred_at: NOW.to_owned(),
-        route_fingerprint: opaque(201),
-        provider_fingerprint: opaque(202),
-        account_fingerprint: Some(opaque(203)),
-        retry_decision: "none".to_owned(),
-        failover_decision: "none".to_owned(),
+        route_fingerprint: OpaqueFingerprint::new(opaque(201)).unwrap(),
+        provider_fingerprint: OpaqueFingerprint::new(opaque(202)).unwrap(),
+        account_fingerprint: Some(OpaqueFingerprint::new(opaque(203)).unwrap()),
+        retry_decision: SupplementalRetryDecision::None,
+        failover_decision: SupplementalFailoverDecision::None,
         queue_ms: 1,
         connect_ms: 2,
         first_byte_ms: 3,
@@ -155,11 +157,9 @@ fn supplemental(request_id: &str) -> RequestSupplementalMetadata {
 
 fn dense_supplemental(index: usize) -> RequestSupplementalMetadata {
     let mut metadata = supplemental(&format!("{index:04}-{}", "r".repeat(250)));
-    metadata.attempt_id = "a".repeat(256);
-    metadata.trace_id = "t".repeat(256);
-    metadata.retry_decision = "r".repeat(256);
-    metadata.failover_decision = "f".repeat(256);
-    metadata.error_code = Some("e".repeat(256));
+    metadata.attempt_id = AttemptId::new("a".repeat(256)).unwrap();
+    metadata.trace_id = TraceId::new("t".repeat(256)).unwrap();
+    metadata.error_code = Some(SupplementalErrorCode::new("e".repeat(128)).unwrap());
     metadata
 }
 
@@ -333,6 +333,35 @@ fn schema_three_has_only_compact_session_and_supplemental_columns() {
             !migration.contains(forbidden),
             "schema migration contains forbidden field {forbidden}"
         );
+    }
+}
+
+#[test]
+fn schema_three_has_current_generation_keyset_indexes() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.db");
+    let _store = StateStore::open(&path).unwrap();
+    let connection = Connection::open(path).unwrap();
+    let indexes = connection
+        .prepare(
+            "SELECT name FROM sqlite_schema
+             WHERE type = 'index' AND name NOT LIKE 'sqlite_autoindex_%'
+             ORDER BY name",
+        )
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    for expected in [
+        "codex_replay_current_order",
+        "session_index_current_order",
+        "session_index_global_current_order",
+        "session_usage_current_order",
+        "session_usage_global_current_order",
+    ] {
+        assert!(indexes.iter().any(|index| index == expected), "{expected}");
     }
 }
 
@@ -587,6 +616,201 @@ fn candidate_batch_is_atomic_resumable_and_hidden_until_promotion() {
 }
 
 #[test]
+fn same_generation_append_advances_index_monotonically_and_rolls_back_regressions() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.db");
+    let source_key = opaque(101);
+    let mut store = StateStore::open(&path).unwrap();
+    let initial_cursor = cursor(&source_key, 1, 100);
+    let initial_index = index_record(&source_key, 1, 101);
+    store.begin_or_resume_candidate(&initial_cursor).unwrap();
+    store
+        .commit_candidate_batch(&SessionBatch {
+            cursor: Some(initial_cursor),
+            index_records: vec![initial_index.clone()],
+            ..SessionBatch::default()
+        })
+        .unwrap();
+    store.promote_candidate(&source_key, 1, NOW).unwrap();
+
+    let mut appended_cursor = cursor(&source_key, 1, 200);
+    appended_cursor.generation_state = SessionGenerationState::Current;
+    appended_cursor.modified_at = "2026-07-26T00:01:00Z".to_owned();
+    appended_cursor.result_changed_at = Some("2026-07-26T00:01:00Z".to_owned());
+    let mut appended_index = initial_index.clone();
+    appended_index.last_active_at = "2026-07-26T00:01:00Z".to_owned();
+    appended_index.message_count = 5;
+    appended_index.usage_event_count = 2;
+    store
+        .commit_session_batch(&SessionBatch {
+            cursor: Some(appended_cursor.clone()),
+            index_records: vec![appended_index.clone()],
+            ..SessionBatch::default()
+        })
+        .unwrap();
+    assert_eq!(
+        store
+            .load_current_session_index_page(&source_key, None, 200)
+            .unwrap()
+            .items,
+        [appended_index]
+    );
+
+    let mut later_cursor = cursor(&source_key, 1, 300);
+    later_cursor.generation_state = SessionGenerationState::Current;
+    later_cursor.modified_at = "2026-07-26T00:02:00Z".to_owned();
+    later_cursor.result_changed_at = Some("2026-07-26T00:02:00Z".to_owned());
+    let mut regressive_index = initial_index;
+    regressive_index.last_active_at = "2026-07-26T00:02:00Z".to_owned();
+    regressive_index.message_count = 4;
+    regressive_index.usage_event_count = 3;
+    assert!(matches!(
+        store
+            .commit_session_batch(&SessionBatch {
+                cursor: Some(later_cursor),
+                index_records: vec![regressive_index],
+                ..SessionBatch::default()
+            })
+            .unwrap_err(),
+        StorageError::StableRecordConflict { .. } | StorageError::InvalidStateRecord { .. }
+    ));
+    drop(store);
+
+    let connection = Connection::open(path).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT complete_byte_offset FROM session_scan_cursors
+                 WHERE source_key = ?1 AND generation = 1",
+                [&source_key],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        200
+    );
+}
+
+#[test]
+fn current_cursor_rejects_invariant_changes_and_regressive_file_metadata() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.db");
+    let source_key = opaque(109);
+    let mut store = StateStore::open(&path).unwrap();
+    let staging = cursor(&source_key, 1, 100);
+    store.begin_or_resume_candidate(&staging).unwrap();
+    store
+        .commit_candidate_batch(&SessionBatch {
+            cursor: Some(staging.clone()),
+            ..SessionBatch::default()
+        })
+        .unwrap();
+    store.promote_candidate(&source_key, 1, NOW).unwrap();
+    let mut expected = staging;
+    expected.generation_state = SessionGenerationState::Current;
+
+    let mut changed_lineage = expected.clone();
+    changed_lineage.parent_generation = Some(5);
+    assert!(matches!(
+        store
+            .commit_session_batch(&SessionBatch {
+                cursor: Some(changed_lineage),
+                ..SessionBatch::default()
+            })
+            .unwrap_err(),
+        StorageError::StableRecordConflict { .. } | StorageError::InvalidStateRecord { .. }
+    ));
+
+    let mut regressive_size = expected.clone();
+    regressive_size.observed_size -= 1;
+    assert!(matches!(
+        store
+            .commit_session_batch(&SessionBatch {
+                cursor: Some(regressive_size),
+                ..SessionBatch::default()
+            })
+            .unwrap_err(),
+        StorageError::StableRecordConflict { .. }
+    ));
+
+    let mut cleared_result = expected.clone();
+    cleared_result.result_code = None;
+    cleared_result.result_changed_at = None;
+    assert!(matches!(
+        store
+            .commit_session_batch(&SessionBatch {
+                cursor: Some(cleared_result),
+                ..SessionBatch::default()
+            })
+            .unwrap_err(),
+        StorageError::StableRecordConflict { .. }
+    ));
+    assert_eq!(
+        store.load_current_session_scan_cursor(&source_key).unwrap(),
+        Some(expected)
+    );
+}
+
+#[test]
+fn staging_resume_rejects_changed_parent_lineage_and_replay_anchor() {
+    let directory = tempfile::tempdir().unwrap();
+    let source_key = opaque(102);
+    let mut store = StateStore::open(directory.path().join("state.db")).unwrap();
+    let initial = cursor(&source_key, 1, 100);
+    store.begin_or_resume_candidate(&initial).unwrap();
+
+    let mut changed_parent = initial.clone();
+    changed_parent.parent_source_key = Some(opaque(103));
+    changed_parent.parser_checkpoint.lineage_source_key = Some(opaque(103));
+    assert_eq!(
+        store.begin_or_resume_candidate(&changed_parent).unwrap(),
+        CandidateBeginOutcome::CleanupRequired { generation: 1 }
+    );
+
+    let mut changed_generation = initial.clone();
+    changed_generation.parent_generation = Some(5);
+    changed_generation.parser_checkpoint.lineage_generation = Some(5);
+    assert_eq!(
+        store
+            .begin_or_resume_candidate(&changed_generation)
+            .unwrap(),
+        CandidateBeginOutcome::CleanupRequired { generation: 1 }
+    );
+
+    let mut changed_anchor = initial;
+    changed_anchor.replay_boundary_fingerprint = Some([0x44; 32]);
+    assert_eq!(
+        store.begin_or_resume_candidate(&changed_anchor).unwrap(),
+        CandidateBeginOutcome::CleanupRequired { generation: 1 }
+    );
+}
+
+#[test]
+fn promoted_cursor_reloads_completely_after_reopen() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.db");
+    let source_key = opaque(104);
+    let expected = cursor(&source_key, 1, 321);
+    let mut store = StateStore::open(&path).unwrap();
+    store.begin_or_resume_candidate(&expected).unwrap();
+    store
+        .commit_candidate_batch(&SessionBatch {
+            cursor: Some(expected.clone()),
+            ..SessionBatch::default()
+        })
+        .unwrap();
+    store.promote_candidate(&source_key, 1, NOW).unwrap();
+    drop(store);
+
+    let store = StateStore::open(path).unwrap();
+    let mut expected = expected;
+    expected.generation_state = SessionGenerationState::Current;
+    assert_eq!(
+        store.load_current_session_scan_cursor(&source_key).unwrap(),
+        Some(expected)
+    );
+}
+
+#[test]
 fn invalid_candidate_row_rolls_back_cursor_and_every_record() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("state.db");
@@ -827,6 +1051,86 @@ fn failed_multibatch_candidate_stays_hidden_and_bounded_cleanup_preserves_curren
 }
 
 #[test]
+fn faults_after_each_of_three_candidate_batches_never_change_current_visibility() {
+    for failure_after_batch in 1..=3_u64 {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.db");
+        let source_key = opaque(600 + failure_after_batch);
+        let mut store = StateStore::open(&path).unwrap();
+        promote_one_record(&mut store, &source_key, 1, 6000);
+        let initial = cursor(&source_key, 2, 0);
+        store.begin_or_resume_candidate(&initial).unwrap();
+
+        let candidate_batches = (1..=3_u64)
+            .map(|batch_number| {
+                (
+                    cursor(&source_key, 2, batch_number * 100),
+                    index_record(&source_key, 2, 6100 + batch_number),
+                )
+            })
+            .collect::<Vec<_>>();
+        for (batch_cursor, batch_index) in candidate_batches
+            .into_iter()
+            .take(failure_after_batch as usize)
+        {
+            store
+                .commit_candidate_batch(&SessionBatch {
+                    cursor: Some(batch_cursor),
+                    index_records: vec![batch_index],
+                    ..SessionBatch::default()
+                })
+                .unwrap();
+        }
+        drop(store);
+
+        let mut store = StateStore::open(&path).unwrap();
+        assert_eq!(
+            store
+                .load_current_session_index_page(&source_key, None, 200)
+                .unwrap()
+                .items,
+            [index_record(&source_key, 1, 6000)]
+        );
+        let persisted = cursor(&source_key, 2, failure_after_batch * 100);
+        assert_eq!(
+            store.begin_or_resume_candidate(&persisted).unwrap(),
+            CandidateBeginOutcome::Resumed(Box::new(persisted.clone()))
+        );
+
+        if failure_after_batch == 3 {
+            let mut invalid_final = index_record(&source_key, 2, 6200);
+            invalid_final.message_count = 2;
+            let mut prior = invalid_final.clone();
+            prior.message_count = 3;
+            store
+                .commit_candidate_batch(&SessionBatch {
+                    cursor: Some(persisted.clone()),
+                    index_records: vec![prior],
+                    ..SessionBatch::default()
+                })
+                .unwrap();
+            assert!(matches!(
+                store
+                    .commit_candidate_batch(&SessionBatch {
+                        cursor: Some(cursor(&source_key, 2, 400)),
+                        index_records: vec![invalid_final],
+                        ..SessionBatch::default()
+                    })
+                    .unwrap_err(),
+                StorageError::StableRecordConflict { .. }
+            ));
+            assert_eq!(
+                store
+                    .load_current_session_index_page(&source_key, None, 200)
+                    .unwrap()
+                    .items,
+                [index_record(&source_key, 1, 6000)]
+            );
+        }
+    }
+}
+
+#[test]
 fn successful_multibatch_candidate_promotes_with_one_pointer_flip() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("state.db");
@@ -888,6 +1192,95 @@ fn successful_multibatch_candidate_promotes_with_one_pointer_flip() {
             )
             .unwrap(),
         (MAX_SESSION_BATCH_ROWS + 1) as i64
+    );
+}
+
+#[test]
+fn bounded_source_and_global_current_pages_restore_only_visible_generations() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = StateStore::open(directory.path().join("state.db")).unwrap();
+    let first_source = opaque(106);
+    let second_source = opaque(107);
+    for (source_key, session_value, usage_value) in [
+        (&first_source, 1060_u64, 2060_u64),
+        (&second_source, 1070, 2070),
+    ] {
+        let generation_cursor = cursor(source_key, 1, 100);
+        store.begin_or_resume_candidate(&generation_cursor).unwrap();
+        store
+            .commit_candidate_batch(&SessionBatch {
+                cursor: Some(generation_cursor),
+                index_records: vec![index_record(source_key, 1, session_value)],
+                usage_records: vec![usage_record(source_key, 1, session_value, usage_value, 1)],
+                ..SessionBatch::default()
+            })
+            .unwrap();
+        store.promote_candidate(source_key, 1, NOW).unwrap();
+    }
+
+    let first_source_page = store.load_session_sources_page(None, 1).unwrap();
+    assert_eq!(first_source_page.items.len(), 1);
+    let second_source_page = store
+        .load_session_sources_page(first_source_page.next_page_key.as_ref(), 1)
+        .unwrap();
+    assert_eq!(second_source_page.items.len(), 1);
+    assert_eq!(second_source_page.next_page_key, None);
+    assert!(matches!(
+        store.load_session_sources_page(None, 513).unwrap_err(),
+        StorageError::InvalidStateRecord { .. }
+    ));
+
+    let global_index = store
+        .load_global_current_session_index_page(None, 200)
+        .unwrap();
+    assert_eq!(global_index.items.len(), 2);
+    assert!(
+        global_index
+            .items
+            .iter()
+            .all(|record| record.generation == 1)
+    );
+    let global_usage = store
+        .load_global_current_session_usage_page(None, 500)
+        .unwrap();
+    assert_eq!(global_usage.items.len(), 2);
+    assert!(
+        global_usage
+            .items
+            .iter()
+            .all(|record| record.generation == 1)
+    );
+
+    let replacement_cursor = cursor(&first_source, 2, 200);
+    store
+        .begin_or_resume_candidate(&replacement_cursor)
+        .unwrap();
+    store
+        .commit_candidate_batch(&SessionBatch {
+            cursor: Some(replacement_cursor),
+            index_records: vec![index_record(&first_source, 2, 1080)],
+            usage_records: vec![usage_record(&first_source, 2, 1080, 2080, 1)],
+            ..SessionBatch::default()
+        })
+        .unwrap();
+    store
+        .promote_candidate(&first_source, 2, "2026-07-26T00:03:00Z")
+        .unwrap();
+
+    let global_index = store
+        .load_global_current_session_index_page(None, 200)
+        .unwrap();
+    assert_eq!(global_index.items.len(), 2);
+    assert!(global_index.items.iter().any(|record| {
+        record.source_key == first_source
+            && record.generation == 2
+            && record.session_key == opaque(1080)
+    }));
+    assert!(
+        !global_index
+            .items
+            .iter()
+            .any(|record| record.source_key == first_source && record.generation == 1)
     );
 }
 
@@ -997,7 +1390,7 @@ fn repeated_unchanged_success_and_identical_failure_are_zero_write() {
 
     assert!(
         !store
-            .record_source_success(&source_key, "2026-07-26T00:10:00Z")
+            .record_source_success(&source_key, 1, "2026-07-26T00:10:00Z")
             .unwrap()
     );
     assert_eq!(store.wal_size_bytes().unwrap(), wal_after_promotion);
@@ -1029,6 +1422,37 @@ fn repeated_unchanged_success_and_identical_failure_are_zero_write() {
             .unwrap()
             .items,
         [index_record(&source_key, 1, 9000)]
+    );
+}
+
+#[test]
+fn stale_source_state_update_cannot_overwrite_a_new_current_generation() {
+    let directory = tempfile::tempdir().unwrap();
+    let source_key = opaque(105);
+    let mut store = StateStore::open(directory.path().join("state.db")).unwrap();
+    promote_one_record(&mut store, &source_key, 1, 1050);
+    promote_one_record(&mut store, &source_key, 2, 1051);
+    store
+        .fail_candidate(
+            &source_key,
+            2,
+            SessionSourceErrorCode::SourceIoFailed,
+            "2026-07-26T00:01:00Z",
+        )
+        .unwrap();
+
+    assert!(matches!(
+        store
+            .record_source_success(&source_key, 1, "2026-07-26T00:02:00Z")
+            .unwrap_err(),
+        StorageError::CandidateStateConflict
+    ));
+    let source = store.load_session_source(&source_key).unwrap().unwrap();
+    assert_eq!(source.current_generation, Some(2));
+    assert_eq!(source.status, SessionSourceStatus::Stale);
+    assert_eq!(
+        source.error_code,
+        Some(SessionSourceErrorCode::SourceIoFailed)
     );
 }
 
@@ -1140,6 +1564,47 @@ fn supplemental_batch_is_bounded_atomic_retained_and_drops_under_pressure() {
 }
 
 #[test]
+fn session_batch_supplemental_path_cannot_bypass_global_capacity() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.db");
+    let mut store = StateStore::open(&path).unwrap();
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "WITH RECURSIVE ids(value) AS (
+                VALUES(1)
+                UNION ALL
+                SELECT value + 1 FROM ids WHERE value < ?1
+             )
+             INSERT INTO request_supplemental_metadata(
+                request_id, attempt_id, trace_id, occurred_at, route_fingerprint,
+                provider_fingerprint, account_fingerprint, retry_decision, failover_decision,
+                queue_ms, connect_ms, first_byte_ms, total_ms, request_bytes, response_bytes,
+                status_code, error_code, logical_bytes
+             )
+             SELECT printf('capacity-%d', value), 'attempt-1', 'trace-1',
+                    ?2, ?3, ?4, NULL, 'none', 'none',
+                    0, 0, 0, 0, 0, 0, NULL, NULL, 256
+             FROM ids",
+            params![MAX_SUPPLEMENTAL_ROWS as i64, NOW, opaque(401), opaque(402)],
+        )
+        .unwrap();
+    drop(connection);
+
+    store
+        .commit_session_batch(&SessionBatch {
+            supplemental_metadata: vec![supplemental("capacity-bypass")],
+            ..SessionBatch::default()
+        })
+        .unwrap();
+
+    assert_eq!(
+        store.inspect_request_supplemental().unwrap().rows,
+        MAX_SUPPLEMENTAL_ROWS
+    );
+}
+
+#[test]
 fn replay_rollout_hard_limit_rejects_one_more_signature() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("state.db");
@@ -1219,7 +1684,7 @@ fn supplemental_row_and_batch_byte_limits_roll_back_atomically() {
     );
 
     let mut invalid = supplemental("invalid");
-    invalid.trace_id = "t".repeat(257);
+    invalid.occurred_at = "not-a-timestamp".to_owned();
     assert!(matches!(
         store
             .record_request_supplemental_batch(&[supplemental("atomic"), invalid])
@@ -1228,7 +1693,7 @@ fn supplemental_row_and_batch_byte_limits_roll_back_atomically() {
     ));
     assert_eq!(store.inspect_request_supplemental().unwrap().rows, 1);
 
-    let oversized = (2..302).map(dense_supplemental).collect::<Vec<_>>();
+    let oversized = (2..452).map(dense_supplemental).collect::<Vec<_>>();
     assert!(matches!(
         store
             .record_request_supplemental_batch(&oversized)
@@ -1236,6 +1701,61 @@ fn supplemental_row_and_batch_byte_limits_roll_back_atomically() {
         StorageError::SessionBatchLimitExceeded
     ));
     assert_eq!(store.inspect_request_supplemental().unwrap().rows, 1);
+}
+
+#[test]
+fn timestamps_require_one_canonical_utc_second_representation() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = StateStore::open(directory.path().join("state.db")).unwrap();
+    for (offset, invalid_timestamp) in [
+        "2026-7-26T00:00:00Z",
+        "2026-07-26T00:00:00+00:00",
+        "2026-02-30T00:00:00Z",
+        "2026-07-26T24:00:00Z",
+        "2026-07-26T00:00:00.000Z",
+        "C:\\sessionsT00:00:00Z",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let source_key = opaque(500 + offset as u64);
+        let mut invalid = cursor(&source_key, 1, 0);
+        invalid.modified_at = invalid_timestamp.to_owned();
+        assert!(
+            matches!(
+                store.begin_or_resume_candidate(&invalid).unwrap_err(),
+                StorageError::InvalidStateRecord { .. }
+            ),
+            "{invalid_timestamp}"
+        );
+    }
+}
+
+#[test]
+fn persistent_identity_decision_code_and_http_status_fields_are_constrained() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = StateStore::open(directory.path().join("state.db")).unwrap();
+    assert!(SessionFileIdentity::new("C:relative-session").is_err());
+    assert!(RequestId::new("C:\\private\\request").is_err());
+    assert!(SupplementalErrorCode::new("arbitrary error text").is_err());
+
+    for (offset, mutate) in [(3_u64, "low-status"), (4, "high-status")] {
+        let mut invalid = supplemental(&format!("typed-{offset}"));
+        match mutate {
+            "low-status" => invalid.status_code = Some(99),
+            "high-status" => invalid.status_code = Some(600),
+            _ => unreachable!(),
+        }
+        assert!(
+            matches!(
+                store
+                    .record_request_supplemental_batch(&[invalid])
+                    .unwrap_err(),
+                StorageError::InvalidStateRecord { .. }
+            ),
+            "{mutate}"
+        );
+    }
 }
 
 #[test]
@@ -1253,7 +1773,7 @@ fn restart_identity_mismatch_and_single_retired_slot_require_bounded_cleanup() {
         })
         .unwrap();
     let mut changed_identity = cursor(&source_key, 1, 0);
-    changed_identity.file_identity = "volume-1:file-replaced".to_owned();
+    changed_identity.file_identity = SessionFileIdentity::new(opaque(401)).unwrap();
     assert_eq!(
         store.begin_or_resume_candidate(&changed_identity).unwrap(),
         CandidateBeginOutcome::CleanupRequired { generation: 1 }
@@ -1304,6 +1824,48 @@ fn restart_identity_mismatch_and_single_retired_slot_require_bounded_cleanup() {
             .begin_or_resume_candidate(&cursor(&source_key, 3, 0))
             .unwrap(),
         CandidateBeginOutcome::Started
+    );
+}
+
+#[test]
+fn generation_cleanup_accounts_for_unicode_in_utf8_bytes() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.db");
+    let source_key = opaque(108);
+    let mut store = StateStore::open(&path).unwrap();
+    let first_cursor = cursor(&source_key, 1, 100);
+    let mut unicode_usage = usage_record(&source_key, 1, 1080, 2080, 1);
+    unicode_usage.model = "界".repeat(10);
+    store.begin_or_resume_candidate(&first_cursor).unwrap();
+    store
+        .commit_candidate_batch(&SessionBatch {
+            cursor: Some(first_cursor),
+            usage_records: vec![unicode_usage],
+            ..SessionBatch::default()
+        })
+        .unwrap();
+    store.promote_candidate(&source_key, 1, NOW).unwrap();
+    promote_one_record(&mut store, &source_key, 2, 1081);
+
+    let cleanup = store
+        .cleanup_generation_batch(&source_key, 1, MAX_SESSION_BATCH_ROWS, 290)
+        .unwrap();
+    assert_eq!(cleanup.deleted_rows, 0);
+    assert_eq!(cleanup.deleted_bytes, 0);
+    assert!(!cleanup.complete);
+    drop(store);
+
+    assert_eq!(
+        Connection::open(path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM session_usage_records
+                 WHERE source_key = ?1 AND generation = 1",
+                [&source_key],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
     );
 }
 

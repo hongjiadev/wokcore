@@ -5,7 +5,13 @@ CREATE TABLE session_sources(
     staging_generation INTEGER CHECK(staging_generation > 0),
     retired_generation INTEGER CHECK(retired_generation > 0),
     status TEXT NOT NULL CHECK(status IN ('undiscovered', 'available', 'stale', 'unavailable', 'resource_limited')),
-    error_code TEXT,
+    error_code TEXT CHECK(error_code IS NULL OR error_code IN (
+        'source_root_missing', 'source_root_unreadable', 'source_sessions_absent',
+        'source_entry_unsafe', 'source_io_failed', 'source_parse_invalid',
+        'source_record_too_large', 'source_replay_parent_missing',
+        'source_replay_parent_ambiguous', 'source_replay_inconsistent',
+        'source_replay_limit', 'source_candidate_interrupted'
+    )),
     last_transition_at TEXT,
     CHECK(current_generation IS NULL OR current_generation != staging_generation),
     CHECK(current_generation IS NULL OR current_generation != retired_generation),
@@ -16,7 +22,10 @@ CREATE TABLE session_scan_cursors(
     generation INTEGER NOT NULL CHECK(generation > 0),
     source_kind TEXT NOT NULL CHECK(source_kind IN ('codex', 'claude', 'gemini')),
     generation_state TEXT NOT NULL CHECK(generation_state IN ('staging', 'current', 'retired')),
-    file_identity TEXT NOT NULL,
+    file_identity TEXT NOT NULL CHECK(
+        length(file_identity) = 64
+        AND file_identity NOT GLOB '*[^0-9a-f]*'
+    ),
     observed_size INTEGER NOT NULL CHECK(observed_size >= 0),
     modified_at TEXT NOT NULL,
     complete_byte_offset INTEGER NOT NULL CHECK(complete_byte_offset >= 0),
@@ -27,7 +36,7 @@ CREATE TABLE session_scan_cursors(
     parent_source_key TEXT,
     parent_generation INTEGER CHECK(parent_generation > 0),
     replay_boundary_fingerprint BLOB CHECK(length(replay_boundary_fingerprint) = 32),
-    result_code TEXT,
+    result_code TEXT CHECK(result_code IS NULL OR result_code IN ('advanced', 'unchanged', 'deferred')),
     result_changed_at TEXT,
     PRIMARY KEY(source_key, generation),
     FOREIGN KEY(source_key) REFERENCES session_sources(source_key) ON DELETE CASCADE,
@@ -47,7 +56,10 @@ CREATE TABLE session_index(
     PRIMARY KEY(source_key, generation, session_key),
     FOREIGN KEY(source_key, generation) REFERENCES session_scan_cursors(source_key, generation) ON DELETE CASCADE
 );
-CREATE INDEX session_index_order ON session_index(last_active_at DESC, session_key);
+CREATE INDEX session_index_current_order
+ON session_index(source_key, generation, last_active_at DESC, session_key);
+CREATE INDEX session_index_global_current_order
+ON session_index(last_active_at DESC, session_key, source_key, generation);
 CREATE TABLE session_usage_records(
     usage_id TEXT NOT NULL,
     session_key TEXT NOT NULL,
@@ -65,7 +77,10 @@ CREATE TABLE session_usage_records(
     PRIMARY KEY(source_key, generation, usage_id),
     FOREIGN KEY(source_key, generation) REFERENCES session_scan_cursors(source_key, generation) ON DELETE CASCADE
 );
-CREATE INDEX session_usage_order ON session_usage_records(occurred_at, usage_id);
+CREATE INDEX session_usage_current_order
+ON session_usage_records(source_key, generation, occurred_at, usage_id);
+CREATE INDEX session_usage_global_current_order
+ON session_usage_records(occurred_at, usage_id, source_key, generation);
 CREATE TABLE codex_replay_signatures(
     parent_source_key TEXT NOT NULL,
     parent_generation INTEGER NOT NULL CHECK(parent_generation > 0),
@@ -75,24 +90,51 @@ CREATE TABLE codex_replay_signatures(
     PRIMARY KEY(parent_source_key, parent_generation, token_event_ordinal),
     FOREIGN KEY(parent_source_key, parent_generation) REFERENCES session_scan_cursors(source_key, generation) ON DELETE CASCADE
 );
+CREATE INDEX codex_replay_current_order
+ON codex_replay_signatures(parent_source_key, parent_generation, token_event_ordinal);
 CREATE TABLE request_supplemental_metadata(
-    request_id TEXT NOT NULL,
-    attempt_id TEXT NOT NULL,
-    trace_id TEXT NOT NULL,
+    request_id TEXT NOT NULL CHECK(
+        length(request_id) BETWEEN 1 AND 256
+        AND request_id NOT GLOB '*[^A-Za-z0-9_.-]*'
+    ),
+    attempt_id TEXT NOT NULL CHECK(
+        length(attempt_id) BETWEEN 1 AND 256
+        AND attempt_id NOT GLOB '*[^A-Za-z0-9_.-]*'
+    ),
+    trace_id TEXT NOT NULL CHECK(
+        length(trace_id) BETWEEN 1 AND 256
+        AND trace_id NOT GLOB '*[^A-Za-z0-9_.-]*'
+    ),
     occurred_at TEXT NOT NULL,
-    route_fingerprint TEXT NOT NULL,
-    provider_fingerprint TEXT NOT NULL,
-    account_fingerprint TEXT,
-    retry_decision TEXT NOT NULL,
-    failover_decision TEXT NOT NULL,
+    route_fingerprint TEXT NOT NULL CHECK(
+        length(route_fingerprint) = 64
+        AND route_fingerprint NOT GLOB '*[^0-9a-f]*'
+    ),
+    provider_fingerprint TEXT NOT NULL CHECK(
+        length(provider_fingerprint) = 64
+        AND provider_fingerprint NOT GLOB '*[^0-9a-f]*'
+    ),
+    account_fingerprint TEXT CHECK(
+        account_fingerprint IS NULL OR (
+            length(account_fingerprint) = 64
+            AND account_fingerprint NOT GLOB '*[^0-9a-f]*'
+        )
+    ),
+    retry_decision TEXT NOT NULL CHECK(retry_decision IN ('none', 'retry', 'exhausted')),
+    failover_decision TEXT NOT NULL CHECK(failover_decision IN ('none', 'failover', 'unavailable')),
     queue_ms INTEGER NOT NULL CHECK(queue_ms >= 0),
     connect_ms INTEGER NOT NULL CHECK(connect_ms >= 0),
     first_byte_ms INTEGER NOT NULL CHECK(first_byte_ms >= 0),
     total_ms INTEGER NOT NULL CHECK(total_ms >= 0),
     request_bytes INTEGER NOT NULL CHECK(request_bytes >= 0),
     response_bytes INTEGER NOT NULL CHECK(response_bytes >= 0),
-    status_code INTEGER,
-    error_code TEXT,
+    status_code INTEGER CHECK(status_code IS NULL OR status_code BETWEEN 100 AND 599),
+    error_code TEXT CHECK(
+        error_code IS NULL OR (
+            length(error_code) BETWEEN 1 AND 128
+            AND error_code NOT GLOB '*[^a-z0-9_]*'
+        )
+    ),
     logical_bytes INTEGER NOT NULL CHECK(logical_bytes >= 0 AND logical_bytes <= 2048),
     PRIMARY KEY(request_id, attempt_id)
 );
