@@ -1,11 +1,15 @@
 use std::{fs, path::Path, time::SystemTime};
 
 use serde_json::{Value, json};
-use tempfile::{TempDir, tempdir};
+use tempfile::TempDir;
 use uuid::Uuid;
 use wokcore_platform::{
     AppPaths, DiscoveryRecord, DiscoveryStore, MAX_DISCOVERY_BYTES, PlatformError, RuntimeLease,
 };
+
+mod support;
+
+use support::private_tempdir;
 
 #[test]
 fn discovery_round_trips_exactly_the_five_public_fields() {
@@ -484,7 +488,7 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let directory = tempdir().unwrap();
+        let directory = private_tempdir();
         let paths = test_paths(directory.path());
         let lease = RuntimeLease::acquire(&paths).unwrap();
         let store = DiscoveryStore::new(&paths).unwrap();

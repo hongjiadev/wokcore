@@ -7,12 +7,28 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tempfile::tempdir;
 use wokcore_platform::{AppPaths, PlatformError, RuntimeLease};
+
+mod support;
+
+use support::private_tempdir;
+
+#[cfg(unix)]
+#[test]
+fn private_tempdir_has_exact_owner_only_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = private_tempdir();
+
+    assert_eq!(
+        directory.path().metadata().unwrap().permissions().mode() & 0o7777,
+        0o700
+    );
+}
 
 #[test]
 fn simultaneous_acquisitions_produce_one_owner_and_one_already_running() {
-    let directory = tempdir().unwrap();
+    let directory = private_tempdir();
     let paths = test_paths(directory.path());
     let start = Arc::new(Barrier::new(3));
     let (sender, receiver) = mpsc::channel();
@@ -47,7 +63,7 @@ fn simultaneous_acquisitions_produce_one_owner_and_one_already_running() {
 
 #[test]
 fn existing_only_acquisition_never_creates_runtime_state() {
-    let directory = tempdir().unwrap();
+    let directory = private_tempdir();
     let paths = test_paths(&directory.path().join("missing"));
 
     assert!(matches!(
@@ -60,7 +76,7 @@ fn existing_only_acquisition_never_creates_runtime_state() {
 
 #[test]
 fn existing_only_acquisition_is_byte_and_mtime_read_only() {
-    let directory = tempdir().unwrap();
+    let directory = private_tempdir();
     let paths = test_paths(directory.path());
     drop(RuntimeLease::acquire(&paths).unwrap());
     let before = tree_snapshot(directory.path());
@@ -72,7 +88,7 @@ fn existing_only_acquisition_is_byte_and_mtime_read_only() {
 
 #[test]
 fn existing_only_acquisition_observes_the_current_owner() {
-    let directory = tempdir().unwrap();
+    let directory = private_tempdir();
     let paths = test_paths(directory.path());
     let owner = RuntimeLease::acquire(&paths).unwrap();
 
@@ -87,7 +103,7 @@ fn existing_only_acquisition_observes_the_current_owner() {
 #[cfg(windows)]
 #[test]
 fn existing_only_lease_prevents_replacing_its_windows_lock_file() {
-    let directory = tempdir().unwrap();
+    let directory = private_tempdir();
     let paths = test_paths(directory.path());
     drop(RuntimeLease::acquire(&paths).unwrap());
     let lease = RuntimeLease::acquire_existing(&paths).unwrap();
@@ -100,7 +116,7 @@ fn existing_only_lease_prevents_replacing_its_windows_lock_file() {
 
 #[test]
 fn separate_processes_contend_for_the_same_operating_system_lock() {
-    let directory = tempdir().unwrap();
+    let directory = private_tempdir();
     let paths = test_paths(directory.path());
     let ready = directory.path().join("holder-ready");
     let release = directory.path().join("release-holder");
@@ -142,7 +158,7 @@ fn cross_process_lease_holder_helper() {
 #[cfg(unix)]
 #[test]
 fn exec_child_does_not_extend_the_runtime_lease_lifetime() {
-    let directory = tempdir().unwrap();
+    let directory = private_tempdir();
     let paths = test_paths(directory.path());
     let owner = RuntimeLease::acquire(&paths).unwrap();
     let ready = directory.path().join("exec-child-ready");
@@ -172,7 +188,7 @@ fn exec_child_does_not_extend_the_runtime_lease_lifetime() {
 fn replacing_the_runtime_directory_path_does_not_create_a_second_lock_domain() {
     use std::os::unix::fs::PermissionsExt;
 
-    let directory = tempdir().unwrap();
+    let directory = private_tempdir();
     let paths = test_paths(directory.path());
     let moved_runtime = directory.path().join("original-runtime");
     let owner = RuntimeLease::acquire(&paths).unwrap();
@@ -193,7 +209,7 @@ fn replacing_the_runtime_directory_path_does_not_create_a_second_lock_domain() {
 fn namespace_lock_is_a_fixed_owner_only_file_in_the_secure_runtime_parent() {
     use std::os::unix::fs::PermissionsExt;
 
-    let directory = tempdir().unwrap();
+    let directory = private_tempdir();
     let paths = test_paths(directory.path());
     let namespace_lock = directory.path().join(".wokcore-runtime-namespace.lock");
     let owner = RuntimeLease::acquire(&paths).unwrap();
@@ -210,7 +226,7 @@ fn namespace_lock_is_a_fixed_owner_only_file_in_the_secure_runtime_parent() {
 fn runtime_parent_must_be_private_to_the_current_user() {
     use std::os::unix::fs::PermissionsExt;
 
-    let directory = tempdir().unwrap();
+    let directory = private_tempdir();
     let paths = test_paths(directory.path());
     fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o755)).unwrap();
 
@@ -223,7 +239,7 @@ fn runtime_parent_must_be_private_to_the_current_user() {
 #[cfg(unix)]
 #[test]
 fn different_runtime_parents_have_independent_lock_domains() {
-    let directory = tempdir().unwrap();
+    let directory = private_tempdir();
     let first = RuntimeLease::acquire(&test_paths(&directory.path().join("first"))).unwrap();
     let second = RuntimeLease::acquire(&test_paths(&directory.path().join("second"))).unwrap();
 
@@ -242,7 +258,7 @@ fn exec_waiting_child_helper() {
 
 #[test]
 fn dropping_the_owner_releases_the_operating_system_lock() {
-    let directory = tempdir().unwrap();
+    let directory = private_tempdir();
     let paths = test_paths(directory.path());
     let owner = RuntimeLease::acquire(&paths).unwrap();
 
@@ -259,7 +275,7 @@ fn dropping_the_owner_releases_the_operating_system_lock() {
 
 #[test]
 fn stale_lock_file_contents_do_not_claim_or_grant_ownership() {
-    let directory = tempdir().unwrap();
+    let directory = private_tempdir();
     let paths = test_paths(directory.path());
     drop(RuntimeLease::acquire(&paths).unwrap());
     fs::write(&paths.instance_lock, b"stale-pid-that-is-not-ownership").unwrap();
@@ -279,7 +295,7 @@ fn stale_lock_file_contents_do_not_claim_or_grant_ownership() {
 
 #[test]
 fn existing_lock_symlink_or_reparse_target_fails_closed() {
-    let directory = tempdir().unwrap();
+    let directory = private_tempdir();
     let paths = test_paths(directory.path());
     drop(RuntimeLease::acquire(&paths).unwrap());
     let moved_lock = paths.runtime_dir.join("moved-instance.lock");
@@ -294,7 +310,7 @@ fn existing_lock_symlink_or_reparse_target_fails_closed() {
 
 #[test]
 fn runtime_acquisition_rejects_a_non_directory_target() {
-    let directory = tempdir().unwrap();
+    let directory = private_tempdir();
     let paths = test_paths(directory.path());
     fs::write(&paths.runtime_dir, b"not a directory").unwrap();
 
@@ -306,7 +322,7 @@ fn runtime_acquisition_rejects_a_non_directory_target() {
 
 #[test]
 fn runtime_acquisition_rejects_a_symlink_or_reparse_target() {
-    let directory = tempdir().unwrap();
+    let directory = private_tempdir();
     let paths = test_paths(directory.path());
     let target = directory.path().join("runtime-target");
     fs::create_dir(&target).unwrap();
@@ -320,7 +336,7 @@ fn runtime_acquisition_rejects_a_symlink_or_reparse_target() {
 
 #[test]
 fn runtime_acquisition_touches_only_the_runtime_directory_and_lock() {
-    let directory = tempdir().unwrap();
+    let directory = private_tempdir();
     let paths = test_paths(directory.path());
     let owner = RuntimeLease::acquire(&paths).unwrap();
 
@@ -351,7 +367,7 @@ fn runtime_acquisition_touches_only_the_runtime_directory_and_lock() {
 fn unix_runtime_and_lock_have_owner_only_modes() {
     use std::os::unix::fs::PermissionsExt;
 
-    let directory = tempdir().unwrap();
+    let directory = private_tempdir();
     let paths = test_paths(directory.path());
     let owner = RuntimeLease::acquire(&paths).unwrap();
 
@@ -377,7 +393,7 @@ fn unix_runtime_and_lock_have_owner_only_modes() {
 #[cfg(windows)]
 #[test]
 fn windows_runtime_and_lock_use_protected_current_user_only_dacls() {
-    let directory = tempdir().unwrap();
+    let directory = private_tempdir();
     let paths = test_paths(directory.path());
     let owner = RuntimeLease::acquire(&paths).unwrap();
 
