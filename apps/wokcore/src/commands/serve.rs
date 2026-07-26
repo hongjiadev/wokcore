@@ -127,31 +127,34 @@ async fn run_service_owned(
         }
     }
 
-    let running = owner
-        .running
-        .take()
-        .expect("started service retains its listener owner");
-    let mut wait = Box::pin(running.wait());
-    let server_result = tokio::select! {
-        result = &mut wait => result,
-        changed = cancelled.changed() => {
-            if changed.is_ok() && *cancelled.borrow() {
-                started.shutdown.request();
+    let server_result = {
+        let Some(running) = owner.running.as_mut() else {
+            let _ = owner.cleanup().await;
+            return Err(ServeError::Server);
+        };
+        let mut wait = Box::pin(running.wait_mut());
+        tokio::select! {
+            result = &mut wait => result,
+            changed = cancelled.changed() => {
+                if changed.is_ok() && *cancelled.borrow() {
+                    started.shutdown.request();
+                }
+                wait.await
             }
-            wait.await
-        }
-        () = dependencies.shutdown.wait() => {
-            let _ = started
-                .lifecycle
-                .begin_drain(dependencies.drain_timeout)
-                .await;
-            started.lifecycle.wait_for_zero_active().await;
-            let _ = started.lifecycle.request_stop();
-            started.shutdown.request();
-            wait.await
+            () = dependencies.shutdown.wait() => {
+                let _ = started
+                    .lifecycle
+                    .begin_drain(dependencies.drain_timeout)
+                    .await;
+                started.lifecycle.wait_for_zero_active().await;
+                let _ = started.lifecycle.request_stop();
+                started.shutdown.request();
+                wait.await
+            }
         }
     };
-    let cleanup_result = owner.remove_discovery();
+    owner.running.take();
+    let cleanup_result = owner.cleanup().await;
     server_result.map_err(|_| ServeError::Server)?;
     cleanup_result?;
     Ok(())
@@ -215,12 +218,13 @@ async fn start_service(
         clock: dependencies.clock.clone(),
         ids: dependencies.ids.clone(),
     });
-    let server_state = ServerState::new_with_token_metadata(
+    let server_state = ServerState::new_with_runtime_sources(
         authority,
         instance_id,
         Arc::new(auth),
         lifecycle.clone(),
         token_metadata,
+        dependencies.entropy.clone(),
     );
     let running = RunningServer::start(listener, server_state)
         .await
@@ -242,16 +246,12 @@ async fn start_service(
     ensure_not_cancelled(cancelled)?;
 
     owner.discovery = Some((discovery, instance_id));
+    let Some((discovery, _)) = owner.discovery.as_ref() else {
+        return Err(ServeError::Server);
+    };
     dependencies
         .discovery_publisher
-        .publish(
-            &owner
-                .discovery
-                .as_ref()
-                .expect("owned discovery is installed before publication")
-                .0,
-            &record,
-        )
+        .publish(discovery, &record)
         .map_err(ServeError::Platform)?;
     Ok(StartedService {
         ready: ReadyService {
@@ -286,11 +286,10 @@ impl OwnedServeTask {
     }
 
     async fn wait(&mut self) -> Result<(), ServeError> {
-        self.join
-            .take()
-            .expect("owned serve task is joined at most once")
-            .await
-            .map_err(|_| ServeError::Server)?
+        let Some(join) = self.join.take() else {
+            return Err(ServeError::Server);
+        };
+        join.await.map_err(|_| ServeError::Server)?
     }
 }
 
@@ -301,7 +300,7 @@ impl Drop for OwnedServeTask {
 }
 
 struct ServiceLifetime {
-    _lease: RuntimeLease,
+    lease: Option<RuntimeLease>,
     running: Option<RunningServer>,
     discovery: Option<(DiscoveryStore, uuid::Uuid)>,
 }
@@ -309,31 +308,93 @@ struct ServiceLifetime {
 impl ServiceLifetime {
     fn new(lease: RuntimeLease) -> Self {
         Self {
-            _lease: lease,
+            lease: Some(lease),
             running: None,
             discovery: None,
         }
     }
 
     async fn cleanup(&mut self) -> Result<(), ServeError> {
+        let Some(cleanup) = self.take_cleanup() else {
+            return Ok(());
+        };
+        cleanup.finish().await
+    }
+
+    fn take_cleanup(&mut self) -> Option<ServiceCleanup> {
+        let lease = self.lease.take()?;
+        Some(ServiceCleanup {
+            running: self.running.take(),
+            discovery: self.discovery.take(),
+            lease: Some(lease),
+        })
+    }
+}
+
+impl Drop for ServiceLifetime {
+    fn drop(&mut self) {
+        let Some(cleanup) = self.take_cleanup() else {
+            return;
+        };
+        cleanup.request_shutdown();
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            ServiceCleanup::leak(cleanup);
+            return;
+        };
+        std::mem::drop(runtime.spawn(async move {
+            let _ = cleanup.finish().await;
+        }));
+    }
+}
+
+struct ServiceCleanup {
+    running: Option<RunningServer>,
+    discovery: Option<(DiscoveryStore, uuid::Uuid)>,
+    lease: Option<RuntimeLease>,
+}
+
+impl ServiceCleanup {
+    fn request_shutdown(&self) {
+        if let Some(running) = self.running.as_ref() {
+            running.shutdown_handle().request();
+        }
+    }
+
+    async fn finish(mut self) -> Result<(), ServeError> {
+        self.request_shutdown();
         let server_result = if let Some(running) = self.running.take() {
             running.shutdown().await.map_err(|_| ServeError::Server)
         } else {
             Ok(())
         };
-        let discovery_result = self.remove_discovery();
+        let discovery_result = if let Some((discovery, instance_id)) = self.discovery.take() {
+            discovery
+                .remove_if_owned(instance_id)
+                .map(|_| ())
+                .map_err(ServeError::Platform)
+        } else {
+            Ok(())
+        };
+        drop(self.lease.take());
         server_result?;
         discovery_result
     }
 
-    fn remove_discovery(&mut self) -> Result<(), ServeError> {
-        let Some((discovery, instance_id)) = self.discovery.take() else {
-            return Ok(());
-        };
-        discovery
-            .remove_if_owned(instance_id)
-            .map(|_| ())
-            .map_err(ServeError::Platform)
+    fn leak(cleanup: Self) {
+        let _ = Box::leak(Box::new(cleanup));
+    }
+}
+
+impl Drop for ServiceCleanup {
+    fn drop(&mut self) {
+        if self.lease.is_none() {
+            return;
+        }
+        Self::leak(Self {
+            running: self.running.take(),
+            discovery: self.discovery.take(),
+            lease: self.lease.take(),
+        });
     }
 }
 

@@ -166,6 +166,70 @@ impl EntropySource for GatedEntropy {
     }
 }
 
+struct FailingOnCallEntropy {
+    calls: AtomicUsize,
+    fail_on_call: usize,
+}
+
+impl FailingOnCallEntropy {
+    fn new(fail_on_call: usize) -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            fail_on_call,
+        }
+    }
+}
+
+impl EntropySource for FailingOnCallEntropy {
+    fn fill(&self, output: &mut [u8; 32]) -> Result<(), TokenError> {
+        let call = self.calls.fetch_add(1, Ordering::AcqRel) + 1;
+        if call == self.fail_on_call {
+            return Err(TokenError::EntropyUnavailable);
+        }
+        output.fill(call as u8);
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct GatedIds {
+    blocked: AtomicBool,
+    released: Mutex<bool>,
+    release: Condvar,
+}
+
+impl GatedIds {
+    async fn wait_until_blocked(&self) {
+        timeout(Duration::from_secs(5), async {
+            while !self.blocked.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("token ID generation did not reach its deterministic gate");
+    }
+
+    fn release(&self) {
+        *self.released.lock().unwrap() = true;
+        self.release.notify_all();
+    }
+}
+
+impl IdSource for GatedIds {
+    fn new_instance_id(&self) -> Result<Uuid, RuntimeValueError> {
+        Ok(Uuid::parse_str(INSTANCE_ID).unwrap())
+    }
+
+    fn new_token_id(&self) -> Result<String, RuntimeValueError> {
+        self.blocked.store(true, Ordering::Release);
+        let mut released = self.released.lock().unwrap();
+        while !*released {
+            released = self.release.wait(released).unwrap();
+        }
+        Ok("019844f0-4de0-7000-8000-000000000011".to_owned())
+    }
+}
+
 struct DeadProcess;
 
 impl ProcessIdentity for DeadProcess {
@@ -212,6 +276,47 @@ impl DiscoveryPublisher for PublishThenFail {
         Err(PlatformError::Io {
             source: std::io::Error::other("injected post-commit publish failure"),
         })
+    }
+}
+
+#[derive(Default)]
+struct PublishThenPanic {
+    published: AtomicBool,
+    panic_requested: Mutex<bool>,
+    panic_request: Condvar,
+}
+
+impl PublishThenPanic {
+    async fn wait_until_published(&self) {
+        timeout(Duration::from_secs(5), async {
+            while !self.published.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("discovery publisher did not commit before its deterministic panic");
+    }
+
+    fn trigger_panic(&self) {
+        *self.panic_requested.lock().unwrap() = true;
+        self.panic_request.notify_all();
+    }
+}
+
+impl DiscoveryPublisher for PublishThenPanic {
+    fn publish(
+        &self,
+        store: &DiscoveryStore,
+        record: &DiscoveryRecord,
+    ) -> Result<(), PlatformError> {
+        store.publish(record)?;
+        self.published.store(true, Ordering::Release);
+        let mut panic_requested = self.panic_requested.lock().unwrap();
+        while !*panic_requested {
+            panic_requested = self.panic_request.wait(panic_requested).unwrap();
+        }
+        drop(panic_requested);
+        panic!("injected panic after discovery publication")
     }
 }
 
@@ -785,7 +890,7 @@ async fn abort_published_service_with_blocked_request(
     let paths = paths(directory.path());
     let port = reserve_port();
     persist_port(&paths, port);
-    let entropy = Arc::new(GatedEntropy::new(2));
+    let entropy = Arc::new(GatedEntropy::new(5));
     let secrets = Arc::new(MemorySecretStore::default());
     let dependencies = runtime_dependencies_with_entropy(
         paths.clone(),
@@ -1077,6 +1182,216 @@ async fn publish_failure_after_commit_removes_only_the_owned_discovery_record() 
         replacement_id,
         "cleanup removed a replacement record it did not own"
     );
+}
+
+async fn panic_after_publish_with_blocked_request(
+    replacement_id: Option<Uuid>,
+) -> (
+    ExitCode,
+    BufferOutput,
+    Option<ExitCode>,
+    AppPaths,
+    Arc<MemorySecretStore>,
+    Option<DiscoveryRecord>,
+    TestDirectory,
+) {
+    let directory = TestDirectory::new();
+    let paths = paths(directory.path());
+    let port = reserve_port();
+    persist_port(&paths, port);
+    let secrets = Arc::new(MemorySecretStore::default());
+    let shutdown = Arc::new(ManualShutdown::default());
+    let values = Arc::new(FixedRuntimeValues);
+    let ids = Arc::new(GatedIds::default());
+    let publisher = Arc::new(PublishThenPanic::default());
+    let dependencies = RunDependencies::new(
+        paths.clone(),
+        secrets.clone(),
+        values.clone(),
+        values.clone(),
+        ids.clone(),
+        values,
+        shutdown,
+    )
+    .with_discovery_publisher(publisher.clone());
+    let serve = tokio::spawn(async move {
+        let mut output = BufferOutput::default();
+        let exit = run_with_dependencies(
+            Cli::try_parse_from(["wokcore", "serve", "--json"]).unwrap(),
+            &dependencies,
+            &mut output,
+        )
+        .await;
+        (exit, output)
+    });
+
+    publisher.wait_until_published().await;
+    let record = DiscoveryStore::new(&paths).unwrap().read().unwrap();
+    let state = ReadOnlyStateStore::open_live(&paths.state_db).unwrap();
+    let management_ref = state
+        .runtime_secret_binding("management")
+        .unwrap()
+        .unwrap()
+        .secret_ref;
+    drop(state);
+    let management = secrets.get(&management_ref).await.unwrap();
+    let authorize = tokio::spawn(async move {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .build()
+            .unwrap()
+            .post(format!("{}/wokcore/v1/clients/authorize", record.base_url))
+            .header(HOST, format!("127.0.0.1:{port}"))
+            .header(
+                AUTHORIZATION,
+                format!("Bearer {}", management.expose_secret()),
+            )
+            .json(&serde_json::json!({"client_id": "wokrouter"}))
+            .send()
+            .await
+            .unwrap()
+    });
+    ids.wait_until_blocked().await;
+
+    publisher.trigger_panic();
+    let (serve_exit, serve_output) = timeout(Duration::from_secs(5), serve)
+        .await
+        .expect("serve did not convert its owned child panic")
+        .expect("the public serve task panicked");
+    let competing_exit = competing_serve_exit(paths.clone(), secrets.clone()).await;
+    let replacement = replacement_id.map(|instance_id| {
+        let mut replacement = DiscoveryStore::new(&paths).unwrap().read().unwrap();
+        replacement.instance_id = instance_id;
+        DiscoveryStore::new(&paths)
+            .unwrap()
+            .publish(&replacement)
+            .unwrap();
+        replacement
+    });
+
+    ids.release();
+    let response = timeout(Duration::from_secs(5), authorize)
+        .await
+        .expect("blocked authorize request did not finish")
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+    wait_for_lease_release(&paths).await;
+
+    (
+        serve_exit,
+        serve_output,
+        competing_exit,
+        paths,
+        secrets,
+        replacement,
+        directory,
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn publish_panic_keeps_lease_until_listener_and_owned_discovery_cleanup_finish() {
+    let (serve_exit, serve_output, competing_exit, paths, secrets, replacement, _directory) =
+        panic_after_publish_with_blocked_request(None).await;
+
+    assert_eq!(serve_exit, ExitCode::InternalFailure);
+    assert_eq!(serve_output.stdout(), "{\"code\":\"internal_error\"}\n");
+    assert_eq!(serve_output.stderr(), "");
+    assert_eq!(competing_exit, Some(ExitCode::AlreadyRunning));
+    assert!(replacement.is_none());
+    assert!(!paths.discovery_file.exists());
+
+    assert_eq!(
+        competing_serve_exit(paths.clone(), secrets).await,
+        Some(ExitCode::Success),
+        "a new owner could not start after panic cleanup released the listener and lease"
+    );
+    assert!(!paths.discovery_file.exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn publish_panic_cleanup_preserves_replacement_discovery() {
+    let replacement_id = Uuid::parse_str("019844f0-4de0-7000-8000-000000000088").unwrap();
+    let (serve_exit, serve_output, competing_exit, paths, _secrets, replacement, _directory) =
+        panic_after_publish_with_blocked_request(Some(replacement_id)).await;
+
+    assert_eq!(serve_exit, ExitCode::InternalFailure);
+    assert_eq!(serve_output.stdout(), "{\"code\":\"internal_error\"}\n");
+    assert_eq!(serve_output.stderr(), "");
+    assert_eq!(competing_exit, Some(ExitCode::AlreadyRunning));
+    assert_eq!(
+        DiscoveryStore::new(&paths).unwrap().read().unwrap(),
+        replacement.unwrap()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn composition_request_id_entropy_failure_is_stable_and_reads_entropy_once() {
+    let directory = TestDirectory::new();
+    let paths = paths(directory.path());
+    let port = reserve_port();
+    persist_port(&paths, port);
+    let entropy = Arc::new(FailingOnCallEntropy::new(4));
+    let shutdown = Arc::new(ManualShutdown::default());
+    let dependencies = runtime_dependencies_with_entropy(
+        paths.clone(),
+        Arc::new(MemorySecretStore::default()),
+        entropy.clone(),
+        shutdown.clone(),
+    );
+    let serve = tokio::spawn(async move {
+        let mut output = BufferOutput::default();
+        let exit = run_with_dependencies(
+            Cli::try_parse_from(["wokcore", "serve", "--json"]).unwrap(),
+            &dependencies,
+            &mut output,
+        )
+        .await;
+        (exit, output)
+    });
+    let record = wait_for_discovery(&paths).await;
+
+    let response = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .build()
+        .unwrap()
+        .get(format!("{}/wokcore/v1/health", record.base_url))
+        .header(HOST, format!("127.0.0.1:{port}"))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let request_id = response.headers()["x-request-id"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let body: serde_json::Value = response.json().await.unwrap();
+    let calls = entropy.calls.load(Ordering::Acquire);
+
+    shutdown.trigger();
+    let (serve_exit, _) = timeout(Duration::from_secs(5), serve)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(status, reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(request_id, Uuid::nil().to_string());
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "error": {
+                "code": "internal_error",
+                "message": "control-plane request failed",
+                "request_id": Uuid::nil().to_string(),
+            }
+        })
+    );
+    assert_eq!(
+        calls, 4,
+        "request-ID failure performed a second entropy read"
+    );
+    assert_eq!(serve_exit, ExitCode::Success);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -156,11 +156,17 @@ impl RunningServer {
         self.join().await
     }
 
+    pub async fn wait_mut(&mut self) -> Result<(), ServerError> {
+        self.join().await
+    }
+
     async fn join(&mut self) -> Result<(), ServerError> {
-        self.task
-            .take()
-            .expect("running server task is joined at most once")
-            .await
+        let Some(task) = self.task.as_mut() else {
+            return Err(ServerError::ServerTask);
+        };
+        let result = task.await;
+        self.task.take();
+        result
             .map_err(|_| ServerError::ServerTask)?
             .map_err(ServerError::Listener)
     }
@@ -199,6 +205,7 @@ mod tests {
     use std::{future, net::SocketAddr};
 
     use tokio::sync::watch;
+    use tokio::time::{Duration, timeout};
 
     use super::{RunningServer, ServerError};
 
@@ -222,5 +229,30 @@ mod tests {
 
         assert!(matches!(result, Err(ServerError::ServerTask)));
         assert!(!task_remained, "JoinError left a completed task handle");
+    }
+
+    #[tokio::test]
+    async fn cancelled_join_keeps_the_server_task_owned_for_cleanup() {
+        let (shutdown, _) = watch::channel(false);
+        let task = tokio::spawn(async {
+            future::pending::<()>().await;
+            Ok::<(), std::io::Error>(())
+        });
+        let mut server = RunningServer {
+            local_addr: SocketAddr::from(([127, 0, 0, 1], 43127)),
+            shutdown,
+            task: Some(task),
+        };
+
+        let result = timeout(Duration::from_millis(10), server.wait_mut()).await;
+
+        assert!(result.is_err(), "pending server unexpectedly completed");
+        assert!(
+            server.task.is_some(),
+            "cancelling listener join detached the server task from its owner"
+        );
+        let task = server.task.take().unwrap();
+        task.abort();
+        let _ = task.await;
     }
 }
