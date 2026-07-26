@@ -9,3 +9,15 @@ publish = false
 
 [dependencies]
 clap.workspace = true
+reqwest.workspace = true
+secrecy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+url.workspace = true
+uuid.workspace = true
+wokcore-core = { version = "0.1.0", path = "../../crates/wokcore-core" }
+wokcore-platform = { version = "0.1.0", path = "../../crates/wokcore-platform" }
+wokcore-server = { version = "0.1.0", path = "../../crates/wokcore-server" }
+wokcore-storage = { version = "0.1.0", path = "../../crates/wokcore-storage" }

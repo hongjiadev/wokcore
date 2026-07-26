@@ -8,7 +8,7 @@ use std::{
 
 use rusqlite::{Connection, params};
 use wokcore_core::{id::ClientId, secret::SecretRef};
-use wokcore_storage::{ClientTokenMetadata, StateStore, StorageError};
+use wokcore_storage::{ClientTokenMetadata, ReadOnlyStateStore, StateStore, StorageError};
 
 const ISSUED_AT: &str = "2026-07-26T00:00:00Z";
 const REVOKED_AT: &str = "2026-07-26T01:00:00Z";
@@ -351,6 +351,36 @@ fn auth_metadata_reads_do_not_change_database_or_wal() {
     assert_eq!(store.wal_size_bytes().unwrap(), wal_size);
 }
 
+#[test]
+fn immutable_read_only_inspection_reads_health_and_management_binding_without_writes() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.db");
+    let mut store = StateStore::open(&path).unwrap();
+    let secret_ref = SecretRef::parse("secret:00000000-0000-0000-0000-000000000001").unwrap();
+    store
+        .bind_runtime_secret_if_absent("management", &secret_ref, ISSUED_AT)
+        .unwrap();
+    store
+        .issue_client_token(&token("token-1", "wokrouter", 0x11))
+        .unwrap();
+    drop(store);
+    let before = directory_snapshot(directory.path());
+
+    let read_only = ReadOnlyStateStore::open(&path).unwrap();
+    assert_eq!(read_only.health().unwrap().schema_version, 2);
+    assert_eq!(
+        read_only
+            .runtime_secret_binding("management")
+            .unwrap()
+            .unwrap()
+            .secret_ref,
+        secret_ref
+    );
+    drop(read_only);
+
+    assert_eq!(directory_snapshot(directory.path()), before);
+}
+
 fn table_columns(connection: &Connection, table: &str) -> Vec<String> {
     let mut statement = connection
         .prepare(&format!("PRAGMA table_info({table})"))
@@ -364,4 +394,20 @@ fn table_columns(connection: &Connection, table: &str) -> Vec<String> {
 
 fn modified_time(path: &Path) -> SystemTime {
     fs::metadata(path).unwrap().modified().unwrap()
+}
+
+fn directory_snapshot(path: &Path) -> Vec<(String, Vec<u8>, SystemTime)> {
+    let mut snapshot = fs::read_dir(path)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            (
+                entry.file_name().to_string_lossy().into_owned(),
+                fs::read(entry.path()).unwrap(),
+                entry.metadata().unwrap().modified().unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    snapshot.sort_by(|left, right| left.0.cmp(&right.0));
+    snapshot
 }

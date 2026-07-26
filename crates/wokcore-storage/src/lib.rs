@@ -10,8 +10,8 @@ pub use secrets::{
     MemorySecretStore, NativeSecretStore, PermissionedFileSecretStore, SecretStore,
 };
 pub use state::{
-    CheckpointResult, ClientTokenMetadata, RequestMetric, RuntimeSecretBinding, StateHealth,
-    StateStore, WAL_CHECKPOINT_THRESHOLD_BYTES,
+    CheckpointResult, ClientTokenMetadata, ReadOnlyStateStore, RequestMetric, RuntimeSecretBinding,
+    StateHealth, StateStore, WAL_CHECKPOINT_THRESHOLD_BYTES,
 };
 
 #[derive(Debug, thiserror::Error)]

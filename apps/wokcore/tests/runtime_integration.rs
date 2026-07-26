@@ -1,0 +1,1146 @@
+use std::{
+    future::Future,
+    net::TcpListener as StdTcpListener,
+    path::{Path, PathBuf},
+    pin::Pin,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
+use clap::Parser;
+use reqwest::header::{AUTHORIZATION, HOST};
+use secrecy::ExposeSecret;
+use tokio::{sync::Notify, time::timeout};
+use uuid::Uuid;
+use wokcore::{
+    BufferOutput, Clock, DiscoveryPublisher, ExitCode, IdSource, LifecycleObserver,
+    ProcessIdentity, RunDependencies, RuntimeValueError, ShutdownSignal, cli::Cli,
+    run_with_dependencies,
+};
+use wokcore_core::{
+    id::ProviderId,
+    secret::{SecretPurpose, SecretScope},
+};
+use wokcore_platform::{AppPaths, DiscoveryRecord, DiscoveryStore, PlatformError, RuntimeLease};
+use wokcore_server::auth::{
+    AuthRegistry, EntropySource, StateAuthMetadataStore, TokenError, TokenMaterial,
+};
+use wokcore_server::lifecycle::{LifecyclePhase, ServiceLifecycle};
+use wokcore_storage::{
+    AppConfig, ConfigStore, MemorySecretStore, ReadOnlyStateStore, SecretStore, ServerConfig,
+    StateStore,
+};
+
+const INSTANCE_ID: &str = "019844f0-4de0-7000-8000-000000000010";
+
+struct UnexpectedRuntimeValues;
+
+impl Clock for UnexpectedRuntimeValues {
+    fn now(&self) -> Result<String, RuntimeValueError> {
+        panic!("read-only absent diagnostics must not ask for a clock")
+    }
+}
+
+impl IdSource for UnexpectedRuntimeValues {
+    fn new_instance_id(&self) -> Result<Uuid, RuntimeValueError> {
+        panic!("read-only absent diagnostics must not generate an instance ID")
+    }
+
+    fn new_token_id(&self) -> Result<String, RuntimeValueError> {
+        panic!("read-only absent diagnostics must not generate a token ID")
+    }
+}
+
+impl ProcessIdentity for UnexpectedRuntimeValues {
+    fn current_pid(&self) -> u32 {
+        panic!("read-only absent diagnostics must not ask for the current PID")
+    }
+
+    fn is_running(&self, _pid: u32) -> bool {
+        panic!("an absent discovery document has no PID to inspect")
+    }
+}
+
+impl EntropySource for UnexpectedRuntimeValues {
+    fn fill(&self, _output: &mut [u8; 32]) -> Result<(), TokenError> {
+        panic!("read-only absent diagnostics must not generate secret entropy")
+    }
+}
+
+impl ShutdownSignal for UnexpectedRuntimeValues {
+    fn wait(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async { panic!("read-only commands must not install a shutdown waiter") })
+    }
+}
+
+#[derive(Debug)]
+struct FixedRuntimeValues;
+
+impl Clock for FixedRuntimeValues {
+    fn now(&self) -> Result<String, RuntimeValueError> {
+        Ok("2026-07-26T12:00:00Z".to_owned())
+    }
+}
+
+impl IdSource for FixedRuntimeValues {
+    fn new_instance_id(&self) -> Result<Uuid, RuntimeValueError> {
+        Ok(Uuid::parse_str(INSTANCE_ID).unwrap())
+    }
+
+    fn new_token_id(&self) -> Result<String, RuntimeValueError> {
+        Ok("019844f0-4de0-7000-8000-000000000011".to_owned())
+    }
+}
+
+impl ProcessIdentity for FixedRuntimeValues {
+    fn current_pid(&self) -> u32 {
+        4242
+    }
+
+    fn is_running(&self, pid: u32) -> bool {
+        pid == 4242
+    }
+}
+
+impl EntropySource for FixedRuntimeValues {
+    fn fill(&self, output: &mut [u8; 32]) -> Result<(), TokenError> {
+        output.fill(0x42);
+        Ok(())
+    }
+}
+
+struct DeadProcess;
+
+impl ProcessIdentity for DeadProcess {
+    fn current_pid(&self) -> u32 {
+        4242
+    }
+
+    fn is_running(&self, _pid: u32) -> bool {
+        false
+    }
+}
+
+#[derive(Default)]
+struct ManualShutdown(Notify);
+
+impl ManualShutdown {
+    fn trigger(&self) {
+        self.0.notify_one();
+    }
+}
+
+impl ShutdownSignal for ManualShutdown {
+    fn wait(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(self.0.notified())
+    }
+}
+
+struct PublishThenFail {
+    replacement: Option<Uuid>,
+}
+
+impl DiscoveryPublisher for PublishThenFail {
+    fn publish(
+        &self,
+        store: &DiscoveryStore,
+        record: &DiscoveryRecord,
+    ) -> Result<(), PlatformError> {
+        store.publish(record)?;
+        if let Some(instance_id) = self.replacement {
+            let mut replacement = record.clone();
+            replacement.instance_id = instance_id;
+            store.publish(&replacement)?;
+        }
+        Err(PlatformError::Io {
+            source: std::io::Error::other("injected post-commit publish failure"),
+        })
+    }
+}
+
+#[derive(Default)]
+struct CapturingLifecycle(Mutex<Option<ServiceLifecycle>>);
+
+impl CapturingLifecycle {
+    fn get(&self) -> Option<ServiceLifecycle> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+impl LifecycleObserver for CapturingLifecycle {
+    fn observe(&self, lifecycle: &ServiceLifecycle) {
+        *self.0.lock().unwrap() = Some(lifecycle.clone());
+    }
+}
+
+struct TestDirectory(PathBuf);
+
+impl TestDirectory {
+    fn new() -> Self {
+        let path = std::env::temp_dir().join(format!("wokcore-task5-{}", Uuid::new_v4()));
+        std::fs::create_dir(&path).unwrap();
+        Self(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TestDirectory {
+    fn drop(&mut self) {
+        if self.0.starts_with(std::env::temp_dir()) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+}
+
+fn paths(base: &Path) -> AppPaths {
+    let runtime_dir = base.join("runtime");
+    AppPaths {
+        config_file: base.join("config").join("config.toml"),
+        state_db: base.join("state").join("state.sqlite3"),
+        log_dir: base.join("state").join("logs"),
+        discovery_file: runtime_dir.join("discovery.json"),
+        instance_lock: runtime_dir.join("instance.lock"),
+        runtime_dir,
+    }
+}
+
+fn dependencies(paths: AppPaths) -> RunDependencies {
+    let unexpected = Arc::new(UnexpectedRuntimeValues);
+    RunDependencies::new(
+        paths,
+        Arc::new(MemorySecretStore::default()),
+        unexpected.clone(),
+        unexpected.clone(),
+        unexpected.clone(),
+        unexpected.clone(),
+        unexpected,
+    )
+}
+
+fn runtime_dependencies(
+    paths: AppPaths,
+    secrets: Arc<MemorySecretStore>,
+    shutdown: Arc<ManualShutdown>,
+) -> RunDependencies {
+    let values = Arc::new(FixedRuntimeValues);
+    RunDependencies::new(
+        paths,
+        secrets,
+        values.clone(),
+        values.clone(),
+        values.clone(),
+        values,
+        shutdown,
+    )
+}
+
+fn doctor_dependencies(paths: AppPaths, process: Arc<dyn ProcessIdentity>) -> RunDependencies {
+    let values = Arc::new(FixedRuntimeValues);
+    RunDependencies::new(
+        paths,
+        Arc::new(MemorySecretStore::default()),
+        values.clone(),
+        values.clone(),
+        values,
+        process,
+        Arc::new(ManualShutdown::default()),
+    )
+}
+
+fn reserve_port() -> u16 {
+    let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap().port()
+}
+
+fn persist_port(paths: &AppPaths, port: u16) {
+    std::fs::create_dir_all(paths.config_file.parent().unwrap()).unwrap();
+    ConfigStore::new(&paths.config_file)
+        .commit(
+            0,
+            &AppConfig {
+                server: ServerConfig { port },
+            },
+        )
+        .unwrap();
+}
+
+#[tokio::test]
+async fn absent_status_and_doctor_have_stable_json_without_creating_files() {
+    let directory = TestDirectory::new();
+    let dependencies = dependencies(paths(directory.path()));
+
+    let mut status_output = BufferOutput::default();
+    let status = run_with_dependencies(
+        Cli::try_parse_from(["wokcore", "status", "--json"]).unwrap(),
+        &dependencies,
+        &mut status_output,
+    )
+    .await;
+    assert_eq!(status, ExitCode::NotRunning);
+    assert_eq!(status_output.stdout(), "{\"code\":\"not_running\"}\n");
+    assert_eq!(status_output.stderr(), "");
+
+    let mut doctor_output = BufferOutput::default();
+    let doctor = run_with_dependencies(
+        Cli::try_parse_from(["wokcore", "doctor", "--json"]).unwrap(),
+        &dependencies,
+        &mut doctor_output,
+    )
+    .await;
+    assert_eq!(doctor, ExitCode::NotRunning);
+    assert_eq!(doctor_output.stdout(), "{\"code\":\"absent\"}\n");
+    assert_eq!(doctor_output.stderr(), "");
+
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn serve_publishes_only_a_ready_loopback_identity_and_removes_its_discovery() {
+    let directory = TestDirectory::new();
+    let paths = paths(directory.path());
+    let port = reserve_port();
+    persist_port(&paths, port);
+    let secrets = Arc::new(MemorySecretStore::default());
+    let shutdown = Arc::new(ManualShutdown::default());
+    let serve_dependencies = runtime_dependencies(paths.clone(), secrets.clone(), shutdown.clone());
+    let serve = tokio::spawn(async move {
+        let mut output = BufferOutput::default();
+        let code = run_with_dependencies(
+            Cli::try_parse_from(["wokcore", "serve", "--json"]).unwrap(),
+            &serve_dependencies,
+            &mut output,
+        )
+        .await;
+        (code, output)
+    });
+
+    let discovery = timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(store) = DiscoveryStore::new(&paths)
+                && let Ok(record) = store.read()
+            {
+                break record;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(discovery.base_url, format!("http://127.0.0.1:{port}"));
+    assert_eq!(discovery.pid, 4242);
+    assert_eq!(discovery.instance_id.to_string(), INSTANCE_ID);
+    assert_eq!(discovery.api_major, 1);
+
+    let status_dependencies =
+        runtime_dependencies(paths.clone(), secrets.clone(), shutdown.clone());
+    let mut status_output = BufferOutput::default();
+    let status = run_with_dependencies(
+        Cli::try_parse_from(["wokcore", "status", "--json"]).unwrap(),
+        &status_dependencies,
+        &mut status_output,
+    )
+    .await;
+    assert_eq!(status, ExitCode::Success);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(status_output.stdout()).unwrap(),
+        serde_json::json!({
+            "api_major": 1,
+            "code": "running",
+            "instance_id": INSTANCE_ID,
+            "pid": 4242,
+            "wokcore_version": env!("CARGO_PKG_VERSION"),
+        })
+    );
+
+    shutdown.trigger();
+    let (serve_code, serve_output) = timeout(Duration::from_secs(5), serve)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(serve_code, ExitCode::Success);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(serve_output.stdout()).unwrap(),
+        serde_json::json!({
+            "api_major": 1,
+            "code": "started",
+            "instance_id": INSTANCE_ID,
+            "pid": 4242,
+            "port": port,
+        })
+    );
+    assert_eq!(serve_output.stderr(), "");
+    assert!(!paths.discovery_file.exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_start_has_exactly_one_lease_owner_and_one_service() {
+    let directory = TestDirectory::new();
+    let paths = paths(directory.path());
+    persist_port(&paths, reserve_port());
+    let secrets = Arc::new(MemorySecretStore::default());
+    let shutdown = Arc::new(ManualShutdown::default());
+    let owner_dependencies = runtime_dependencies(paths.clone(), secrets.clone(), shutdown.clone());
+    let owner = tokio::spawn(async move {
+        let mut output = BufferOutput::default();
+        let code = run_with_dependencies(
+            Cli::try_parse_from(["wokcore", "serve", "--json"]).unwrap(),
+            &owner_dependencies,
+            &mut output,
+        )
+        .await;
+        (code, output)
+    });
+    let owned_record = timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(store) = DiscoveryStore::new(&paths)
+                && let Ok(record) = store.read()
+            {
+                break record;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let unexpected = Arc::new(UnexpectedRuntimeValues);
+    let contender_dependencies = RunDependencies::new(
+        paths.clone(),
+        Arc::new(MemorySecretStore::default()),
+        unexpected.clone(),
+        unexpected.clone(),
+        unexpected.clone(),
+        unexpected.clone(),
+        unexpected,
+    );
+    let mut contender_output = BufferOutput::default();
+    let contender = run_with_dependencies(
+        Cli::try_parse_from(["wokcore", "serve", "--json"]).unwrap(),
+        &contender_dependencies,
+        &mut contender_output,
+    )
+    .await;
+    assert_eq!(contender, ExitCode::AlreadyRunning);
+    assert_eq!(
+        contender_output.stdout(),
+        "{\"code\":\"already_running\"}\n"
+    );
+    assert_eq!(
+        DiscoveryStore::new(&paths).unwrap().read().unwrap(),
+        owned_record
+    );
+
+    shutdown.trigger();
+    let (owner_code, _) = timeout(Duration::from_secs(5), owner)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(owner_code, ExitCode::Success);
+}
+
+#[tokio::test]
+async fn fixed_port_conflict_has_no_fallback_and_preserves_config_and_discovery() {
+    let directory = TestDirectory::new();
+    let paths = paths(directory.path());
+    let occupied = StdTcpListener::bind("127.0.0.1:0").unwrap();
+    let port = occupied.local_addr().unwrap().port();
+    persist_port(&paths, port);
+    let config_before = std::fs::read(&paths.config_file).unwrap();
+    let discovery_before = paths.discovery_file.try_exists().unwrap();
+    let dependencies = runtime_dependencies(
+        paths.clone(),
+        Arc::new(MemorySecretStore::default()),
+        Arc::new(ManualShutdown::default()),
+    );
+    let mut output = BufferOutput::default();
+
+    let code = run_with_dependencies(
+        Cli::try_parse_from(["wokcore", "serve", "--json"]).unwrap(),
+        &dependencies,
+        &mut output,
+    )
+    .await;
+
+    assert_eq!(code, ExitCode::PortOccupied);
+    assert_eq!(output.stdout(), "{\"code\":\"port_occupied\"}\n");
+    assert_eq!(output.stderr(), "");
+    assert_eq!(std::fs::read(&paths.config_file).unwrap(), config_before);
+    assert_eq!(paths.discovery_file.try_exists().unwrap(), discovery_before);
+    assert!(
+        StdTcpListener::bind(("127.0.0.1", port)).is_err(),
+        "serve silently fell back and released the configured occupied port"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn publish_failure_after_commit_removes_only_the_owned_discovery_record() {
+    let owned_directory = TestDirectory::new();
+    let owned_paths = paths(owned_directory.path());
+    persist_port(&owned_paths, reserve_port());
+    let owned_dependencies = runtime_dependencies(
+        owned_paths.clone(),
+        Arc::new(MemorySecretStore::default()),
+        Arc::new(ManualShutdown::default()),
+    )
+    .with_discovery_publisher(Arc::new(PublishThenFail { replacement: None }));
+    let mut owned_output = BufferOutput::default();
+
+    assert_eq!(
+        run_with_dependencies(
+            Cli::try_parse_from(["wokcore", "serve", "--json"]).unwrap(),
+            &owned_dependencies,
+            &mut owned_output,
+        )
+        .await,
+        ExitCode::InternalFailure
+    );
+    assert_eq!(owned_output.stdout(), "{\"code\":\"internal_error\"}\n");
+    assert!(
+        !owned_paths.discovery_file.exists(),
+        "a record committed before publish returned an error was left behind"
+    );
+
+    let replacement_directory = TestDirectory::new();
+    let replacement_paths = paths(replacement_directory.path());
+    persist_port(&replacement_paths, reserve_port());
+    let replacement_id = Uuid::parse_str("019844f0-4de0-7000-8000-000000000088").unwrap();
+    let replacement_dependencies = runtime_dependencies(
+        replacement_paths.clone(),
+        Arc::new(MemorySecretStore::default()),
+        Arc::new(ManualShutdown::default()),
+    )
+    .with_discovery_publisher(Arc::new(PublishThenFail {
+        replacement: Some(replacement_id),
+    }));
+    let mut replacement_output = BufferOutput::default();
+
+    assert_eq!(
+        run_with_dependencies(
+            Cli::try_parse_from(["wokcore", "serve", "--json"]).unwrap(),
+            &replacement_dependencies,
+            &mut replacement_output,
+        )
+        .await,
+        ExitCode::InternalFailure
+    );
+    assert_eq!(
+        DiscoveryStore::new(&replacement_paths)
+            .unwrap()
+            .read()
+            .unwrap()
+            .instance_id,
+        replacement_id,
+        "cleanup removed a replacement record it did not own"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn composition_root_waits_for_admitted_work_after_shutdown_timeout() {
+    let directory = TestDirectory::new();
+    let paths = paths(directory.path());
+    persist_port(&paths, reserve_port());
+    let shutdown = Arc::new(ManualShutdown::default());
+    let observer = Arc::new(CapturingLifecycle::default());
+    let dependencies = runtime_dependencies(
+        paths.clone(),
+        Arc::new(MemorySecretStore::default()),
+        shutdown.clone(),
+    )
+    .with_lifecycle_observer(observer.clone())
+    .with_drain_timeout(Duration::from_millis(25));
+    let mut serve = tokio::spawn(async move {
+        let mut output = BufferOutput::default();
+        run_with_dependencies(
+            Cli::try_parse_from(["wokcore", "serve", "--json"]).unwrap(),
+            &dependencies,
+            &mut output,
+        )
+        .await
+    });
+
+    let lifecycle = timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(lifecycle) = observer.get()
+                && lifecycle.snapshot().phase == LifecyclePhase::Running
+            {
+                break lifecycle;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let admitted = lifecycle.admission_controller().try_enter().unwrap();
+    shutdown.trigger();
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if lifecycle.snapshot().phase == LifecyclePhase::AwaitingCancellation {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        timeout(Duration::from_millis(50), &mut serve)
+            .await
+            .is_err(),
+        "composition root exited while already-admitted mutation work was still active"
+    );
+
+    drop(admitted);
+    assert_eq!(
+        timeout(Duration::from_secs(5), serve)
+            .await
+            .unwrap()
+            .unwrap(),
+        ExitCode::Success
+    );
+    assert!(!paths.discovery_file.exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn authorize_emits_one_proxy_token_and_stop_completes_before_owner_cleanup() {
+    let directory = TestDirectory::new();
+    let paths = paths(directory.path());
+    let port = reserve_port();
+    persist_port(&paths, port);
+    let secrets = Arc::new(MemorySecretStore::default());
+    let shutdown = Arc::new(ManualShutdown::default());
+    let serve_dependencies = runtime_dependencies(paths.clone(), secrets.clone(), shutdown.clone());
+    let serve = tokio::spawn(async move {
+        let mut output = BufferOutput::default();
+        let code = run_with_dependencies(
+            Cli::try_parse_from(["wokcore", "serve", "--json"]).unwrap(),
+            &serve_dependencies,
+            &mut output,
+        )
+        .await;
+        (code, output)
+    });
+    let record = timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(store) = DiscoveryStore::new(&paths)
+                && let Ok(record) = store.read()
+            {
+                break record;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let authorize_dependencies =
+        runtime_dependencies(paths.clone(), secrets.clone(), shutdown.clone());
+    let mut authorize_output = BufferOutput::default();
+    let authorize = run_with_dependencies(
+        Cli::try_parse_from(["wokcore", "authorize", "--client", "wokrouter", "--json"]).unwrap(),
+        &authorize_dependencies,
+        &mut authorize_output,
+    )
+    .await;
+    assert_eq!(authorize, ExitCode::Success);
+    assert_eq!(authorize_output.stderr(), "");
+    let authorized: serde_json::Value = serde_json::from_str(authorize_output.stdout()).unwrap();
+    let token = authorized["token"].as_str().unwrap().to_owned();
+    let management_canary = TokenMaterial::generate_admin(&FixedRuntimeValues)
+        .unwrap()
+        .into_response_value()
+        .expose_secret()
+        .to_owned();
+    assert!(token.starts_with("wok_proxy_v1_"));
+    assert_eq!(authorized["client_id"], "wokrouter");
+    assert_eq!(
+        authorize_output.stdout().matches(&token).count(),
+        1,
+        "one-time token appeared more than once"
+    );
+    assert_tree_does_not_contain(directory.path(), &token);
+    assert_tree_does_not_contain(directory.path(), &management_canary);
+
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .build()
+        .unwrap();
+    let proxy_as_management = client
+        .get(format!("{}/wokcore/v1/service/status", record.base_url))
+        .header(HOST, format!("127.0.0.1:{port}"))
+        .header(AUTHORIZATION, format!("Bearer {token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        proxy_as_management.status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    let proxy_error = proxy_as_management.text().await.unwrap();
+    assert!(!proxy_error.contains(&token));
+    assert!(!proxy_error.contains(&management_canary));
+
+    let observer_dependencies =
+        runtime_dependencies(paths.clone(), secrets.clone(), shutdown.clone());
+    let mut status_output = BufferOutput::default();
+    assert_eq!(
+        run_with_dependencies(
+            Cli::try_parse_from(["wokcore", "status", "--json"]).unwrap(),
+            &observer_dependencies,
+            &mut status_output,
+        )
+        .await,
+        ExitCode::Success
+    );
+    let mut doctor_output = BufferOutput::default();
+    assert_eq!(
+        run_with_dependencies(
+            Cli::try_parse_from(["wokcore", "doctor", "--json"]).unwrap(),
+            &observer_dependencies,
+            &mut doctor_output,
+        )
+        .await,
+        ExitCode::Success
+    );
+
+    let stop_dependencies = runtime_dependencies(paths.clone(), secrets.clone(), shutdown.clone());
+    let mut stop_output = BufferOutput::default();
+    let stop = run_with_dependencies(
+        Cli::try_parse_from(["wokcore", "stop", "--json"]).unwrap(),
+        &stop_dependencies,
+        &mut stop_output,
+    )
+    .await;
+    assert_eq!(stop, ExitCode::Success);
+    assert_eq!(stop_output.stdout(), "{\"code\":\"stopped\"}\n");
+    assert_eq!(stop_output.stderr(), "");
+    let (serve_code, serve_output) = timeout(Duration::from_secs(5), serve)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(serve_code, ExitCode::Success);
+    assert!(!paths.discovery_file.exists());
+
+    let metadata = Arc::new(StateAuthMetadataStore::new(
+        StateStore::open(&paths.state_db).unwrap(),
+    ));
+    let scope = SecretScope {
+        provider_id: ProviderId::new("wokcore-runtime").unwrap(),
+        account_id: None,
+        purpose: SecretPurpose::Auxiliary,
+    };
+    let registry = AuthRegistry::bootstrap(
+        secrets,
+        metadata,
+        Arc::new(FixedRuntimeValues),
+        scope,
+        "2026-07-26T12:00:00Z".to_owned(),
+    )
+    .await
+    .unwrap();
+    let client = registry.validate_client(&token).unwrap();
+    assert_eq!(client.client_id.as_str(), "wokrouter");
+    assert!(!registry.validate_management(&token));
+
+    for (name, rendered) in [
+        ("status stdout", status_output.stdout()),
+        ("status stderr", status_output.stderr()),
+        ("doctor stdout", doctor_output.stdout()),
+        ("doctor stderr", doctor_output.stderr()),
+        ("stop stdout", stop_output.stdout()),
+        ("stop stderr", stop_output.stderr()),
+        ("serve stdout", serve_output.stdout()),
+        ("serve stderr", serve_output.stderr()),
+    ] {
+        assert!(!rendered.contains(&token), "{name} leaked proxy token");
+        assert!(
+            !rendered.contains(&management_canary),
+            "{name} leaked management token"
+        );
+    }
+}
+
+async fn doctor_code(dependencies: &RunDependencies) -> (ExitCode, String) {
+    let mut output = BufferOutput::default();
+    let exit = run_with_dependencies(
+        Cli::try_parse_from(["wokcore", "doctor", "--json"]).unwrap(),
+        dependencies,
+        &mut output,
+    )
+    .await;
+    assert_eq!(output.stderr(), "");
+    let code = serde_json::from_str::<serde_json::Value>(output.stdout()).unwrap()["code"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    (exit, code)
+}
+
+fn publish_record(paths: &AppPaths, record: &DiscoveryRecord) {
+    let _lease = RuntimeLease::acquire(paths).unwrap();
+    DiscoveryStore::new(paths).unwrap().publish(record).unwrap();
+}
+
+#[tokio::test]
+async fn doctor_offline_matrix_has_stable_codes_and_never_writes() {
+    let absent_dir = TestDirectory::new();
+    let absent_paths = paths(absent_dir.path());
+    let absent_dependencies = doctor_dependencies(absent_paths, Arc::new(UnexpectedRuntimeValues));
+    let absent_before = tree_snapshot(absent_dir.path());
+    assert_eq!(
+        doctor_code(&absent_dependencies).await,
+        (ExitCode::NotRunning, "absent".to_owned())
+    );
+    assert_eq!(tree_snapshot(absent_dir.path()), absent_before);
+
+    let unreachable_dir = TestDirectory::new();
+    let unreachable_paths = paths(unreachable_dir.path());
+    let unreachable_port = reserve_port();
+    publish_record(
+        &unreachable_paths,
+        &DiscoveryRecord {
+            base_url: format!("http://127.0.0.1:{unreachable_port}"),
+            pid: 4242,
+            instance_id: Uuid::parse_str(INSTANCE_ID).unwrap(),
+            wokcore_version: env!("CARGO_PKG_VERSION").to_owned(),
+            api_major: 1,
+        },
+    );
+    let unreachable_dependencies =
+        doctor_dependencies(unreachable_paths, Arc::new(FixedRuntimeValues));
+    let unreachable_before = tree_snapshot(unreachable_dir.path());
+    assert_eq!(
+        doctor_code(&unreachable_dependencies).await,
+        (ExitCode::NotRunning, "unreachable".to_owned())
+    );
+    assert_eq!(tree_snapshot(unreachable_dir.path()), unreachable_before);
+
+    let pid_dir = TestDirectory::new();
+    let pid_paths = paths(pid_dir.path());
+    publish_record(
+        &pid_paths,
+        &DiscoveryRecord {
+            base_url: format!("http://127.0.0.1:{}", reserve_port()),
+            pid: 4242,
+            instance_id: Uuid::parse_str(INSTANCE_ID).unwrap(),
+            wokcore_version: env!("CARGO_PKG_VERSION").to_owned(),
+            api_major: 1,
+        },
+    );
+    let pid_dependencies = doctor_dependencies(pid_paths, Arc::new(DeadProcess));
+    let pid_before = tree_snapshot(pid_dir.path());
+    assert_eq!(
+        doctor_code(&pid_dependencies).await,
+        (ExitCode::NotRunning, "pid_mismatch".to_owned())
+    );
+    assert_eq!(tree_snapshot(pid_dir.path()), pid_before);
+
+    let unsafe_dir = TestDirectory::new();
+    let unsafe_paths = paths(unsafe_dir.path());
+    std::fs::write(&unsafe_paths.runtime_dir, b"not-a-directory").unwrap();
+    let unsafe_dependencies = doctor_dependencies(unsafe_paths, Arc::new(UnexpectedRuntimeValues));
+    let unsafe_before = tree_snapshot(unsafe_dir.path());
+    assert_eq!(
+        doctor_code(&unsafe_dependencies).await,
+        (ExitCode::InvalidInput, "unsafe_runtime".to_owned())
+    );
+    assert_eq!(tree_snapshot(unsafe_dir.path()), unsafe_before);
+
+    let occupied_dir = TestDirectory::new();
+    let occupied_paths = paths(occupied_dir.path());
+    let occupied = StdTcpListener::bind("127.0.0.1:0").unwrap();
+    persist_port(&occupied_paths, occupied.local_addr().unwrap().port());
+    let occupied_dependencies =
+        doctor_dependencies(occupied_paths, Arc::new(UnexpectedRuntimeValues));
+    let occupied_before = tree_snapshot(occupied_dir.path());
+    assert_eq!(
+        doctor_code(&occupied_dependencies).await,
+        (ExitCode::PortOccupied, "port_occupied".to_owned())
+    );
+    assert_eq!(tree_snapshot(occupied_dir.path()), occupied_before);
+
+    let corrupt_dir = TestDirectory::new();
+    let corrupt_paths = paths(corrupt_dir.path());
+    std::fs::create_dir_all(corrupt_paths.state_db.parent().unwrap()).unwrap();
+    std::fs::write(&corrupt_paths.state_db, b"not a sqlite database").unwrap();
+    let corrupt_dependencies =
+        doctor_dependencies(corrupt_paths, Arc::new(UnexpectedRuntimeValues));
+    let corrupt_before = tree_snapshot(corrupt_dir.path());
+    assert_eq!(
+        doctor_code(&corrupt_dependencies).await,
+        (ExitCode::StorageCorruption, "storage_corrupt".to_owned())
+    );
+    assert_eq!(tree_snapshot(corrupt_dir.path()), corrupt_before);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn doctor_online_identity_matrix_is_read_only() {
+    let directory = TestDirectory::new();
+    let paths = paths(directory.path());
+    persist_port(&paths, reserve_port());
+    let secrets = Arc::new(MemorySecretStore::default());
+    let shutdown = Arc::new(ManualShutdown::default());
+    let serve_dependencies = runtime_dependencies(paths.clone(), secrets, shutdown.clone());
+    let serve = tokio::spawn(async move {
+        let mut output = BufferOutput::default();
+        run_with_dependencies(
+            Cli::try_parse_from(["wokcore", "serve", "--json"]).unwrap(),
+            &serve_dependencies,
+            &mut output,
+        )
+        .await
+    });
+    let original = timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(store) = DiscoveryStore::new(&paths)
+                && let Ok(record) = store.read()
+            {
+                break record;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let doctor_dependencies = doctor_dependencies(paths.clone(), Arc::new(FixedRuntimeValues));
+
+    let healthy_before = tree_snapshot(directory.path());
+    assert_eq!(
+        doctor_code(&doctor_dependencies).await,
+        (ExitCode::Success, "healthy".to_owned())
+    );
+    assert_eq!(tree_snapshot(directory.path()), healthy_before);
+
+    let mut instance_mismatch = original.clone();
+    instance_mismatch.instance_id =
+        Uuid::parse_str("019844f0-4de0-7000-8000-000000000099").unwrap();
+    DiscoveryStore::new(&paths)
+        .unwrap()
+        .publish(&instance_mismatch)
+        .unwrap();
+    let instance_before = tree_snapshot(directory.path());
+    assert_eq!(
+        doctor_code(&doctor_dependencies).await,
+        (ExitCode::InvalidInput, "instance_mismatch".to_owned())
+    );
+    assert_eq!(tree_snapshot(directory.path()), instance_before);
+
+    let mut api_mismatch = original.clone();
+    api_mismatch.api_major = 2;
+    DiscoveryStore::new(&paths)
+        .unwrap()
+        .publish(&api_mismatch)
+        .unwrap();
+    let api_before = tree_snapshot(directory.path());
+    assert_eq!(
+        doctor_code(&doctor_dependencies).await,
+        (ExitCode::InvalidInput, "api_mismatch".to_owned())
+    );
+    assert_eq!(tree_snapshot(directory.path()), api_before);
+
+    DiscoveryStore::new(&paths)
+        .unwrap()
+        .publish(&original)
+        .unwrap();
+    shutdown.trigger();
+    assert_eq!(
+        timeout(Duration::from_secs(5), serve)
+            .await
+            .unwrap()
+            .unwrap(),
+        ExitCode::Success
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn repeated_identity_and_auth_validation_are_byte_and_mtime_read_only() {
+    let directory = TestDirectory::new();
+    let paths = paths(directory.path());
+    let port = reserve_port();
+    persist_port(&paths, port);
+    let secrets = Arc::new(MemorySecretStore::default());
+    let shutdown = Arc::new(ManualShutdown::default());
+    let serve_dependencies = runtime_dependencies(paths.clone(), secrets.clone(), shutdown.clone());
+    let serve = tokio::spawn(async move {
+        let mut output = BufferOutput::default();
+        run_with_dependencies(
+            Cli::try_parse_from(["wokcore", "serve", "--json"]).unwrap(),
+            &serve_dependencies,
+            &mut output,
+        )
+        .await
+    });
+    let record = timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(store) = DiscoveryStore::new(&paths)
+                && let Ok(record) = store.read()
+            {
+                break record;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let state = ReadOnlyStateStore::open_live(&paths.state_db).unwrap();
+    let management_ref = state
+        .runtime_secret_binding("management")
+        .unwrap()
+        .unwrap()
+        .secret_ref;
+    drop(state);
+    let management = secrets.get(&management_ref).await.unwrap();
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .build()
+        .unwrap();
+    let dependencies = runtime_dependencies(paths.clone(), secrets.clone(), shutdown.clone());
+    let before = tree_snapshot(directory.path());
+
+    for _ in 0..20 {
+        let mut status_output = BufferOutput::default();
+        assert_eq!(
+            run_with_dependencies(
+                Cli::try_parse_from(["wokcore", "status", "--json"]).unwrap(),
+                &dependencies,
+                &mut status_output,
+            )
+            .await,
+            ExitCode::Success
+        );
+        let mut doctor_output = BufferOutput::default();
+        assert_eq!(
+            run_with_dependencies(
+                Cli::try_parse_from(["wokcore", "doctor", "--json"]).unwrap(),
+                &dependencies,
+                &mut doctor_output,
+            )
+            .await,
+            ExitCode::Success
+        );
+        let authenticated = client
+            .get(format!("{}/wokcore/v1/service/status", record.base_url))
+            .header(HOST, format!("127.0.0.1:{port}"))
+            .header(
+                AUTHORIZATION,
+                format!("Bearer {}", management.expose_secret()),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(authenticated.status(), reqwest::StatusCode::OK);
+    }
+
+    assert_eq!(tree_snapshot(directory.path()), before);
+    shutdown.trigger();
+    assert_eq!(
+        timeout(Duration::from_secs(5), serve)
+            .await
+            .unwrap()
+            .unwrap(),
+        ExitCode::Success
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn owner_shutdown_preserves_a_replacement_discovery_record() {
+    let directory = TestDirectory::new();
+    let paths = paths(directory.path());
+    persist_port(&paths, reserve_port());
+    let secrets = Arc::new(MemorySecretStore::default());
+    let shutdown = Arc::new(ManualShutdown::default());
+    let serve_dependencies = runtime_dependencies(paths.clone(), secrets, shutdown.clone());
+    let serve = tokio::spawn(async move {
+        let mut output = BufferOutput::default();
+        run_with_dependencies(
+            Cli::try_parse_from(["wokcore", "serve", "--json"]).unwrap(),
+            &serve_dependencies,
+            &mut output,
+        )
+        .await
+    });
+    let mut replacement = timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(store) = DiscoveryStore::new(&paths)
+                && let Ok(record) = store.read()
+            {
+                break record;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    replacement.instance_id = Uuid::parse_str("019844f0-4de0-7000-8000-000000000088").unwrap();
+    let store = DiscoveryStore::new(&paths).unwrap();
+    store.publish(&replacement).unwrap();
+
+    shutdown.trigger();
+    assert_eq!(
+        timeout(Duration::from_secs(5), serve)
+            .await
+            .unwrap()
+            .unwrap(),
+        ExitCode::Success
+    );
+    assert_eq!(store.read().unwrap(), replacement);
+    assert!(store.remove_if_owned(replacement.instance_id).unwrap());
+}
+
+fn tree_snapshot(root: &Path) -> Vec<(String, Option<Vec<u8>>, u64, std::time::SystemTime)> {
+    fn visit(
+        root: &Path,
+        path: &Path,
+        entries: &mut Vec<(String, Option<Vec<u8>>, u64, std::time::SystemTime)>,
+    ) {
+        let Ok(children) = std::fs::read_dir(path) else {
+            return;
+        };
+        for child in children {
+            let child = child.unwrap();
+            let metadata = child.metadata().unwrap();
+            if metadata.is_dir() {
+                visit(root, &child.path(), entries);
+            } else {
+                let contents = match std::fs::read(child.path()) {
+                    Ok(contents) => Some(contents),
+                    Err(_) if child.file_name() == "instance.lock" => None,
+                    Err(error) => panic!("failed to snapshot {}: {error}", child.path().display()),
+                };
+                entries.push((
+                    child
+                        .path()
+                        .strip_prefix(root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                    contents,
+                    metadata.len(),
+                    metadata.modified().unwrap(),
+                ));
+            }
+        }
+    }
+
+    let mut entries = Vec::new();
+    visit(root, root, &mut entries);
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    entries
+}
+
+fn assert_tree_does_not_contain(root: &Path, canary: &str) {
+    for (path, contents, _, _) in tree_snapshot(root) {
+        if let Some(contents) = contents {
+            assert!(
+                !contents
+                    .windows(canary.len())
+                    .any(|window| window == canary.as_bytes()),
+                "{path} persisted a raw token"
+            );
+        }
+    }
+}

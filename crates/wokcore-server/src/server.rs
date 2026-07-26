@@ -6,7 +6,12 @@ use std::{
 use tokio::{net::TcpListener, sync::watch, task::JoinHandle};
 use uuid::Uuid;
 
-use crate::{api::build_router, auth::AuthRegistry, lifecycle::ServiceLifecycle};
+use crate::{
+    api::build_router,
+    auth::AuthRegistry,
+    lifecycle::ServiceLifecycle,
+    runtime::{SystemTokenMetadata, TokenMetadataSource},
+};
 
 #[derive(Clone)]
 pub struct ServerState {
@@ -14,6 +19,7 @@ pub struct ServerState {
     pub(crate) instance_id: Uuid,
     pub(crate) auth: Arc<AuthRegistry>,
     pub(crate) lifecycle: ServiceLifecycle,
+    pub(crate) token_metadata: Arc<dyn TokenMetadataSource>,
     shutdown: watch::Sender<bool>,
 }
 
@@ -24,12 +30,29 @@ impl ServerState {
         auth: Arc<AuthRegistry>,
         lifecycle: ServiceLifecycle,
     ) -> Self {
+        Self::new_with_token_metadata(
+            authority,
+            instance_id,
+            auth,
+            lifecycle,
+            Arc::new(SystemTokenMetadata),
+        )
+    }
+
+    pub fn new_with_token_metadata(
+        authority: impl Into<Arc<str>>,
+        instance_id: Uuid,
+        auth: Arc<AuthRegistry>,
+        lifecycle: ServiceLifecycle,
+        token_metadata: Arc<dyn TokenMetadataSource>,
+    ) -> Self {
         let (shutdown, _) = watch::channel(false);
         Self {
             authority: authority.into(),
             instance_id,
             auth,
             lifecycle,
+            token_metadata,
             shutdown,
         }
     }
@@ -47,6 +70,17 @@ pub struct RunningServer {
     local_addr: std::net::SocketAddr,
     shutdown: watch::Sender<bool>,
     task: Option<JoinHandle<Result<(), std::io::Error>>>,
+}
+
+#[derive(Clone)]
+pub struct ServerShutdown {
+    shutdown: watch::Sender<bool>,
+}
+
+impl ServerShutdown {
+    pub fn request(&self) {
+        self.shutdown.send_replace(true);
+    }
 }
 
 impl RunningServer {
@@ -84,6 +118,12 @@ impl RunningServer {
 
     pub const fn local_addr(&self) -> std::net::SocketAddr {
         self.local_addr
+    }
+
+    pub fn shutdown_handle(&self) -> ServerShutdown {
+        ServerShutdown {
+            shutdown: self.shutdown.clone(),
+        }
     }
 
     pub async fn shutdown(mut self) -> Result<(), ServerError> {

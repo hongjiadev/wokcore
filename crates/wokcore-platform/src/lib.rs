@@ -5,6 +5,7 @@ pub mod system;
 
 pub use runtime::{DiscoveryRecord, DiscoveryStore, MAX_DISCOVERY_BYTES, RuntimeLease};
 pub use system::paths::{AppPaths, EnvironmentSnapshot, Platform};
+pub use system::process::is_process_running;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PlatformError {

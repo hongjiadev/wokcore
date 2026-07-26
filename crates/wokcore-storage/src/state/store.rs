@@ -1,10 +1,11 @@
 use std::{
     fs::{self, OpenOptions},
+    io,
     path::{Path, PathBuf},
 };
 
 use fs4::fs_std::FileExt;
-use rusqlite::{Connection, ErrorCode, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use wokcore_core::{id::ClientId, secret::SecretRef};
 
 use crate::StorageError;
@@ -60,6 +61,68 @@ pub struct ClientTokenMetadata {
 pub struct StateStore {
     connection: Connection,
     database_path: PathBuf,
+}
+
+pub struct ReadOnlyStateStore {
+    connection: Connection,
+}
+
+impl ReadOnlyStateStore {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
+        Self::open_uri(read_only_database_uri(path.as_ref(), true)?)
+    }
+
+    pub fn open_live(path: impl AsRef<Path>) -> Result<Self, StorageError> {
+        Self::open_uri(read_only_database_uri(path.as_ref(), false)?)
+    }
+
+    fn open_uri(uri: String) -> Result<Self, StorageError> {
+        let connection = Connection::open_with_flags(
+            uri,
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_URI
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(map_database_error)?;
+        connection
+            .execute_batch("PRAGMA query_only = ON;")
+            .map_err(map_database_error)?;
+        let store = Self { connection };
+        store.validate()?;
+        Ok(store)
+    }
+
+    pub fn health(&self) -> Result<StateHealth, StorageError> {
+        let versions = schema_versions(&self.connection)?;
+        if versions != [1, LATEST_SCHEMA_VERSION] {
+            return Err(StorageError::StateDatabaseCorrupt {
+                message: "state database has an incompatible migration history".to_owned(),
+            });
+        }
+        Ok(StateHealth {
+            schema_version: LATEST_SCHEMA_VERSION,
+        })
+    }
+
+    pub fn runtime_secret_binding(
+        &self,
+        name: &str,
+    ) -> Result<Option<RuntimeSecretBinding>, StorageError> {
+        query_runtime_secret_binding(&self.connection, name)
+    }
+
+    fn validate(&self) -> Result<(), StorageError> {
+        let quick_check = self
+            .connection
+            .query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))
+            .map_err(map_database_error)?;
+        if quick_check != "ok" {
+            return Err(StorageError::StateDatabaseCorrupt {
+                message: "state database failed read-only integrity inspection".to_owned(),
+            });
+        }
+        self.health().map(|_| ())
+    }
 }
 
 impl StateStore {
@@ -184,39 +247,7 @@ impl StateStore {
         &self,
         name: &str,
     ) -> Result<Option<RuntimeSecretBinding>, StorageError> {
-        let result = self.connection.query_row(
-            "SELECT binding_name, secret_ref, revision, created_at
-             FROM runtime_secret_bindings
-             WHERE binding_name = ?1",
-            [name],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            },
-        );
-        let (name, secret_ref, revision, created_at) = match result {
-            Ok(binding) => binding,
-            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
-            Err(error) => return Err(map_database_error(error)),
-        };
-        let secret_ref =
-            SecretRef::parse(secret_ref).map_err(|_| StorageError::StateDatabaseCorrupt {
-                message: "runtime secret binding contains an invalid reference".to_owned(),
-            })?;
-        let revision = u64::try_from(revision).map_err(|_| StorageError::StateDatabaseCorrupt {
-            message: "runtime secret binding contains an invalid revision".to_owned(),
-        })?;
-
-        Ok(Some(RuntimeSecretBinding {
-            name,
-            secret_ref,
-            revision,
-            created_at,
-        }))
+        query_runtime_secret_binding(&self.connection, name)
     }
 
     pub fn bind_runtime_secret_if_absent(
@@ -432,6 +463,83 @@ impl StateStore {
             .query_row(&format!("PRAGMA {name}"), [], |row| row.get(0))
             .map_err(map_database_error)
     }
+}
+
+fn query_runtime_secret_binding(
+    connection: &Connection,
+    name: &str,
+) -> Result<Option<RuntimeSecretBinding>, StorageError> {
+    let result = connection.query_row(
+        "SELECT binding_name, secret_ref, revision, created_at
+             FROM runtime_secret_bindings
+             WHERE binding_name = ?1",
+        [name],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        },
+    );
+    let (name, secret_ref, revision, created_at) = match result {
+        Ok(binding) => binding,
+        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+        Err(error) => return Err(map_database_error(error)),
+    };
+    let secret_ref =
+        SecretRef::parse(secret_ref).map_err(|_| StorageError::StateDatabaseCorrupt {
+            message: "runtime secret binding contains an invalid reference".to_owned(),
+        })?;
+    let revision = u64::try_from(revision).map_err(|_| StorageError::StateDatabaseCorrupt {
+        message: "runtime secret binding contains an invalid revision".to_owned(),
+    })?;
+
+    Ok(Some(RuntimeSecretBinding {
+        name,
+        secret_ref,
+        revision,
+        created_at,
+    }))
+}
+
+fn read_only_database_uri(path: &Path, immutable: bool) -> Result<String, StorageError> {
+    let absolute = path
+        .canonicalize()
+        .map_err(|source| StorageError::Io { source })?;
+    let value = absolute
+        .to_str()
+        .ok_or_else(|| StorageError::Io {
+            source: io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "state database path is not valid UTF-8",
+            ),
+        })?
+        .replace('\\', "/");
+    #[cfg(windows)]
+    let value = value.strip_prefix("//?/").unwrap_or(&value);
+    #[cfg(not(windows))]
+    let value = value.as_str();
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'/' | b':') {
+            encoded.push(char::from(byte));
+        } else {
+            use std::fmt::Write as _;
+            write!(&mut encoded, "%{byte:02X}").expect("writing to a string cannot fail");
+        }
+    }
+    #[cfg(windows)]
+    if !encoded.starts_with('/') {
+        encoded.insert(0, '/');
+    }
+    let options = if immutable {
+        "mode=ro&immutable=1"
+    } else {
+        "mode=ro"
+    };
+    Ok(format!("file:{encoded}?{options}"))
 }
 
 fn apply_ordered_migrations(connection: &mut Connection) -> Result<(), StorageError> {

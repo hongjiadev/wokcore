@@ -28,6 +28,7 @@ use wokcore_server::{
     api::build_router,
     auth::{AuthMetadataStore, AuthRegistry, EntropySource, TokenError, TokenMaterial},
     lifecycle::{DrainOutcome, ServiceLifecycle},
+    runtime::{TokenMetadataError, TokenMetadataSource},
 };
 use wokcore_storage::{
     ClientTokenMetadata, MemorySecretStore, RuntimeSecretBinding, SecretStore, StorageError,
@@ -36,6 +37,7 @@ use wokcore_storage::{
 const AUTHORITY: &str = "127.0.0.1:43128";
 const CREATED_AT: &str = "2026-07-26T00:00:00Z";
 const INSTANCE_ID: &str = "019844f0-4de0-7000-8000-000000000002";
+const TOKEN_ID: &str = "019844f0-4de0-7000-8000-000000000003";
 
 #[derive(Debug, Default)]
 struct IncrementingEntropy(AtomicU8);
@@ -44,6 +46,19 @@ impl EntropySource for IncrementingEntropy {
     fn fill(&self, output: &mut [u8; 32]) -> Result<(), TokenError> {
         output.fill(self.0.fetch_add(1, Ordering::SeqCst).wrapping_add(1));
         Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct FixedTokenMetadata;
+
+impl TokenMetadataSource for FixedTokenMetadata {
+    fn new_token_id(&self) -> Result<String, TokenMetadataError> {
+        Ok(TOKEN_ID.to_owned())
+    }
+
+    fn now(&self) -> Result<String, TokenMetadataError> {
+        Ok(CREATED_AT.to_owned())
     }
 }
 
@@ -198,11 +213,12 @@ async fn state_fixture(
     .unwrap();
     let lifecycle = ServiceLifecycle::new();
     lifecycle.mark_running().unwrap();
-    let state = ServerState::new(
+    let state = ServerState::new_with_token_metadata(
         authority.to_owned(),
         Uuid::parse_str(INSTANCE_ID).unwrap(),
         Arc::new(auth),
         lifecycle.clone(),
+        Arc::new(FixedTokenMetadata),
     );
     (state, management, lifecycle, metadata)
 }
@@ -398,6 +414,11 @@ async fn authorize_returns_raw_proxy_once_and_revoke_removes_it() {
     let token_id = authorized["token_id"].as_str().unwrap();
     assert!(token.starts_with("wok_proxy_v1_"));
     assert_eq!(authorized["client_id"], "wokrouter");
+    assert_eq!(token_id, TOKEN_ID);
+    assert_eq!(
+        fixture.metadata.active.lock().unwrap()[0].issued_at,
+        CREATED_AT
+    );
 
     let path = format!("/wokcore/v1/clients/wokrouter/tokens/{token_id}");
     let revoked = fixture

@@ -1,4 +1,4 @@
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use axum::{
     Json,
@@ -9,7 +9,6 @@ use axum::{
     http::StatusCode,
 };
 use secrecy::ExposeSecret;
-use uuid::Uuid;
 use wokcore_core::id::ClientId;
 use wokcore_protocols::IMPLEMENTED_PROVIDER_PROTOCOLS;
 
@@ -104,10 +103,17 @@ pub(crate) async fn authorize(
         }
         Err(_) => return Err(ApiError::invalid_request_body(request_id)),
     };
-    let token_id = Uuid::new_v4().to_string();
+    let token_id = state
+        .token_metadata
+        .new_token_id()
+        .map_err(|_| ApiError::internal_failure(request_id))?;
+    let issued_at = state
+        .token_metadata
+        .now()
+        .map_err(|_| ApiError::internal_failure(request_id))?;
     let material = state
         .auth
-        .issue_client_token(token_id.clone(), request.client_id.clone(), timestamp())
+        .issue_client_token(token_id.clone(), request.client_id.clone(), issued_at)
         .await
         .map_err(|_| ApiError::storage_failure(request_id))?;
     let token = material.into_response_value();
@@ -130,9 +136,13 @@ pub(crate) async fn revoke(
         path.map_err(|_| ApiError::invalid_path_parameters(request_id))?;
     let client_id =
         ClientId::new(client_id).map_err(|_| ApiError::invalid_client_id(request_id))?;
+    let revoked_at = state
+        .token_metadata
+        .now()
+        .map_err(|_| ApiError::internal_failure(request_id))?;
     let revoked = state
         .auth
-        .revoke_client_token(client_id, token_id, timestamp())
+        .revoke_client_token(client_id, token_id, revoked_at)
         .await
         .map_err(|_| ApiError::storage_failure(request_id))?;
     Ok(Json(RevokeResponse { revoked }))
@@ -155,14 +165,6 @@ const fn lifecycle_phase_name(phase: crate::lifecycle::LifecyclePhase) -> &'stat
         LifecyclePhase::AwaitingCancellation => "awaiting_cancellation",
         LifecyclePhase::Stopping => "stopping",
     }
-}
-
-fn timestamp() -> String {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        .to_string()
 }
 
 pub(crate) async fn not_found(Extension(request_id): Extension<RequestId>) -> ApiError {

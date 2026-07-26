@@ -1,13 +1,7 @@
 use clap::Parser;
 
-#[derive(Debug, Parser)]
-#[command(
-    name = "wokcore",
-    version,
-    about = "Independent local provider gateway for the Wok product family"
-)]
-struct Cli {}
-
-fn main() {
-    Cli::parse();
+#[tokio::main]
+async fn main() {
+    let cli = wokcore::cli::Cli::parse();
+    std::process::exit(wokcore::run_production(cli).await.as_i32());
 }
