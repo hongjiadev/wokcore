@@ -10,13 +10,14 @@ use rusqlite::{Connection, params};
 use wokcore_core::id::ClientId;
 use wokcore_storage::{
     AttemptId, CandidateBeginOutcome, ClientTokenMetadata, ClientTokenScope, CodexReplaySignature,
-    MAX_CODEX_REPLAY_SIGNATURES, MAX_SESSION_BATCH_BYTES, MAX_SESSION_BATCH_ROWS,
-    MAX_SUPPLEMENTAL_ROWS, OpaqueFingerprint, ParserCheckpoint, ReadOnlyStateStore, RequestId,
+    GlobalSessionIndexPageKey, GlobalSessionUsagePageKey, MAX_CODEX_REPLAY_SIGNATURES,
+    MAX_SESSION_BATCH_BYTES, MAX_SESSION_BATCH_ROWS, MAX_SUPPLEMENTAL_ROWS, OpaqueFingerprint,
+    ParserCheckpoint, ReadOnlyStateStore, ReplaySignaturePageKey, RequestId,
     RequestSupplementalMetadata, SessionAvailability, SessionBatch, SessionFileIdentity,
-    SessionGenerationState, SessionIndexRecord, SessionScanCursor, SessionScanResultCode,
-    SessionSourceErrorCode, SessionSourceKind, SessionSourceStatus, SessionUsageRecord, StateStore,
-    StorageError, SupplementalErrorCode, SupplementalFailoverDecision, SupplementalRetryDecision,
-    TraceId,
+    SessionGenerationState, SessionIndexPageKey, SessionIndexRecord, SessionScanCursor,
+    SessionScanResultCode, SessionSourceErrorCode, SessionSourceKind, SessionSourcePageKey,
+    SessionSourceStatus, SessionUsagePageKey, SessionUsageRecord, StateStore, StorageError,
+    SupplementalErrorCode, SupplementalFailoverDecision, SupplementalRetryDecision, TraceId,
 };
 
 const NOW: &str = "2026-07-26T00:00:00Z";
@@ -182,6 +183,56 @@ fn promote_one_record(
         .promote_candidate(source_key, generation, NOW)
         .unwrap();
     generation_cursor.generation_state = SessionGenerationState::Current;
+}
+
+#[test]
+fn external_crate_can_rebuild_every_page_key_from_validated_components() {
+    let source_key = opaque(1);
+    let session_key = opaque(2);
+    let usage_id = opaque(3);
+
+    let index = SessionIndexPageKey::new(&source_key, 4, NOW, &session_key).unwrap();
+    assert_eq!(index.source_key(), source_key);
+    assert_eq!(index.generation(), 4);
+    assert_eq!(index.last_active_at(), NOW);
+    assert_eq!(index.session_key(), session_key);
+
+    let source = SessionSourcePageKey::new(&source_key).unwrap();
+    assert_eq!(source.source_key(), source_key);
+
+    let global_index = GlobalSessionIndexPageKey::new(NOW, &session_key, &source_key).unwrap();
+    assert_eq!(global_index.last_active_at(), NOW);
+    assert_eq!(global_index.session_key(), session_key);
+    assert_eq!(global_index.source_key(), source_key);
+
+    let usage = SessionUsagePageKey::new(&source_key, 4, NOW, &usage_id).unwrap();
+    assert_eq!(usage.source_key(), source_key);
+    assert_eq!(usage.generation(), 4);
+    assert_eq!(usage.occurred_at(), NOW);
+    assert_eq!(usage.usage_id(), usage_id);
+
+    let global_usage = GlobalSessionUsagePageKey::new(NOW, &usage_id, &source_key).unwrap();
+    assert_eq!(global_usage.occurred_at(), NOW);
+    assert_eq!(global_usage.usage_id(), usage_id);
+    assert_eq!(global_usage.source_key(), source_key);
+
+    let replay = ReplaySignaturePageKey::new(&source_key, 4, 5).unwrap();
+    assert_eq!(replay.parent_source_key(), source_key);
+    assert_eq!(replay.parent_generation(), 4);
+    assert_eq!(replay.token_event_ordinal(), 5);
+
+    assert!(SessionSourcePageKey::new("not-an-opaque-key").is_err());
+    assert!(SessionIndexPageKey::new(&source_key, 0, NOW, &session_key).is_err());
+    assert!(
+        GlobalSessionIndexPageKey::new("2026-07-26T00:00:00+00:00", &session_key, &source_key)
+            .is_err()
+    );
+    assert!(SessionUsagePageKey::new(&source_key, 4, NOW, "not-an-opaque-key").is_err());
+    assert!(
+        GlobalSessionUsagePageKey::new("2026-07-26T00:00:00+00:00", &usage_id, &source_key,)
+            .is_err()
+    );
+    assert!(ReplaySignaturePageKey::new(&source_key, 4, 0).is_err());
 }
 
 #[test]
@@ -708,6 +759,29 @@ fn current_cursor_rejects_invariant_changes_and_regressive_file_metadata() {
     let mut expected = staging;
     expected.generation_state = SessionGenerationState::Current;
 
+    let wal_before_replay = store.wal_size_bytes().unwrap();
+    let replay_outcome = store
+        .commit_session_batch(&SessionBatch {
+            cursor: Some(expected.clone()),
+            ..SessionBatch::default()
+        })
+        .unwrap();
+    assert_eq!(replay_outcome.inserted_rows, 0);
+    assert_eq!(replay_outcome.dropped_rows, 0);
+    assert_eq!(store.wal_size_bytes().unwrap(), wal_before_replay);
+
+    let mut changed_checkpoint = expected.clone();
+    changed_checkpoint.parser_checkpoint.previous_input_tokens += 1;
+    assert!(matches!(
+        store
+            .commit_session_batch(&SessionBatch {
+                cursor: Some(changed_checkpoint),
+                ..SessionBatch::default()
+            })
+            .unwrap_err(),
+        StorageError::StableRecordConflict { .. }
+    ));
+
     let mut changed_lineage = expected.clone();
     changed_lineage.parent_generation = Some(5);
     assert!(matches!(
@@ -744,6 +818,17 @@ fn current_cursor_rejects_invariant_changes_and_regressive_file_metadata() {
             .unwrap_err(),
         StorageError::StableRecordConflict { .. }
     ));
+
+    let mut result_transition = expected.clone();
+    result_transition.result_code = Some(SessionScanResultCode::Unchanged);
+    result_transition.result_changed_at = Some("2026-07-26T00:01:00Z".to_owned());
+    store
+        .commit_session_batch(&SessionBatch {
+            cursor: Some(result_transition.clone()),
+            ..SessionBatch::default()
+        })
+        .unwrap();
+    expected = result_transition;
     assert_eq!(
         store.load_current_session_scan_cursor(&source_key).unwrap(),
         Some(expected)
@@ -1416,12 +1501,14 @@ fn repeated_unchanged_success_and_identical_failure_are_zero_write() {
             .unwrap()
     );
     assert_eq!(store.wal_size_bytes().unwrap(), wal_after_failure);
+    let mut retained = index_record(&source_key, 1, 9000);
+    retained.availability = SessionAvailability::Unavailable;
     assert_eq!(
         store
             .load_current_session_index_page(&source_key, None, 200)
             .unwrap()
             .items,
-        [index_record(&source_key, 1, 9000)]
+        [retained]
     );
 }
 
@@ -1479,6 +1566,73 @@ fn source_without_success_becomes_unavailable_without_aggregate_deletion() {
     assert_eq!(
         state.error_code,
         Some(SessionSourceErrorCode::SourceSessionsAbsent)
+    );
+}
+
+#[test]
+fn current_index_derives_effective_availability_from_source_status() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.db");
+    let source_key = opaque(145);
+    let mut store = StateStore::open(&path).unwrap();
+    promote_one_record(&mut store, &source_key, 1, 1450);
+
+    store
+        .fail_candidate(
+            &source_key,
+            1,
+            SessionSourceErrorCode::SourceIoFailed,
+            "2026-07-26T00:01:00Z",
+        )
+        .unwrap();
+
+    let current = store
+        .load_current_session_index_page(&source_key, None, 200)
+        .unwrap();
+    assert_eq!(
+        current.items[0].availability,
+        SessionAvailability::Unavailable
+    );
+    let global = store
+        .load_global_current_session_index_page(None, 200)
+        .unwrap();
+    assert_eq!(
+        global.items[0].availability,
+        SessionAvailability::Unavailable
+    );
+
+    let connection = Connection::open(&path).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT availability FROM session_index
+                 WHERE source_key = ?1 AND generation = 1",
+                [&source_key],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "available"
+    );
+    drop(connection);
+
+    store
+        .record_source_success(&source_key, 1, "2026-07-26T00:02:00Z")
+        .unwrap();
+    assert_eq!(
+        store
+            .load_current_session_index_page(&source_key, None, 200)
+            .unwrap()
+            .items[0]
+            .availability,
+        SessionAvailability::Available
+    );
+    assert_eq!(
+        store
+            .load_global_current_session_index_page(None, 200)
+            .unwrap()
+            .items[0]
+            .availability,
+        SessionAvailability::Available
     );
 }
 
@@ -1564,7 +1718,7 @@ fn supplemental_batch_is_bounded_atomic_retained_and_drops_under_pressure() {
 }
 
 #[test]
-fn session_batch_supplemental_path_cannot_bypass_global_capacity() {
+fn every_session_batch_path_reports_exact_supplemental_pressure_drops() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("state.db");
     let mut store = StateStore::open(&path).unwrap();
@@ -1591,16 +1745,43 @@ fn session_batch_supplemental_path_cannot_bypass_global_capacity() {
         .unwrap();
     drop(connection);
 
-    store
+    let outcome = store
         .commit_session_batch(&SessionBatch {
-            supplemental_metadata: vec![supplemental("capacity-bypass")],
+            supplemental_metadata: vec![
+                supplemental("capacity-bypass-1"),
+                supplemental("capacity-bypass-2"),
+            ],
             ..SessionBatch::default()
         })
         .unwrap();
+    assert_eq!(outcome.inserted_rows, 0);
+    assert_eq!(outcome.dropped_rows, 2);
 
     assert_eq!(
         store.inspect_request_supplemental().unwrap().rows,
         MAX_SUPPLEMENTAL_ROWS
+    );
+
+    let source_key = opaque(403);
+    let candidate_cursor = cursor(&source_key, 1, 100);
+    store.begin_or_resume_candidate(&candidate_cursor).unwrap();
+    let outcome = store
+        .commit_candidate_batch(&SessionBatch {
+            cursor: Some(candidate_cursor),
+            index_records: vec![index_record(&source_key, 1, 4030)],
+            supplemental_metadata: vec![supplemental("candidate-pressure")],
+            ..SessionBatch::default()
+        })
+        .unwrap();
+    assert_eq!(outcome.inserted_rows, 0);
+    assert_eq!(outcome.dropped_rows, 1);
+    store.promote_candidate(&source_key, 1, NOW).unwrap();
+    assert_eq!(
+        store
+            .load_current_session_index_page(&source_key, None, 200)
+            .unwrap()
+            .items,
+        [index_record(&source_key, 1, 4030)]
     );
 }
 
@@ -1867,6 +2048,68 @@ fn generation_cleanup_accounts_for_unicode_in_utf8_bytes() {
             .unwrap(),
         1
     );
+}
+
+#[test]
+fn generation_cleanup_cursor_bytes_exactly_match_batch_accounting() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.db");
+    let source_key = opaque(146);
+    let mut store = StateStore::open(&path).unwrap();
+    let first_cursor = cursor(&source_key, 1, 100);
+    store.begin_or_resume_candidate(&first_cursor).unwrap();
+    store.promote_candidate(&source_key, 1, NOW).unwrap();
+    let second_cursor = cursor(&source_key, 2, 100);
+    store.begin_or_resume_candidate(&second_cursor).unwrap();
+    store
+        .promote_candidate(&source_key, 2, "2026-07-26T00:01:00Z")
+        .unwrap();
+
+    let connection = Connection::open(&path).unwrap();
+    let checkpoint_bytes = usize::try_from(
+        connection
+            .query_row(
+                "SELECT length(parser_checkpoint) FROM session_scan_cursors
+                 WHERE source_key = ?1 AND generation = 1",
+                [&source_key],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    drop(connection);
+    let expected_cursor_bytes = source_key.len()
+        + first_cursor.file_identity.as_str().len()
+        + first_cursor.modified_at.len()
+        + "advanced".len()
+        + NOW.len()
+        + first_cursor.parent_source_key.as_ref().unwrap().len()
+        + checkpoint_bytes
+        + 128;
+
+    let too_small = store
+        .cleanup_generation_batch(
+            &source_key,
+            1,
+            MAX_SESSION_BATCH_ROWS,
+            expected_cursor_bytes - 1,
+        )
+        .unwrap();
+    assert_eq!(too_small.deleted_rows, 0);
+    assert_eq!(too_small.deleted_bytes, 0);
+    assert!(!too_small.complete);
+
+    let exact = store
+        .cleanup_generation_batch(
+            &source_key,
+            1,
+            MAX_SESSION_BATCH_ROWS,
+            expected_cursor_bytes,
+        )
+        .unwrap();
+    assert_eq!(exact.deleted_rows, 1);
+    assert_eq!(exact.deleted_bytes, expected_cursor_bytes);
+    assert!(exact.complete);
 }
 
 #[test]

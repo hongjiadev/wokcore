@@ -19,6 +19,60 @@ const RUNTIME_AUTH_MIGRATION: &str = include_str!("../../migrations/0002_runtime
 const SESSION_DIAGNOSTICS_MIGRATION: &str =
     include_str!("../../migrations/0003_session_diagnostics.sql");
 const LATEST_SCHEMA_VERSION: i64 = 3;
+const GLOBAL_CURRENT_SESSION_INDEX_FIRST_PAGE_SQL: &str =
+    "SELECT i.session_key, i.source_key, i.generation, i.source_kind,
+            i.created_at, i.last_active_at, i.message_count,
+            i.usage_event_count,
+            CASE WHEN s.status = 'available'
+                 THEN i.availability ELSE 'unavailable' END
+     FROM session_sources s
+     CROSS JOIN session_index i INDEXED BY session_index_current_order
+     WHERE i.source_key = s.source_key
+       AND i.generation = s.current_generation
+     ORDER BY i.last_active_at DESC, i.session_key, i.source_key
+     LIMIT ?1";
+const GLOBAL_CURRENT_SESSION_INDEX_AFTER_PAGE_SQL: &str =
+    "SELECT i.session_key, i.source_key, i.generation, i.source_kind,
+            i.created_at, i.last_active_at, i.message_count,
+            i.usage_event_count,
+            CASE WHEN s.status = 'available'
+                 THEN i.availability ELSE 'unavailable' END
+     FROM session_sources s
+     CROSS JOIN session_index i INDEXED BY session_index_current_order
+     WHERE i.source_key = s.source_key
+       AND i.generation = s.current_generation
+       AND (i.last_active_at < ?1
+         OR (i.last_active_at = ?1 AND i.session_key > ?2)
+         OR (i.last_active_at = ?1 AND i.session_key = ?2
+             AND i.source_key > ?3))
+     ORDER BY i.last_active_at DESC, i.session_key, i.source_key
+     LIMIT ?4";
+const GLOBAL_CURRENT_SESSION_USAGE_FIRST_PAGE_SQL: &str =
+    "SELECT u.usage_id, u.session_key, u.source_key, u.generation,
+            u.source_kind, u.model, u.occurred_at, u.input_tokens,
+            u.output_tokens, u.cache_read_tokens, u.cache_write_tokens,
+            u.reasoning_tokens, u.record_revision
+     FROM session_sources s
+     CROSS JOIN session_usage_records u INDEXED BY session_usage_current_order
+     WHERE u.source_key = s.source_key
+       AND u.generation = s.current_generation
+     ORDER BY u.occurred_at, u.usage_id, u.source_key
+     LIMIT ?1";
+const GLOBAL_CURRENT_SESSION_USAGE_AFTER_PAGE_SQL: &str =
+    "SELECT u.usage_id, u.session_key, u.source_key, u.generation,
+            u.source_kind, u.model, u.occurred_at, u.input_tokens,
+            u.output_tokens, u.cache_read_tokens, u.cache_write_tokens,
+            u.reasoning_tokens, u.record_revision
+     FROM session_sources s
+     CROSS JOIN session_usage_records u INDEXED BY session_usage_current_order
+     WHERE u.source_key = s.source_key
+       AND u.generation = s.current_generation
+       AND (u.occurred_at > ?1
+         OR (u.occurred_at = ?1 AND u.usage_id > ?2)
+         OR (u.occurred_at = ?1 AND u.usage_id = ?2
+             AND u.source_key > ?3))
+     ORDER BY u.occurred_at, u.usage_id, u.source_key
+     LIMIT ?4";
 
 pub const WAL_CHECKPOINT_THRESHOLD_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -629,6 +683,43 @@ pub struct SessionIndexPageKey {
     session_key: String,
 }
 
+impl SessionIndexPageKey {
+    pub fn new(
+        source_key: impl Into<String>,
+        generation: u64,
+        last_active_at: impl Into<String>,
+        session_key: impl Into<String>,
+    ) -> Result<Self, StorageError> {
+        let key = Self {
+            source_key: source_key.into(),
+            generation,
+            last_active_at: last_active_at.into(),
+            session_key: session_key.into(),
+        };
+        validate_opaque_key("source key", &key.source_key)?;
+        validate_generation(key.generation)?;
+        validate_timestamp("Session page activity timestamp", &key.last_active_at)?;
+        validate_opaque_key("session key", &key.session_key)?;
+        Ok(key)
+    }
+
+    pub fn source_key(&self) -> &str {
+        &self.source_key
+    }
+
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn last_active_at(&self) -> &str {
+        &self.last_active_at
+    }
+
+    pub fn session_key(&self) -> &str {
+        &self.session_key
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionIndexPage {
     pub items: Vec<SessionIndexRecord>,
@@ -638,6 +729,18 @@ pub struct SessionIndexPage {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionSourcePageKey {
     source_key: String,
+}
+
+impl SessionSourcePageKey {
+    pub fn new(source_key: impl Into<String>) -> Result<Self, StorageError> {
+        let source_key = source_key.into();
+        validate_opaque_key("source key", &source_key)?;
+        Ok(Self { source_key })
+    }
+
+    pub fn source_key(&self) -> &str {
+        &self.source_key
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -651,6 +754,39 @@ pub struct GlobalSessionIndexPageKey {
     last_active_at: String,
     session_key: String,
     source_key: String,
+}
+
+impl GlobalSessionIndexPageKey {
+    pub fn new(
+        last_active_at: impl Into<String>,
+        session_key: impl Into<String>,
+        source_key: impl Into<String>,
+    ) -> Result<Self, StorageError> {
+        let key = Self {
+            last_active_at: last_active_at.into(),
+            session_key: session_key.into(),
+            source_key: source_key.into(),
+        };
+        validate_timestamp(
+            "global Session page activity timestamp",
+            &key.last_active_at,
+        )?;
+        validate_opaque_key("session key", &key.session_key)?;
+        validate_opaque_key("source key", &key.source_key)?;
+        Ok(key)
+    }
+
+    pub fn last_active_at(&self) -> &str {
+        &self.last_active_at
+    }
+
+    pub fn session_key(&self) -> &str {
+        &self.session_key
+    }
+
+    pub fn source_key(&self) -> &str {
+        &self.source_key
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -667,6 +803,43 @@ pub struct SessionUsagePageKey {
     usage_id: String,
 }
 
+impl SessionUsagePageKey {
+    pub fn new(
+        source_key: impl Into<String>,
+        generation: u64,
+        occurred_at: impl Into<String>,
+        usage_id: impl Into<String>,
+    ) -> Result<Self, StorageError> {
+        let key = Self {
+            source_key: source_key.into(),
+            generation,
+            occurred_at: occurred_at.into(),
+            usage_id: usage_id.into(),
+        };
+        validate_opaque_key("source key", &key.source_key)?;
+        validate_generation(key.generation)?;
+        validate_timestamp("Session usage page timestamp", &key.occurred_at)?;
+        validate_opaque_key("usage identifier", &key.usage_id)?;
+        Ok(key)
+    }
+
+    pub fn source_key(&self) -> &str {
+        &self.source_key
+    }
+
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn occurred_at(&self) -> &str {
+        &self.occurred_at
+    }
+
+    pub fn usage_id(&self) -> &str {
+        &self.usage_id
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionUsagePage {
     pub items: Vec<SessionUsageRecord>,
@@ -680,6 +853,36 @@ pub struct GlobalSessionUsagePageKey {
     source_key: String,
 }
 
+impl GlobalSessionUsagePageKey {
+    pub fn new(
+        occurred_at: impl Into<String>,
+        usage_id: impl Into<String>,
+        source_key: impl Into<String>,
+    ) -> Result<Self, StorageError> {
+        let key = Self {
+            occurred_at: occurred_at.into(),
+            usage_id: usage_id.into(),
+            source_key: source_key.into(),
+        };
+        validate_timestamp("global Session usage page timestamp", &key.occurred_at)?;
+        validate_opaque_key("usage identifier", &key.usage_id)?;
+        validate_opaque_key("source key", &key.source_key)?;
+        Ok(key)
+    }
+
+    pub fn occurred_at(&self) -> &str {
+        &self.occurred_at
+    }
+
+    pub fn usage_id(&self) -> &str {
+        &self.usage_id
+    }
+
+    pub fn source_key(&self) -> &str {
+        &self.source_key
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GlobalSessionUsagePage {
     pub items: Vec<SessionUsageRecord>,
@@ -691,6 +894,39 @@ pub struct ReplaySignaturePageKey {
     parent_source_key: String,
     parent_generation: u64,
     token_event_ordinal: u64,
+}
+
+impl ReplaySignaturePageKey {
+    pub fn new(
+        parent_source_key: impl Into<String>,
+        parent_generation: u64,
+        token_event_ordinal: u64,
+    ) -> Result<Self, StorageError> {
+        let key = Self {
+            parent_source_key: parent_source_key.into(),
+            parent_generation,
+            token_event_ordinal,
+        };
+        validate_opaque_key("parent source key", &key.parent_source_key)?;
+        validate_generation(key.parent_generation)?;
+        if key.token_event_ordinal == 0 {
+            return Err(invalid_state("replay signature ordinal must be positive"));
+        }
+        to_i64(key.token_event_ordinal, "replay ordinal")?;
+        Ok(key)
+    }
+
+    pub fn parent_source_key(&self) -> &str {
+        &self.parent_source_key
+    }
+
+    pub const fn parent_generation(&self) -> u64 {
+        self.parent_generation
+    }
+
+    pub const fn token_event_ordinal(&self) -> u64 {
+        self.token_event_ordinal
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -717,22 +953,16 @@ pub struct ReadOnlyStateStore {
     connection: Connection,
 }
 
-#[derive(Clone, Copy)]
-enum ReadOnlyAccess {
-    Offline,
-    Live,
-}
-
 impl ReadOnlyStateStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
-        Self::open_path(path.as_ref(), ReadOnlyAccess::Offline)
+        Self::open_path(path.as_ref())
     }
 
     pub fn open_live(path: impl AsRef<Path>) -> Result<Self, StorageError> {
-        Self::open_path(path.as_ref(), ReadOnlyAccess::Live)
+        Self::open_path(path.as_ref())
     }
 
-    fn open_path(path: &Path, _access: ReadOnlyAccess) -> Result<Self, StorageError> {
+    fn open_path(path: &Path) -> Result<Self, StorageError> {
         let absolute = path
             .canonicalize()
             .map_err(|source| StorageError::Io { source })?;
@@ -1250,7 +1480,10 @@ impl StateStore {
         Ok(outcome)
     }
 
-    pub fn commit_candidate_batch(&mut self, batch: &SessionBatch) -> Result<(), StorageError> {
+    pub fn commit_candidate_batch(
+        &mut self,
+        batch: &SessionBatch,
+    ) -> Result<SupplementalBatchOutcome, StorageError> {
         let cursor = batch
             .cursor
             .as_ref()
@@ -1263,7 +1496,10 @@ impl StateStore {
         self.commit_session_batch_internal(batch, Some(SessionGenerationState::Staging))
     }
 
-    pub fn commit_session_batch(&mut self, batch: &SessionBatch) -> Result<(), StorageError> {
+    pub fn commit_session_batch(
+        &mut self,
+        batch: &SessionBatch,
+    ) -> Result<SupplementalBatchOutcome, StorageError> {
         self.commit_session_batch_internal(batch, None)
     }
 
@@ -1271,7 +1507,7 @@ impl StateStore {
         &mut self,
         batch: &SessionBatch,
         required_state: Option<SessionGenerationState>,
-    ) -> Result<(), StorageError> {
+    ) -> Result<SupplementalBatchOutcome, StorageError> {
         validate_session_batch(batch)?;
         if batch.cursor.is_none()
             && batch.index_records.is_empty()
@@ -1279,7 +1515,10 @@ impl StateStore {
             && batch.replay_signatures.is_empty()
             && batch.supplemental_metadata.is_empty()
         {
-            return Ok(());
+            return Ok(SupplementalBatchOutcome {
+                inserted_rows: 0,
+                dropped_rows: 0,
+            });
         }
 
         let transaction = self
@@ -1325,16 +1564,27 @@ impl StateStore {
         }
         let (pending_supplemental, pending_supplemental_bytes) =
             pending_supplemental_metadata(&transaction, &batch.supplemental_metadata)?;
-        if supplemental_batch_fits(
+        let supplemental_outcome = if supplemental_batch_fits(
             &transaction,
             pending_supplemental.len(),
             pending_supplemental_bytes,
         )? {
+            let inserted_rows = pending_supplemental.len();
             for metadata in pending_supplemental {
                 write_supplemental_metadata(&transaction, metadata)?;
             }
-        }
-        transaction.commit().map_err(map_database_error)
+            SupplementalBatchOutcome {
+                inserted_rows,
+                dropped_rows: 0,
+            }
+        } else {
+            SupplementalBatchOutcome {
+                inserted_rows: 0,
+                dropped_rows: pending_supplemental.len(),
+            }
+        };
+        transaction.commit().map_err(map_database_error)?;
+        Ok(supplemental_outcome)
     }
 
     pub fn promote_candidate(
@@ -1880,6 +2130,9 @@ impl StateStore {
                 "SELECT length(CAST(source_key AS BLOB))
                         + length(CAST(file_identity AS BLOB))
                         + length(CAST(modified_at AS BLOB))
+                        + length(CAST(COALESCE(result_code, '') AS BLOB))
+                        + length(CAST(COALESCE(result_changed_at, '') AS BLOB))
+                        + length(CAST(COALESCE(parent_source_key, '') AS BLOB))
                         + length(parser_checkpoint) + 128
                  FROM session_scan_cursors WHERE source_key = ?1 AND generation = ?2",
                 params![source_key, generation],
@@ -1997,31 +2250,11 @@ impl StateStore {
         validate_page_limit(limit, 200)?;
         let (sql, values): (&str, Vec<rusqlite::types::Value>) = match after {
             None => (
-                "SELECT i.session_key, i.source_key, i.generation, i.source_kind,
-                        i.created_at, i.last_active_at, i.message_count,
-                        i.usage_event_count, i.availability
-                 FROM session_sources s
-                 JOIN session_index i
-                   ON i.source_key = s.source_key
-                  AND i.generation = s.current_generation
-                 ORDER BY i.last_active_at DESC, i.session_key, i.source_key
-                 LIMIT ?1",
+                GLOBAL_CURRENT_SESSION_INDEX_FIRST_PAGE_SQL,
                 vec![usize_to_i64(limit + 1, "page limit")?.into()],
             ),
             Some(key) => (
-                "SELECT i.session_key, i.source_key, i.generation, i.source_kind,
-                        i.created_at, i.last_active_at, i.message_count,
-                        i.usage_event_count, i.availability
-                 FROM session_sources s
-                 JOIN session_index i
-                   ON i.source_key = s.source_key
-                  AND i.generation = s.current_generation
-                 WHERE i.last_active_at < ?1
-                    OR (i.last_active_at = ?1 AND i.session_key > ?2)
-                    OR (i.last_active_at = ?1 AND i.session_key = ?2
-                        AND i.source_key > ?3)
-                 ORDER BY i.last_active_at DESC, i.session_key, i.source_key
-                 LIMIT ?4",
+                GLOBAL_CURRENT_SESSION_INDEX_AFTER_PAGE_SQL,
                 vec![
                     key.last_active_at.clone().into(),
                     key.session_key.clone().into(),
@@ -2066,33 +2299,11 @@ impl StateStore {
         validate_page_limit(limit, 500)?;
         let (sql, values): (&str, Vec<rusqlite::types::Value>) = match after {
             None => (
-                "SELECT u.usage_id, u.session_key, u.source_key, u.generation,
-                        u.source_kind, u.model, u.occurred_at, u.input_tokens,
-                        u.output_tokens, u.cache_read_tokens, u.cache_write_tokens,
-                        u.reasoning_tokens, u.record_revision
-                 FROM session_sources s
-                 JOIN session_usage_records u
-                   ON u.source_key = s.source_key
-                  AND u.generation = s.current_generation
-                 ORDER BY u.occurred_at, u.usage_id, u.source_key
-                 LIMIT ?1",
+                GLOBAL_CURRENT_SESSION_USAGE_FIRST_PAGE_SQL,
                 vec![usize_to_i64(limit + 1, "page limit")?.into()],
             ),
             Some(key) => (
-                "SELECT u.usage_id, u.session_key, u.source_key, u.generation,
-                        u.source_kind, u.model, u.occurred_at, u.input_tokens,
-                        u.output_tokens, u.cache_read_tokens, u.cache_write_tokens,
-                        u.reasoning_tokens, u.record_revision
-                 FROM session_sources s
-                 JOIN session_usage_records u
-                   ON u.source_key = s.source_key
-                  AND u.generation = s.current_generation
-                 WHERE u.occurred_at > ?1
-                    OR (u.occurred_at = ?1 AND u.usage_id > ?2)
-                    OR (u.occurred_at = ?1 AND u.usage_id = ?2
-                        AND u.source_key > ?3)
-                 ORDER BY u.occurred_at, u.usage_id, u.source_key
-                 LIMIT ?4",
+                GLOBAL_CURRENT_SESSION_USAGE_AFTER_PAGE_SQL,
                 vec![
                     key.occurred_at.clone().into(),
                     key.usage_id.clone().into(),
@@ -2144,7 +2355,9 @@ impl StateStore {
             None => (
                 "SELECT s.current_generation, i.session_key, i.source_key, i.generation,
                         i.source_kind, i.created_at, i.last_active_at, i.message_count,
-                        i.usage_event_count, i.availability
+                        i.usage_event_count,
+                        CASE WHEN s.status = 'available'
+                             THEN i.availability ELSE 'unavailable' END
                  FROM session_sources s
                  LEFT JOIN session_index i
                    ON i.source_key = s.source_key
@@ -2160,7 +2373,9 @@ impl StateStore {
             Some(key) => (
                 "SELECT s.current_generation, i.session_key, i.source_key, i.generation,
                         i.source_kind, i.created_at, i.last_active_at, i.message_count,
-                        i.usage_event_count, i.availability
+                        i.usage_event_count,
+                        CASE WHEN s.status = 'available'
+                             THEN i.availability ELSE 'unavailable' END
                  FROM session_sources s
                  LEFT JOIN session_index i
                    ON i.source_key = s.source_key
@@ -3241,6 +3456,9 @@ fn upsert_cursor(connection: &Connection, cursor: &SessionScanCursor) -> Result<
                 && cursor.modified_at >= existing.modified_at
                 && cursor.complete_byte_offset >= existing.complete_byte_offset
                 && cursor.stable_record_ordinal >= existing.stable_record_ordinal
+                && (cursor.complete_byte_offset > existing.complete_byte_offset
+                    || cursor.stable_record_ordinal > existing.stable_record_ordinal
+                    || cursor.parser_checkpoint == existing.parser_checkpoint)
                 && !(existing.result_code.is_some() && cursor.result_code.is_none())
                 && (!matches!(
                     (&existing.result_changed_at, &cursor.result_changed_at),
@@ -4182,5 +4400,153 @@ fn map_database_error(error: rusqlite::Error) -> StorageError {
             }
         }
         _ => StorageError::StateDatabase { source: error },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rusqlite::StatementStatus;
+
+    use super::*;
+
+    fn opaque(value: u64) -> String {
+        format!("{value:064x}")
+    }
+
+    fn query_vm_steps(connection: &Connection, sql: &str) -> i32 {
+        let mut statement = connection.prepare(sql).unwrap();
+        let rows = statement
+            .query_map([2_i64], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        statement.get_status(StatementStatus::VmStep)
+    }
+
+    #[test]
+    fn global_current_query_vm_work_does_not_scale_with_hidden_generations() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::open(directory.path().join("state.db")).unwrap();
+        let source_key = opaque(1);
+        store
+            .connection
+            .execute(
+                "INSERT INTO session_sources(
+                    source_key, source_kind, current_generation, staging_generation,
+                    retired_generation, status, error_code, last_transition_at
+                 ) VALUES (?1, 'codex', 1, NULL, NULL, 'available', NULL, ?2)",
+                params![source_key, "2026-07-26T00:00:00Z"],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO session_scan_cursors(
+                    source_key, generation, source_kind, generation_state, file_identity,
+                    observed_size, modified_at, complete_byte_offset, stable_record_ordinal,
+                    parser_checkpoint, head_fingerprint, boundary_fingerprint,
+                    parent_source_key, parent_generation, replay_boundary_fingerprint,
+                    result_code, result_changed_at
+                 ) VALUES (
+                    ?1, 1, 'codex', 'current', ?2, 0, ?3, 0, 0,
+                    X'31', zeroblob(32), zeroblob(32), NULL, NULL, NULL, NULL, NULL
+                 )",
+                params![source_key, opaque(2), "2026-07-26T00:00:00Z"],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO session_index(
+                    session_key, source_key, generation, source_kind, created_at,
+                    last_active_at, message_count, usage_event_count, availability
+                 ) VALUES (?1, ?2, 1, 'codex', ?3, ?3, 1, 1, 'available')",
+                params![opaque(3), source_key, "2026-07-26T00:00:00Z"],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO session_usage_records(
+                    usage_id, session_key, source_key, generation, source_kind, model,
+                    occurred_at, input_tokens, output_tokens, cache_read_tokens,
+                    cache_write_tokens, reasoning_tokens, record_revision
+                 ) VALUES (?1, ?2, ?3, 1, 'codex', 'gpt-5.6', ?4, 1, 1, 0, 0, 0, 1)",
+                params![opaque(4), opaque(3), source_key, "2026-07-26T00:00:00Z"],
+            )
+            .unwrap();
+
+        let baseline_index_steps = query_vm_steps(
+            &store.connection,
+            GLOBAL_CURRENT_SESSION_INDEX_FIRST_PAGE_SQL,
+        );
+        let baseline_usage_steps = query_vm_steps(
+            &store.connection,
+            GLOBAL_CURRENT_SESSION_USAGE_FIRST_PAGE_SQL,
+        );
+
+        store
+            .connection
+            .execute_batch(
+                "WITH RECURSIVE generations(value) AS (
+                    VALUES(2)
+                    UNION ALL
+                    SELECT value + 1 FROM generations WHERE value < 20001
+                 )
+                 INSERT INTO session_scan_cursors(
+                    source_key, generation, source_kind, generation_state, file_identity,
+                    observed_size, modified_at, complete_byte_offset, stable_record_ordinal,
+                    parser_checkpoint, head_fingerprint, boundary_fingerprint,
+                    parent_source_key, parent_generation, replay_boundary_fingerprint,
+                    result_code, result_changed_at
+                 )
+                 SELECT
+                    '0000000000000000000000000000000000000000000000000000000000000001',
+                    value, 'codex', 'retired',
+                    '0000000000000000000000000000000000000000000000000000000000000002',
+                    0, '2026-07-26T00:00:00Z', 0, 0, X'31',
+                    zeroblob(32), zeroblob(32), NULL, NULL, NULL, NULL, NULL
+                 FROM generations;
+
+                 INSERT INTO session_index(
+                    session_key, source_key, generation, source_kind, created_at,
+                    last_active_at, message_count, usage_event_count, availability
+                 )
+                 SELECT printf('%064x', generation),
+                        '0000000000000000000000000000000000000000000000000000000000000001',
+                        generation, 'codex', '2026-07-26T00:00:00Z',
+                        '9999-12-31T23:59:59Z', 1, 1, 'available'
+                 FROM session_scan_cursors WHERE generation > 1;
+
+                 INSERT INTO session_usage_records(
+                    usage_id, session_key, source_key, generation, source_kind, model,
+                    occurred_at, input_tokens, output_tokens, cache_read_tokens,
+                    cache_write_tokens, reasoning_tokens, record_revision
+                 )
+                 SELECT printf('%064x', generation), printf('%064x', generation),
+                        '0000000000000000000000000000000000000000000000000000000000000001',
+                        generation, 'codex', 'gpt-5.6', '0001-01-01T00:00:00Z',
+                        1, 1, 0, 0, 0, 1
+                 FROM session_scan_cursors WHERE generation > 1;",
+            )
+            .unwrap();
+
+        let hidden_index_steps = query_vm_steps(
+            &store.connection,
+            GLOBAL_CURRENT_SESSION_INDEX_FIRST_PAGE_SQL,
+        );
+        let hidden_usage_steps = query_vm_steps(
+            &store.connection,
+            GLOBAL_CURRENT_SESSION_USAGE_FIRST_PAGE_SQL,
+        );
+        assert!(
+            hidden_index_steps <= baseline_index_steps + 1_000,
+            "index VM steps scaled from {baseline_index_steps} to {hidden_index_steps}"
+        );
+        assert!(
+            hidden_usage_steps <= baseline_usage_steps + 1_000,
+            "usage VM steps scaled from {baseline_usage_steps} to {hidden_usage_steps}"
+        );
     }
 }

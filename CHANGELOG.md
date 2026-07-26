@@ -22,7 +22,7 @@ All notable WokCore changes are documented in this file.
 
 ### Fixed
 
-- Session state now enforces monotonic same-generation appends, complete current-cursor reloads, lineage-safe resume, single-snapshot current-generation paging, bounded startup enumeration/global pages, canonical UTC and typed persistent metadata, transactional generation compare-and-swap updates, shared supplemental capacity limits, indexed/batched replay accounting, UTF-8 cleanup byte budgets, and three-batch interruption coverage.
+- Session state now enforces monotonic same-generation appends, immutable same-position parser checkpoints, complete current-cursor reloads, lineage-safe resume, externally rebuildable validated page keys, source-derived effective availability, source-driven current-generation paging that ignores hidden-generation volume, transactional generation compare-and-swap updates, typed supplemental drop outcomes, exact cleanup byte budgets, and three-batch interruption coverage.
 - Configuration loading now rejects every field outside top-level `revision`/`server` and nested `server.port`, while preserving invalid source files.
 - Protocol channels, SSE frame aggregation, and Azure/Gemini event aggregation now fail closed at configured memory and event bounds.
 - OpenAI Responses streaming and non-stream aggregation now bound retained output, identifiers, output items, and serialized context and usage values.
