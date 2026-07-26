@@ -261,11 +261,28 @@ impl DirectoryChain {
     }
 
     #[cfg(target_vendor = "apple")]
+    pub(super) fn capture_ancestor_stability(
+        &self,
+    ) -> Result<DirectoryChainStability, SessionError> {
+        let generation = absolute_directory_chain_ancestor_generation(self)?;
+        validate_absolute_directory_chain_ancestor_generation(self, &generation)?;
+        Ok(DirectoryChainStability { generation })
+    }
+
+    #[cfg(target_vendor = "apple")]
     pub(super) fn verify_stability(
         &self,
         stability: &DirectoryChainStability,
     ) -> Result<(), SessionError> {
         validate_absolute_directory_chain_generation(self, &stability.generation)
+    }
+
+    #[cfg(target_vendor = "apple")]
+    pub(super) fn verify_ancestor_stability(
+        &self,
+        stability: &DirectoryChainStability,
+    ) -> Result<(), SessionError> {
+        validate_absolute_directory_chain_ancestor_generation(self, &stability.generation)
     }
 }
 
@@ -445,6 +462,30 @@ fn validate_absolute_directory_chain_generation(
 ) -> Result<(), SessionError> {
     validate_directory_chain(chain)?;
     if absolute_directory_chain_generation(chain)? != expected {
+        return Err(SessionError::UnsafePath);
+    }
+    Ok(())
+}
+
+#[cfg(target_vendor = "apple")]
+fn absolute_directory_chain_ancestor_generation(
+    chain: &DirectoryChain,
+) -> Result<Vec<DirectoryGeneration>, SessionError> {
+    chain
+        .directories
+        .iter()
+        .take(chain.directories.len().saturating_sub(1))
+        .map(|directory| directory_generation(&directory.file))
+        .collect()
+}
+
+#[cfg(target_vendor = "apple")]
+fn validate_absolute_directory_chain_ancestor_generation(
+    chain: &DirectoryChain,
+    expected: &[DirectoryGeneration],
+) -> Result<(), SessionError> {
+    validate_directory_chain(chain)?;
+    if absolute_directory_chain_ancestor_generation(chain)? != expected {
         return Err(SessionError::UnsafePath);
     }
     Ok(())

@@ -7,6 +7,8 @@ use std::{
 };
 
 use super::SessionError;
+#[cfg(target_vendor = "apple")]
+use super::file::DirectoryChainStability;
 #[cfg(not(target_vendor = "apple"))]
 use super::file::SessionFileIdentity;
 #[cfg(windows)]
@@ -40,6 +42,52 @@ struct CreatedTemporary {
 struct TemporaryCreationGuard<'a> {
     parent: &'a DirectoryChain,
     temporary: Option<CreatedTemporary>,
+}
+
+#[cfg(target_vendor = "apple")]
+struct ApplePublishStability {
+    watcher: apple::PublishWatcher,
+    parent_ancestors: DirectoryChainStability,
+    session_roots: Vec<DirectoryChainStability>,
+}
+
+#[cfg(target_vendor = "apple")]
+impl ApplePublishStability {
+    fn capture(
+        parent: &DirectoryChain,
+        session_roots: &[DirectoryChain],
+    ) -> Result<Self, SessionError> {
+        let watcher = apple::PublishWatcher::start(parent, session_roots)?;
+        let parent_ancestors = parent.capture_ancestor_stability()?;
+        let root_stabilities = session_roots
+            .iter()
+            .map(DirectoryChain::capture_stability)
+            .collect::<Result<Vec<_>, _>>()?;
+        let stability = Self {
+            watcher,
+            parent_ancestors,
+            session_roots: root_stabilities,
+        };
+        validate_export_boundary(parent, session_roots)?;
+        stability.verify(parent, session_roots)?;
+        Ok(stability)
+    }
+
+    fn verify(
+        &self,
+        parent: &DirectoryChain,
+        session_roots: &[DirectoryChain],
+    ) -> Result<(), SessionError> {
+        if self.session_roots.len() != session_roots.len() {
+            return Err(SessionError::UnsafePath);
+        }
+        self.watcher.verify_quiet()?;
+        parent.verify_ancestor_stability(&self.parent_ancestors)?;
+        for (root, stability) in session_roots.iter().zip(&self.session_roots) {
+            root.verify_stability(stability)?;
+        }
+        self.watcher.verify_quiet()
+    }
 }
 
 impl TemporaryCreationGuard<'_> {
@@ -142,6 +190,8 @@ impl PinnedExportDestination {
             return Err(SessionError::UnsafePath);
         }
         prepare_temporary_for_publish(temporary)?;
+        #[cfg(target_vendor = "apple")]
+        let publish_stability = ApplePublishStability::capture(&self.parent, &self.session_roots)?;
         publish_relative_noreplace(
             &self.parent,
             temporary,
@@ -150,7 +200,9 @@ impl PinnedExportDestination {
         )?;
         #[cfg(target_vendor = "apple")]
         {
+            publish_stability.verify(&self.parent, &self.session_roots)?;
             validate_export_boundary(&self.parent, &self.session_roots)?;
+            publish_stability.verify(&self.parent, &self.session_roots)?;
             temporary.disarm_published()?;
         }
         self.committed = true;
@@ -706,7 +758,10 @@ mod apple {
         fs::File,
         io,
         mem::{MaybeUninit, align_of, offset_of, size_of},
-        os::{fd::FromRawFd, unix::ffi::OsStrExt},
+        os::{
+            fd::{AsRawFd, FromRawFd, OwnedFd},
+            unix::ffi::OsStrExt,
+        },
         ptr,
     };
 
@@ -869,6 +924,89 @@ mod apple {
             count: CfIndex,
         ) -> CfStringRef;
         fn CFRelease(value: *const c_void);
+    }
+
+    pub(super) struct PublishWatcher {
+        queue: OwnedFd,
+    }
+
+    impl PublishWatcher {
+        pub(super) fn start(
+            parent: &DirectoryChain,
+            session_roots: &[DirectoryChain],
+        ) -> Result<Self, SessionError> {
+            let queue = unsafe { libc::kqueue() };
+            if queue < 0 {
+                return Err(SessionError::Io {
+                    source: io::Error::last_os_error(),
+                });
+            }
+            let queue = unsafe { OwnedFd::from_raw_fd(queue) };
+            let watched_events = libc::NOTE_DELETE | libc::NOTE_RENAME | libc::NOTE_REVOKE;
+            let mut changes = Vec::new();
+            for directory in parent.directories.iter().chain(
+                session_roots
+                    .iter()
+                    .flat_map(|root| root.directories.iter()),
+            ) {
+                changes.push(libc::kevent {
+                    ident: directory.file.as_raw_fd() as libc::uintptr_t,
+                    filter: libc::EVFILT_VNODE,
+                    flags: libc::EV_ADD | libc::EV_CLEAR,
+                    fflags: watched_events,
+                    data: 0,
+                    udata: ptr::null_mut(),
+                });
+            }
+            let change_count =
+                libc::c_int::try_from(changes.len()).map_err(|_| SessionError::UnsafePath)?;
+            let status = unsafe {
+                libc::kevent(
+                    queue.as_raw_fd(),
+                    changes.as_ptr(),
+                    change_count,
+                    ptr::null_mut(),
+                    0,
+                    ptr::null(),
+                )
+            };
+            if status < 0 {
+                return Err(SessionError::Io {
+                    source: io::Error::last_os_error(),
+                });
+            }
+            if status != 0 {
+                return Err(SessionError::UnsafePath);
+            }
+            Ok(Self { queue })
+        }
+
+        pub(super) fn verify_quiet(&self) -> Result<(), SessionError> {
+            let timeout = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            let mut event = MaybeUninit::<libc::kevent>::uninit();
+            let status = unsafe {
+                libc::kevent(
+                    self.queue.as_raw_fd(),
+                    ptr::null(),
+                    0,
+                    event.as_mut_ptr(),
+                    1,
+                    &raw const timeout,
+                )
+            };
+            if status < 0 {
+                return Err(SessionError::Io {
+                    source: io::Error::last_os_error(),
+                });
+            }
+            if status != 0 {
+                return Err(SessionError::UnsafePath);
+            }
+            Ok(())
+        }
     }
 
     pub(super) struct Temporary {
@@ -1147,6 +1285,10 @@ mod apple {
                 });
             }
             self.object.reference = unsafe { published.assume_init() };
+            #[cfg(test)]
+            super::apple_synchronization_tests::hit(
+                super::AppleSynchronizationPoint::AfterObjectBoundPublish,
+            );
             Ok(())
         }
 
@@ -1359,6 +1501,7 @@ enum AppleSynchronizationPoint {
     BeforeIdentityOpen,
     AfterIdentityOpen,
     BeforeObjectBoundPublish,
+    AfterObjectBoundPublish,
 }
 
 #[cfg(all(test, target_vendor = "apple"))]
@@ -1859,6 +2002,58 @@ mod apple_regression_tests {
         assert!(!target.exists());
         assert!(directory_entries(&relocated_parent).is_empty());
         fs::remove_dir(&relocated_parent).unwrap();
+        assert!(directory_entries(&fixture.session_path).is_empty());
+    }
+
+    #[test]
+    fn object_bound_publish_detects_parent_move_into_session_and_back() {
+        let fixture = AppleFixture::new();
+        let target = fixture.export_parent.join("diagnostics.zip");
+        let mut destination =
+            PinnedExportDestination::create(&target, &[&fixture.session]).unwrap();
+        destination.write_all(b"owned temporary").unwrap();
+        let relocated_parent = fixture.session_path.join("relocated-exports");
+
+        let (thread_tx, thread_rx) = mpsc::channel();
+        let (start_tx, start_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            thread_tx.send(thread::current().id()).unwrap();
+            start_rx.recv().unwrap();
+            result_tx.send(destination.commit()).unwrap();
+        });
+        let worker_id = thread_rx.recv().unwrap();
+        let before_publish = install_apple_hook(
+            worker_id,
+            AppleSynchronizationPoint::BeforeObjectBoundPublish,
+        );
+        let after_publish = install_apple_hook(
+            worker_id,
+            AppleSynchronizationPoint::AfterObjectBoundPublish,
+        );
+        start_tx.send(()).unwrap();
+
+        assert!(wait_for_hook_or_result(&before_publish, &result_rx).is_none());
+        fs::rename(&fixture.export_parent, &relocated_parent).unwrap();
+        before_publish.resume_operation();
+
+        assert!(wait_for_hook_or_result(&after_publish, &result_rx).is_none());
+        let relocated_target = relocated_parent.join("diagnostics.zip");
+        assert_eq!(fs::read(&relocated_target).unwrap(), b"owned temporary");
+        fs::rename(&relocated_parent, &fixture.export_parent).unwrap();
+        after_publish.resume_operation();
+
+        let result = result_rx.recv().unwrap();
+        worker.join().unwrap();
+        super::apple_synchronization_tests::uninstall(worker_id);
+
+        assert!(matches!(
+            result,
+            Err(SessionError::UnsafePath | SessionError::Io { .. })
+        ));
+        assert!(!target.exists());
+        assert!(!relocated_parent.exists());
+        assert!(directory_entries(&fixture.export_parent).is_empty());
         assert!(directory_entries(&fixture.session_path).is_empty());
     }
 
