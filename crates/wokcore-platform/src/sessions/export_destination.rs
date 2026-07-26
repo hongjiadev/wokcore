@@ -705,14 +705,35 @@ mod apple {
         ptr,
     };
 
+    use crate::sessions::SessionFileIdentity;
+
     use super::{DirectoryChain, SessionError, file_identity};
 
-    const NO_ERR: i16 = 0;
-    const DUPLICATE_FILE_NAME_ERROR: i16 = -48;
-    const CATALOG_PERMISSIONS: u32 = 0x0000_0400;
+    // CoreServices/CarbonCore/Files.h 64-bit ABI, as mirrored by objc2-generated
+    // CoreServices/CarbonCore/Files.rs: FSIORefNum is c_int, OSStatus is i32,
+    // OSErr is i16, UniCharCount/FSCatalogInfoBitmap/OptionBits are u32.
+    type OsStatus = i32;
+    type OsErr = i16;
+    type FsIoRefNum = libc::c_int;
+    type UniCharCount = u32;
+    type CatalogInfoBitmap = u32;
+    type OptionBits = u32;
+    type ByteCount = usize;
+    type CfIndex = isize;
+    type CfStringRef = *const CfString;
+
+    const NO_ERR: OsErr = 0;
+    const DUPLICATE_FILE_NAME_ERROR: OsErr = -48;
+    const CATALOG_NODE_ID: CatalogInfoBitmap = 0x0000_0010;
+    const CATALOG_PERMISSIONS: CatalogInfoBitmap = 0x0000_0400;
     const READ_WRITE_PERMISSION: i8 = 3;
     const AT_MARK: u16 = 0;
-    const UNKNOWN_TEXT_ENCODING: u32 = 0xffff_ffff;
+    const DO_NOT_MOVE_ACROSS_VOLUMES: OptionBits = 4;
+
+    #[repr(C)]
+    struct CfString {
+        _private: [u8; 0],
+    }
 
     #[repr(C)]
     #[derive(Clone, Copy)]
@@ -785,56 +806,172 @@ mod apple {
 
     #[link(name = "CoreServices", kind = "framework")]
     unsafe extern "C" {
-        fn FSPathMakeRef(path: *const u8, reference: *mut FsRef, is_directory: *mut u8) -> i32;
-        fn FSRefMakePath(reference: *const FsRef, path: *mut u8, maximum_size: u32) -> i32;
-        fn FSGetDataForkName(name: *mut HfsUniStr255) -> i16;
-        fn FSCreateFileAndOpenForkUnicode(
+        fn FSPathMakeRef(path: *const u8, reference: *mut FsRef, is_directory: *mut u8)
+        -> OsStatus;
+        fn FSRefMakePath(reference: *const FsRef, path: *mut u8, maximum_size: u32) -> OsStatus;
+        fn FSGetDataForkName(name: *mut HfsUniStr255) -> OsErr;
+        fn FSCreateFileUnicode(
             parent: *const FsRef,
-            name_length: u32,
+            name_length: UniCharCount,
             name: *const u16,
-            which_info: u32,
+            which_info: CatalogInfoBitmap,
             catalog_info: *const CatalogInfo,
-            fork_name_length: u32,
+            reference: *mut FsRef,
+            specification: *mut c_void,
+        ) -> OsErr;
+        fn FSOpenFork(
+            reference: *const FsRef,
+            fork_name_length: UniCharCount,
             fork_name: *const u16,
             permissions: i8,
-            fork: *mut i32,
-            reference: *mut FsRef,
-        ) -> i32;
+            fork: *mut FsIoRefNum,
+        ) -> OsErr;
         fn FSWriteFork(
-            fork: i32,
+            fork: FsIoRefNum,
             position_mode: u16,
             position_offset: i64,
-            request_count: usize,
+            request_count: ByteCount,
             buffer: *const c_void,
-            actual_count: *mut usize,
-        ) -> i16;
-        fn FSFlushFork(fork: i32) -> i16;
-        fn FSCloseFork(fork: i32) -> i16;
+            actual_count: *mut ByteCount,
+        ) -> OsErr;
+        fn FSFlushFork(fork: FsIoRefNum) -> OsErr;
+        fn FSCloseFork(fork: FsIoRefNum) -> OsErr;
         fn FSGetCatalogInfo(
             reference: *const FsRef,
-            which_info: u32,
+            which_info: CatalogInfoBitmap,
             catalog_info: *mut CatalogInfo,
             name: *mut HfsUniStr255,
             specification: *mut c_void,
             parent: *mut FsRef,
-        ) -> i16;
-        fn FSCompareFSRefs(first: *const FsRef, second: *const FsRef) -> i16;
-        fn FSRenameUnicode(
-            reference: *const FsRef,
-            name_length: u32,
-            name: *const u16,
-            text_encoding_hint: u32,
-            new_reference: *mut FsRef,
-        ) -> i16;
-        fn FSUnlinkObject(reference: *const FsRef) -> i16;
-        fn FSDeleteObject(reference: *const FsRef) -> i16;
+        ) -> OsErr;
+        fn FSCompareFSRefs(first: *const FsRef, second: *const FsRef) -> OsErr;
+        fn FSMoveObjectSync(
+            source: *const FsRef,
+            destination_directory: *const FsRef,
+            destination_name: CfStringRef,
+            target: *mut FsRef,
+            options: OptionBits,
+        ) -> OsStatus;
+        fn FSUnlinkObject(reference: *const FsRef) -> OsErr;
+        fn FSDeleteObject(reference: *const FsRef) -> OsErr;
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFStringCreateWithCharacters(
+            allocator: *const c_void,
+            characters: *const u16,
+            count: CfIndex,
+        ) -> CfStringRef;
+        fn CFRelease(value: *const c_void);
     }
 
     pub(super) struct Temporary {
-        object: FsRef,
+        fork: Option<ForkOwner>,
+        object: ObjectOwner,
         original_parent: FsRef,
-        fork: Option<i32>,
+    }
+
+    struct ForkOwner {
+        raw: Option<FsIoRefNum>,
+    }
+
+    impl ForkOwner {
+        fn close(&mut self) -> Result<(), SessionError> {
+            let Some(raw) = self.raw else {
+                return Ok(());
+            };
+            #[cfg(test)]
+            if super::apple_close_failure_injected() {
+                return Err(carbon_error("FSCloseFork", -1));
+            }
+            let status = unsafe { FSCloseFork(raw) };
+            if status != NO_ERR {
+                return Err(carbon_error("FSCloseFork", i32::from(status)));
+            }
+            self.raw = None;
+            Ok(())
+        }
+    }
+
+    impl Drop for ForkOwner {
+        fn drop(&mut self) {
+            let _ = self.close();
+        }
+    }
+
+    struct ObjectOwner {
+        reference: FsRef,
         owned: bool,
+    }
+
+    impl ObjectOwner {
+        fn unlink(&mut self) -> Result<(), SessionError> {
+            if !self.owned {
+                return Ok(());
+            }
+            #[cfg(test)]
+            let status = if super::apple_unlink_failure_injected() {
+                -1
+            } else {
+                unsafe { FSUnlinkObject(&raw const self.reference) }
+            };
+            #[cfg(not(test))]
+            let status = unsafe { FSUnlinkObject(&raw const self.reference) };
+            if status != NO_ERR {
+                return Err(carbon_error("FSUnlinkObject", i32::from(status)));
+            }
+            self.owned = false;
+            Ok(())
+        }
+
+        fn delete(&mut self) -> Result<(), SessionError> {
+            if !self.owned {
+                return Ok(());
+            }
+            #[cfg(test)]
+            let status = if super::apple_delete_failure_injected() {
+                -1
+            } else {
+                unsafe { FSDeleteObject(&raw const self.reference) }
+            };
+            #[cfg(not(test))]
+            let status = unsafe { FSDeleteObject(&raw const self.reference) };
+            if status != NO_ERR {
+                return Err(carbon_error("FSDeleteObject", i32::from(status)));
+            }
+            self.owned = false;
+            Ok(())
+        }
+    }
+
+    impl Drop for ObjectOwner {
+        fn drop(&mut self) {
+            if self.unlink().is_err() {
+                let _ = self.delete();
+            }
+        }
+    }
+
+    struct OwnedCfString(CfStringRef);
+
+    impl OwnedCfString {
+        fn new(characters: &[u16]) -> Result<Self, SessionError> {
+            let count =
+                CfIndex::try_from(characters.len()).map_err(|_| SessionError::UnsafePath)?;
+            let raw =
+                unsafe { CFStringCreateWithCharacters(ptr::null(), characters.as_ptr(), count) };
+            if raw.is_null() {
+                return Err(carbon_error("CFStringCreateWithCharacters", -1));
+            }
+            Ok(Self(raw))
+        }
+    }
+
+    impl Drop for OwnedCfString {
+        fn drop(&mut self) {
+            unsafe { CFRelease(self.0.cast()) };
+        }
     }
 
     impl Temporary {
@@ -849,40 +986,58 @@ mod apple {
             let fork_name = unsafe { fork_name.assume_init() };
             let mut catalog_info = unsafe { MaybeUninit::<CatalogInfo>::zeroed().assume_init() };
             catalog_info.permissions.mode = 0o600;
-            let mut fork = 0;
-            let mut object = MaybeUninit::<FsRef>::uninit();
+            let mut reference = MaybeUninit::<FsRef>::uninit();
             let status = unsafe {
-                FSCreateFileAndOpenForkUnicode(
+                FSCreateFileUnicode(
                     &raw const original_parent,
-                    name.len() as u32,
+                    name.len() as UniCharCount,
                     name.as_ptr(),
                     CATALOG_PERMISSIONS,
                     &raw const catalog_info,
-                    u32::from(fork_name.length),
+                    reference.as_mut_ptr(),
+                    ptr::null_mut(),
+                )
+            };
+            if status != NO_ERR {
+                return Err(if status == DUPLICATE_FILE_NAME_ERROR {
+                    SessionError::UnsafePath
+                } else {
+                    carbon_error("FSCreateFileUnicode", i32::from(status))
+                });
+            }
+            let object = ObjectOwner {
+                reference: unsafe { reference.assume_init() },
+                owned: true,
+            };
+            #[cfg(test)]
+            if super::apple_open_failure_injected() {
+                return Err(carbon_error("FSOpenFork", -1));
+            }
+            let mut fork = 0;
+            let status = unsafe {
+                FSOpenFork(
+                    &raw const object.reference,
+                    UniCharCount::from(fork_name.length),
                     fork_name.unicode.as_ptr(),
                     READ_WRITE_PERMISSION,
                     &mut fork,
-                    object.as_mut_ptr(),
                 )
             };
-            if status != i32::from(NO_ERR) {
-                return Err(if status == i32::from(DUPLICATE_FILE_NAME_ERROR) {
-                    SessionError::UnsafePath
-                } else {
-                    carbon_error("FSCreateFileAndOpenForkUnicode", status)
-                });
+            if status != NO_ERR {
+                return Err(carbon_error("FSOpenFork", i32::from(status)));
             }
             Ok(Self {
-                object: unsafe { object.assume_init() },
+                fork: Some(ForkOwner { raw: Some(fork) }),
+                object,
                 original_parent,
-                fork: Some(fork),
-                owned: true,
             })
         }
 
         pub(super) fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
             let fork = self
                 .fork
+                .as_ref()
+                .and_then(|fork| fork.raw)
                 .ok_or_else(|| io::Error::other("Apple export fork is closed"))?;
             let mut actual_count = 0;
             let status = unsafe {
@@ -911,7 +1066,11 @@ mod apple {
         }
 
         fn flush_fork(&self) -> Result<(), SessionError> {
-            let fork = self.fork.ok_or(SessionError::UnsafePath)?;
+            let fork = self
+                .fork
+                .as_ref()
+                .and_then(|fork| fork.raw)
+                .ok_or(SessionError::UnsafePath)?;
             let status = unsafe { FSFlushFork(fork) };
             if status == NO_ERR {
                 Ok(())
@@ -921,13 +1080,10 @@ mod apple {
         }
 
         pub(super) fn close_fork(&mut self) -> Result<(), SessionError> {
-            let Some(fork) = self.fork else {
+            let Some(fork) = self.fork.as_mut() else {
                 return Ok(());
             };
-            let status = unsafe { FSCloseFork(fork) };
-            if status != NO_ERR {
-                return Err(carbon_error("FSCloseFork", i32::from(status)));
-            }
+            fork.close()?;
             self.fork = None;
             Ok(())
         }
@@ -936,7 +1092,7 @@ mod apple {
             let mut current_parent = MaybeUninit::<FsRef>::uninit();
             let status = unsafe {
                 FSGetCatalogInfo(
-                    &raw const self.object,
+                    &raw const self.object.reference,
                     0,
                     ptr::null_mut(),
                     ptr::null_mut(),
@@ -958,64 +1114,60 @@ mod apple {
         }
 
         pub(super) fn rename_noreplace(&mut self, name: &OsStr) -> Result<(), SessionError> {
-            if self.fork.is_some() || !self.owned {
+            if self.fork.is_some() || !self.object.owned {
                 return Err(SessionError::UnsafePath);
             }
             self.verify_current_parent()?;
+            #[cfg(test)]
+            super::apple_synchronization_tests::hit(
+                super::AppleSynchronizationPoint::BeforeObjectBoundPublish,
+            );
             let name = unicode_name(name)?;
+            let name = OwnedCfString::new(&name)?;
             let mut published = MaybeUninit::<FsRef>::uninit();
             let status = unsafe {
-                FSRenameUnicode(
-                    &raw const self.object,
-                    name.len() as u32,
-                    name.as_ptr(),
-                    UNKNOWN_TEXT_ENCODING,
+                FSMoveObjectSync(
+                    &raw const self.object.reference,
+                    &raw const self.original_parent,
+                    name.0,
                     published.as_mut_ptr(),
+                    DO_NOT_MOVE_ACROSS_VOLUMES,
                 )
             };
-            if status != NO_ERR {
-                return Err(if status == DUPLICATE_FILE_NAME_ERROR {
+            if status != OsStatus::from(NO_ERR) {
+                return Err(if status == OsStatus::from(DUPLICATE_FILE_NAME_ERROR) {
                     SessionError::UnsafePath
                 } else {
-                    carbon_error("FSRenameUnicode", i32::from(status))
+                    carbon_error("FSMoveObjectSync", status)
                 });
             }
-            self.object = unsafe { published.assume_init() };
-            self.owned = false;
+            self.object.reference = unsafe { published.assume_init() };
+            self.object.owned = false;
             Ok(())
         }
 
         pub(super) fn remove_owned(&mut self) -> Result<(), SessionError> {
-            if !self.owned {
-                return Ok(());
-            }
-            #[cfg(test)]
-            let unlink_status = if super::apple_unlink_failure_injected() {
-                -1
-            } else {
-                unsafe { FSUnlinkObject(&raw const self.object) }
-            };
-            #[cfg(not(test))]
-            let unlink_status = unsafe { FSUnlinkObject(&raw const self.object) };
-            if unlink_status == NO_ERR {
-                self.owned = false;
+            if !self.object.owned {
                 return self.close_fork();
             }
-
+            let unlink_result = self.object.unlink();
             let close_result = self.close_fork();
-            let delete_status = unsafe { FSDeleteObject(&raw const self.object) };
-            if delete_status == NO_ERR {
-                self.owned = false;
+            if unlink_result.is_ok() {
                 return close_result;
             }
-            Err(carbon_error(
-                "FSUnlinkObject/FSDeleteObject",
-                i32::from(delete_status),
-            ))
+            self.object.delete()?;
+            close_result
+        }
+    }
+
+    impl Drop for Temporary {
+        fn drop(&mut self) {
+            let _ = self.remove_owned();
         }
     }
 
     fn pinned_directory_ref(parent: &DirectoryChain) -> Result<FsRef, SessionError> {
+        let stability = parent.capture_stability()?;
         let path = CString::new(parent.path().as_os_str().as_bytes())
             .map_err(|_| SessionError::UnsafePath)?;
         let mut reference = MaybeUninit::<FsRef>::uninit();
@@ -1034,6 +1186,9 @@ mod apple {
             return Err(SessionError::UnsafePath);
         }
         let reference = unsafe { reference.assume_init() };
+        #[cfg(test)]
+        super::apple_synchronization_tests::hit(super::AppleSynchronizationPoint::AfterPathMakeRef);
+        parent.verify_stability(&stability)?;
         let mut verified_path = [0_u8; libc::PATH_MAX as usize];
         let status = unsafe {
             FSRefMakePath(
@@ -1045,6 +1200,10 @@ mod apple {
         if status != i32::from(NO_ERR) {
             return Err(carbon_error("FSRefMakePath", status));
         }
+        #[cfg(test)]
+        super::apple_synchronization_tests::hit(
+            super::AppleSynchronizationPoint::BeforeIdentityOpen,
+        );
         let verified_path = unsafe { CStr::from_ptr(verified_path.as_ptr().cast()) };
         let descriptor = unsafe {
             libc::open(
@@ -1058,10 +1217,42 @@ mod apple {
             });
         }
         let verified = unsafe { File::from_raw_fd(descriptor) };
-        if file_identity(&verified)? != file_identity(parent.file())? {
+        let pinned_identity = file_identity(parent.file())?;
+        if file_identity(&verified)? != pinned_identity {
             return Err(SessionError::UnsafePath);
         }
+        verify_catalog_node_identity(&reference, pinned_identity)?;
+        parent.verify_stability(&stability)?;
         Ok(reference)
+    }
+
+    fn verify_catalog_node_identity(
+        reference: &FsRef,
+        pinned_identity: SessionFileIdentity,
+    ) -> Result<(), SessionError> {
+        let SessionFileIdentity::Unix { inode, .. } = pinned_identity;
+        let Ok(inode) = u32::try_from(inode) else {
+            return Ok(());
+        };
+        let mut catalog = unsafe { MaybeUninit::<CatalogInfo>::zeroed().assume_init() };
+        let status = unsafe {
+            FSGetCatalogInfo(
+                reference,
+                CATALOG_NODE_ID,
+                &mut catalog,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            )
+        };
+        if status != NO_ERR {
+            return Err(carbon_error("FSGetCatalogInfo", i32::from(status)));
+        }
+        let node_id = unsafe { ptr::addr_of!(catalog.node_id).read_unaligned() };
+        if node_id != inode {
+            return Err(SessionError::UnsafePath);
+        }
+        Ok(())
     }
 
     fn unicode_name(name: &OsStr) -> Result<Vec<u16>, SessionError> {
@@ -1096,6 +1287,12 @@ std::thread_local! {
     static FAIL_TEMPORARY_IDENTITY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     #[cfg(target_vendor = "apple")]
     static FAIL_APPLE_UNLINK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    #[cfg(target_vendor = "apple")]
+    static FAIL_APPLE_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    #[cfg(target_vendor = "apple")]
+    static FAIL_APPLE_CLOSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    #[cfg(target_vendor = "apple")]
+    static FAIL_APPLE_DELETE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -1106,6 +1303,106 @@ fn temporary_identity_failure_injected() -> bool {
 #[cfg(all(test, target_vendor = "apple"))]
 fn apple_unlink_failure_injected() -> bool {
     FAIL_APPLE_UNLINK.with(|injected| injected.replace(false))
+}
+
+#[cfg(all(test, target_vendor = "apple"))]
+fn apple_open_failure_injected() -> bool {
+    FAIL_APPLE_OPEN.with(|injected| injected.replace(false))
+}
+
+#[cfg(all(test, target_vendor = "apple"))]
+fn apple_close_failure_injected() -> bool {
+    FAIL_APPLE_CLOSE.with(|injected| injected.replace(false))
+}
+
+#[cfg(all(test, target_vendor = "apple"))]
+fn apple_delete_failure_injected() -> bool {
+    FAIL_APPLE_DELETE.with(|injected| injected.replace(false))
+}
+
+#[cfg(all(test, target_vendor = "apple"))]
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum AppleSynchronizationPoint {
+    AfterPathMakeRef,
+    BeforeIdentityOpen,
+    BeforeObjectBoundPublish,
+}
+
+#[cfg(all(test, target_vendor = "apple"))]
+mod apple_synchronization_tests {
+    use std::{
+        sync::{Arc, Barrier, Mutex},
+        thread::{self, ThreadId},
+    };
+
+    use super::AppleSynchronizationPoint;
+
+    struct InstalledHook {
+        thread: ThreadId,
+        point: AppleSynchronizationPoint,
+        window: Arc<HookWindow>,
+    }
+
+    pub(super) struct HookWindow {
+        reached: Barrier,
+        resume: Barrier,
+    }
+
+    impl HookWindow {
+        pub(super) fn new() -> Self {
+            Self {
+                reached: Barrier::new(2),
+                resume: Barrier::new(2),
+            }
+        }
+
+        fn pause_operation(&self) {
+            self.reached.wait();
+            self.resume.wait();
+        }
+
+        pub(super) fn wait_until_reached(&self) {
+            self.reached.wait();
+        }
+
+        pub(super) fn resume_operation(&self) {
+            self.resume.wait();
+        }
+    }
+
+    static INSTALLED_HOOKS: Mutex<Vec<InstalledHook>> = Mutex::new(Vec::new());
+
+    pub(super) fn install(
+        thread: ThreadId,
+        point: AppleSynchronizationPoint,
+        window: Arc<HookWindow>,
+    ) {
+        INSTALLED_HOOKS.lock().unwrap().push(InstalledHook {
+            thread,
+            point,
+            window,
+        });
+    }
+
+    pub(super) fn uninstall(thread: ThreadId) {
+        INSTALLED_HOOKS
+            .lock()
+            .unwrap()
+            .retain(|hook| hook.thread != thread);
+    }
+
+    pub(super) fn hit(point: AppleSynchronizationPoint) {
+        let window = {
+            let hooks = INSTALLED_HOOKS.lock().unwrap();
+            hooks
+                .iter()
+                .find(|hook| hook.thread == thread::current().id() && hook.point == point)
+                .map(|hook| Arc::clone(&hook.window))
+        };
+        if let Some(window) = window {
+            window.pause_operation();
+        }
+    }
 }
 
 #[cfg(all(test, windows))]
@@ -1430,5 +1727,245 @@ mod tests {
             .collect::<Vec<_>>();
         entries.sort();
         entries
+    }
+}
+
+#[cfg(all(test, target_vendor = "apple"))]
+mod apple_regression_tests {
+    use std::{
+        ffi::OsString,
+        fs,
+        io::Write,
+        path::Path,
+        sync::{Arc, mpsc},
+        thread,
+    };
+
+    use crate::sessions::{SessionError, SessionRootLease};
+
+    use super::{AppleSynchronizationPoint, PinnedExportDestination};
+
+    #[test]
+    fn parent_fsref_conversion_detects_swap_restore_after_path_lookup() {
+        assert_parent_fsref_swap_restore_fails_closed(AppleSynchronizationPoint::AfterPathMakeRef);
+    }
+
+    #[test]
+    fn parent_fsref_conversion_detects_swap_restore_before_identity_open() {
+        assert_parent_fsref_swap_restore_fails_closed(
+            AppleSynchronizationPoint::BeforeIdentityOpen,
+        );
+    }
+
+    #[test]
+    fn object_bound_publish_never_renames_inside_a_synthetic_session_parent() {
+        let fixture = AppleFixture::new();
+        let target = fixture.export_parent.join("diagnostics.zip");
+        let mut destination =
+            PinnedExportDestination::create(&target, &[&fixture.session]).unwrap();
+        destination.write_all(b"owned temporary").unwrap();
+        let temporary_name = destination.temporary_name.clone().unwrap();
+        let synthetic_source = fixture.session_path.join("synthetic-owned.tmp");
+
+        let result = run_commit_at_hook(
+            destination,
+            AppleSynchronizationPoint::BeforeObjectBoundPublish,
+            || {
+                fs::rename(
+                    fixture.export_parent.join(&temporary_name),
+                    &synthetic_source,
+                )
+                .unwrap();
+            },
+        );
+
+        match result {
+            Ok(()) => assert_eq!(fs::read(&target).unwrap(), b"owned temporary"),
+            Err(SessionError::UnsafePath | SessionError::Io { .. }) => assert!(!target.exists()),
+            Err(error) => panic!("unexpected publish result: {error:?}"),
+        }
+        assert!(!synthetic_source.exists());
+        assert!(directory_entries(&fixture.session_path).is_empty());
+        assert!(
+            directory_entries(&fixture.export_parent).is_empty()
+                || directory_entries(&fixture.export_parent)
+                    == vec![OsString::from("diagnostics.zip")]
+        );
+    }
+
+    #[test]
+    fn object_bound_publish_never_overwrites_a_raced_target() {
+        let fixture = AppleFixture::new();
+        let target = fixture.export_parent.join("diagnostics.zip");
+        let mut destination =
+            PinnedExportDestination::create(&target, &[&fixture.session]).unwrap();
+        destination.write_all(b"owned temporary").unwrap();
+
+        let result = run_commit_at_hook(
+            destination,
+            AppleSynchronizationPoint::BeforeObjectBoundPublish,
+            || fs::write(&target, b"raced target").unwrap(),
+        );
+
+        assert!(matches!(result, Err(SessionError::UnsafePath)));
+        assert_eq!(fs::read(&target).unwrap(), b"raced target");
+        assert_eq!(
+            directory_entries(&fixture.export_parent),
+            vec![OsString::from("diagnostics.zip")]
+        );
+        assert!(directory_entries(&fixture.session_path).is_empty());
+    }
+
+    #[test]
+    fn fork_open_failure_cleans_the_created_object_without_handle_growth() {
+        let fixture = AppleFixture::new();
+        let before = open_handle_count();
+
+        for index in 0..32 {
+            super::FAIL_APPLE_OPEN.with(|injected| injected.set(true));
+            let target = fixture
+                .export_parent
+                .join(format!("diagnostics-{index}.zip"));
+            assert!(matches!(
+                PinnedExportDestination::create(&target, &[&fixture.session]),
+                Err(SessionError::Io { .. })
+            ));
+        }
+
+        assert!(directory_entries(&fixture.export_parent).is_empty());
+        assert!(open_handle_count() <= before + 2);
+    }
+
+    #[test]
+    fn fork_close_failure_retains_ownership_until_drop_cleanup() {
+        let fixture = AppleFixture::new();
+        let before = open_handle_count();
+
+        for index in 0..32 {
+            let target = fixture
+                .export_parent
+                .join(format!("diagnostics-{index}.zip"));
+            let mut destination =
+                PinnedExportDestination::create(&target, &[&fixture.session]).unwrap();
+            destination.write_all(b"owned temporary").unwrap();
+            super::FAIL_APPLE_CLOSE.with(|injected| injected.set(true));
+
+            assert!(matches!(destination.commit(), Err(SessionError::Io { .. })));
+            assert!(!target.exists());
+        }
+
+        assert!(directory_entries(&fixture.export_parent).is_empty());
+        assert!(open_handle_count() <= before + 2);
+    }
+
+    #[test]
+    fn unlink_and_delete_failures_retain_object_for_drop_retry() {
+        let fixture = AppleFixture::new();
+        let target = fixture.export_parent.join("diagnostics.zip");
+        let destination = PinnedExportDestination::create(&target, &[&fixture.session]).unwrap();
+        super::FAIL_APPLE_UNLINK.with(|injected| injected.set(true));
+        super::FAIL_APPLE_DELETE.with(|injected| injected.set(true));
+
+        drop(destination);
+
+        assert!(directory_entries(&fixture.export_parent).is_empty());
+        assert!(!target.exists());
+    }
+
+    fn assert_parent_fsref_swap_restore_fails_closed(point: AppleSynchronizationPoint) {
+        let fixture = AppleFixture::new();
+        let replacement_parent = fixture.root.path().join("replacement");
+        fs::create_dir(&replacement_parent).unwrap();
+        let moved_parent = fixture.root.path().join("moved-export");
+        let target = fixture.export_parent.join("diagnostics.zip");
+        let session = fixture.session;
+
+        let (thread_tx, thread_rx) = mpsc::channel();
+        let (start_tx, start_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            thread_tx.send(thread::current().id()).unwrap();
+            start_rx.recv().unwrap();
+            PinnedExportDestination::create(&target, &[&session])
+        });
+        let worker_id = thread_rx.recv().unwrap();
+        let window = Arc::new(super::apple_synchronization_tests::HookWindow::new());
+        super::apple_synchronization_tests::install(worker_id, point, Arc::clone(&window));
+        start_tx.send(()).unwrap();
+        window.wait_until_reached();
+
+        fs::rename(&fixture.export_parent, &moved_parent).unwrap();
+        fs::rename(&replacement_parent, &fixture.export_parent).unwrap();
+        fs::rename(&fixture.export_parent, &replacement_parent).unwrap();
+        fs::rename(&moved_parent, &fixture.export_parent).unwrap();
+
+        window.resume_operation();
+        let result = worker.join().unwrap();
+        super::apple_synchronization_tests::uninstall(worker_id);
+
+        assert!(matches!(result, Err(SessionError::UnsafePath)));
+        assert!(directory_entries(&fixture.export_parent).is_empty());
+        assert!(directory_entries(&replacement_parent).is_empty());
+        assert!(directory_entries(&fixture.session_path).is_empty());
+    }
+
+    fn run_commit_at_hook(
+        destination: PinnedExportDestination,
+        point: AppleSynchronizationPoint,
+        action: impl FnOnce(),
+    ) -> Result<(), SessionError> {
+        let (thread_tx, thread_rx) = mpsc::channel();
+        let (start_tx, start_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            thread_tx.send(thread::current().id()).unwrap();
+            start_rx.recv().unwrap();
+            destination.commit()
+        });
+        let worker_id = thread_rx.recv().unwrap();
+        let window = Arc::new(super::apple_synchronization_tests::HookWindow::new());
+        super::apple_synchronization_tests::install(worker_id, point, Arc::clone(&window));
+        start_tx.send(()).unwrap();
+        window.wait_until_reached();
+        action();
+        window.resume_operation();
+        let result = worker.join().unwrap();
+        super::apple_synchronization_tests::uninstall(worker_id);
+        result
+    }
+
+    struct AppleFixture {
+        root: tempfile::TempDir,
+        session_path: std::path::PathBuf,
+        session: SessionRootLease,
+        export_parent: std::path::PathBuf,
+    }
+
+    impl AppleFixture {
+        fn new() -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let session_path = root.path().join("sessions");
+            fs::create_dir(&session_path).unwrap();
+            let session = SessionRootLease::open(&session_path).unwrap();
+            let export_parent = root.path().join("exports");
+            fs::create_dir(&export_parent).unwrap();
+            Self {
+                root,
+                session_path,
+                session,
+                export_parent,
+            }
+        }
+    }
+
+    fn directory_entries(path: &Path) -> Vec<OsString> {
+        let mut entries = fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        entries.sort();
+        entries
+    }
+
+    fn open_handle_count() -> usize {
+        fs::read_dir("/dev/fd").unwrap().count()
     }
 }

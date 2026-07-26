@@ -252,6 +252,26 @@ impl DirectoryChain {
             .expect("a directory chain is never empty")
             .file
     }
+
+    #[cfg(target_vendor = "apple")]
+    pub(super) fn capture_stability(&self) -> Result<DirectoryChainStability, SessionError> {
+        let generation = directory_chain_generation(self)?;
+        validate_directory_chain_generation(self, &generation)?;
+        Ok(DirectoryChainStability { generation })
+    }
+
+    #[cfg(target_vendor = "apple")]
+    pub(super) fn verify_stability(
+        &self,
+        stability: &DirectoryChainStability,
+    ) -> Result<(), SessionError> {
+        validate_directory_chain_generation(self, &stability.generation)
+    }
+}
+
+#[cfg(target_vendor = "apple")]
+pub(super) struct DirectoryChainStability {
+    generation: Vec<DirectoryGeneration>,
 }
 
 pub(super) struct PinnedDirectory {
