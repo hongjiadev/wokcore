@@ -1,6 +1,6 @@
 use std::{
     ffi::OsString,
-    fs::{self, OpenOptions},
+    fs::{self, FileTimes, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
 };
@@ -26,6 +26,35 @@ fn pinned_root_and_file_identities_are_stable_and_native() {
     assert_eq!(first_file.snapshot().size, 17);
     assert_native_identity(first_root.identity());
     assert_native_identity(first_file.snapshot().identity);
+}
+
+#[test]
+fn same_length_write_with_restored_mtime_changes_the_pinned_mutation_marker() {
+    let fixture = SessionFixture::new(b"original-content");
+    let root = SessionRootLease::open(fixture.root.path()).unwrap();
+    let original = root
+        .open_file(&fixture.relative_file, 1024)
+        .unwrap()
+        .snapshot()
+        .clone();
+    let modified = fs::metadata(&fixture.file).unwrap().modified().unwrap();
+    fs::write(&fixture.file, b"rewritten-value!").unwrap();
+    OpenOptions::new()
+        .write(true)
+        .open(&fixture.file)
+        .unwrap()
+        .set_times(FileTimes::new().set_modified(modified))
+        .unwrap();
+    let rewritten = root
+        .open_file(&fixture.relative_file, 1024)
+        .unwrap()
+        .snapshot()
+        .clone();
+
+    assert_eq!(rewritten.identity, original.identity);
+    assert_eq!(rewritten.size, original.size);
+    assert_eq!(rewritten.modified, original.modified);
+    assert_ne!(rewritten.mutation_marker, original.mutation_marker);
 }
 
 #[test]

@@ -3,6 +3,8 @@ use std::fmt;
 use serde_json::Value;
 use wokcore_platform::sessions::{SessionError, SessionFile};
 
+use crate::model::OpaqueStreamHash;
+
 pub const MAX_JSONL_LINE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_JSONL_RECORDS_PER_SCAN: usize = 512;
 pub const MAX_JSONL_BATCH_INPUT_BYTES: usize = 16 * 1024 * 1024;
@@ -133,6 +135,7 @@ pub(crate) struct JsonlReader {
     buffer_start: u64,
     read_offset: u64,
     buffer: Vec<u8>,
+    raw_fingerprint: Option<OpaqueStreamHash>,
 }
 
 impl JsonlReader {
@@ -143,7 +146,17 @@ impl JsonlReader {
             buffer_start: cursor.complete_byte_offset,
             read_offset: cursor.complete_byte_offset,
             buffer: Vec::new(),
+            raw_fingerprint: None,
         }
+    }
+
+    pub(crate) fn with_raw_fingerprint(mut self, fingerprint: OpaqueStreamHash) -> Self {
+        self.raw_fingerprint = Some(fingerprint);
+        self
+    }
+
+    pub(crate) fn finish_raw_fingerprint(&mut self, promoted_extent: u64) -> Option<[u8; 32]> {
+        self.raw_fingerprint.take()?.finalize(promoted_extent)
     }
 
     pub(crate) fn scan(&mut self, file: &mut SessionFile) -> Result<JsonlScan, JsonlError> {
@@ -219,6 +232,11 @@ impl JsonlReader {
                         ),
                     },
                 };
+                if self.raw_fingerprint.as_mut().is_some_and(|fingerprint| {
+                    !fingerprint.update(&self.buffer[line_start..=newline])
+                }) {
+                    return Err(JsonlError::CursorOverflow);
+                }
                 records.push(record);
                 committed_offset = byte_end;
                 next_ordinal = next_ordinal
@@ -275,5 +293,16 @@ impl JsonlReader {
             read_bytes,
             reached_end,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{JsonlCursor, JsonlReader};
+
+    #[test]
+    fn raw_fingerprinting_is_opt_in() {
+        let mut reader = JsonlReader::new(JsonlCursor::new(0, 1));
+        assert!(reader.finish_raw_fingerprint(0).is_none());
     }
 }

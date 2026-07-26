@@ -30,8 +30,12 @@ pub struct SessionFileSnapshot {
     pub identity: SessionFileIdentity,
     pub size: u64,
     pub modified: Option<SystemTime>,
+    pub mutation_marker: SessionFileMutationMarker,
     pub kind: SessionFileKind,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SessionFileMutationMarker([i64; 2]);
 
 pub struct SessionRootLease {
     chain: DirectoryChain,
@@ -233,6 +237,8 @@ impl SessionFile {
             .by_ref()
             .take(maximum_bytes)
             .read_to_end(&mut bytes)?;
+        #[cfg(test)]
+        synchronization_tests::hit(SynchronizationPoint::AfterRangeReadBeforeRevalidate);
         self.revalidate_entry()?;
         Ok(bytes)
     }
@@ -797,8 +803,50 @@ fn snapshot_file(file: &File) -> Result<SessionFileSnapshot, SessionError> {
         identity: file_identity(file)?,
         size: metadata.len(),
         modified: metadata.modified().ok(),
+        mutation_marker: file_mutation_marker(file, &metadata)?,
         kind,
     })
+}
+
+#[cfg(unix)]
+fn file_mutation_marker(
+    _file: &File,
+    metadata: &std::fs::Metadata,
+) -> Result<SessionFileMutationMarker, SessionError> {
+    use std::os::unix::fs::MetadataExt;
+
+    Ok(SessionFileMutationMarker([
+        metadata.ctime(),
+        metadata.ctime_nsec(),
+    ]))
+}
+
+#[cfg(windows)]
+fn file_mutation_marker(
+    file: &File,
+    _metadata: &std::fs::Metadata,
+) -> Result<SessionFileMutationMarker, SessionError> {
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_BASIC_INFO, FileBasicInfo, GetFileInformationByHandleEx,
+    };
+
+    let mut information = FILE_BASIC_INFO::default();
+    if unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileBasicInfo,
+            (&raw mut information).cast(),
+            std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(SessionError::Io {
+            source: std::io::Error::last_os_error(),
+        });
+    }
+    Ok(SessionFileMutationMarker([information.ChangeTime, 0]))
 }
 
 #[cfg(unix)]
@@ -1222,13 +1270,14 @@ enum SynchronizationPoint {
     BeforeOpen,
     AfterOpen,
     BeforeEmptyRangeReturn,
+    AfterRangeReadBeforeRevalidate,
 }
 
 #[cfg(test)]
 mod synchronization_tests {
     use std::{
         ffi::{OsStr, OsString},
-        fs::{self, OpenOptions},
+        fs::{self, FileTimes, OpenOptions},
         io::Write,
         path::PathBuf,
         sync::{Arc, Barrier, Mutex, mpsc},
@@ -1456,6 +1505,54 @@ mod synchronization_tests {
                 Err(SessionError::SessionFileChanged | SessionError::SessionFileUnavailable)
             ));
         }
+    }
+
+    #[test]
+    fn synchronized_range_read_rejects_same_length_rewrite_with_restored_mtime() {
+        let root = tempfile::tempdir().unwrap();
+        let relative = PathBuf::from("sessions/2026/07/26/session.jsonl");
+        let file_path = root.path().join(&relative);
+        fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        fs::write(&file_path, b"original").unwrap();
+        let modified = fs::metadata(&file_path).unwrap().modified().unwrap();
+        let lease = SessionRootLease::open(root.path()).unwrap();
+        let mut file = lease.open_file(&relative, u64::MAX).unwrap();
+        let window = Arc::new(HookWindow::new());
+        let worker_window = Arc::clone(&window);
+        let (ready_sender, ready_receiver) = mpsc::channel();
+
+        let worker = thread::spawn(move || {
+            install_hook(
+                thread::current().id(),
+                vec![(
+                    SynchronizationPoint::AfterRangeReadBeforeRevalidate,
+                    worker_window,
+                )],
+                &ready_sender,
+            );
+            let result = file.read_range_bounded(0, 8);
+            clear_hook();
+            result
+        });
+
+        ready_receiver.recv().unwrap();
+        window.wait_until_reached();
+        let mut replacement = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&file_path)
+            .unwrap();
+        replacement.write_all(b"replaced").unwrap();
+        replacement
+            .set_times(FileTimes::new().set_modified(modified))
+            .unwrap();
+        drop(replacement);
+        window.resume_operation();
+
+        assert!(matches!(
+            worker.join().unwrap(),
+            Err(SessionError::SessionFileChanged | SessionError::SessionFileUnavailable)
+        ));
     }
 
     #[test]

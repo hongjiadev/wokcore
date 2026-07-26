@@ -1,0 +1,37 @@
+{
+  "sessionId": "gemini-migrated",
+  "projectHash": "PRIVATE-PROJECT-HASH",
+  "startTime": "2026-07-26T12:00:00+00:00",
+  "lastUpdated": "2026-07-26T12:00:03+00:00",
+  "messages": [
+    {
+      "id": "legacy-user",
+      "timestamp": "2026-07-26T12:00:01+00:00",
+      "type": "user",
+      "content": "legacy question"
+    },
+    {
+      "id": "legacy-answer",
+      "timestamp": "2026-07-26T12:00:02+00:00",
+      "type": "gemini",
+      "content": "legacy answer",
+      "model": "GEMINI-2.5-PRO",
+      "tokens": {
+        "input": 2,
+        "output": 3,
+        "cached": 48719,
+        "thoughts": 5,
+        "tool": 7,
+        "total": 48736
+      },
+      "toolCalls": [
+        {
+          "id": "legacy-tool",
+          "name": "read_file",
+          "args": {"secret": "LEGACY-TOOL-INPUT-MUST-NOT-ESCAPE"},
+          "result": [{"functionResponse": {"response": {"output": "LEGACY-TOOL-OUTPUT-MUST-NOT-ESCAPE"}}}]
+        }
+      ]
+    }
+  ]
+}

@@ -13,7 +13,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, limits::Limit};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use wokcore_platform::sessions::{
-    SessionFile, SessionFileIdentity as PlatformFileIdentity, SessionRootLease,
+    SessionError, SessionFile, SessionFileIdentity as PlatformFileIdentity, SessionRootLease,
 };
 use wokcore_storage::{
     CandidateBeginOutcome, CodexReplaySignature, CodexReplaySignaturePage,
@@ -1230,10 +1230,17 @@ impl CodexScanner {
         let mut file = source
             .open(&self.root, u64::MAX)
             .map_err(|_| SourceInspectionError::Read)?;
+        self.inspect_pinned_source(&mut file)
+    }
+
+    fn inspect_pinned_source(
+        &mut self,
+        file: &mut SessionFile,
+    ) -> Result<SourceMetadata, SourceInspectionError> {
         let mut reader = JsonlReader::new(JsonlCursor::new(0, 1));
         for _ in 0..METADATA_PROBE_RECORDS {
             let scan = reader
-                .scan_bounded(&mut file, 1, MAX_JSONL_LINE_BYTES)
+                .scan_bounded(file, 1, MAX_JSONL_LINE_BYTES)
                 .map_err(SourceInspectionError::from)?;
             self.metrics.metadata_probe_bytes = self
                 .metrics
@@ -2319,25 +2326,16 @@ impl CodexScanner {
         let Some(cursor) = self.state.load_current_session_scan_cursor(source_key)? else {
             return Ok(None);
         };
-        let discovered = discover_codex_sessions(&self.root, self.discovery_limits)?;
-        let mut target = None;
-        for source in &discovered {
-            if opaque_file_identity(&self.domain_key, source.identity())
-                != cursor.file_identity.as_str()
-            {
-                continue;
+        let mut file = match open_source_for_paging(&self.root, &self.domain_key, &cursor, u64::MAX)
+        {
+            Ok(file) => file,
+            Err(CodexScannerError::Storage(error)) => {
+                return Err(CodexScannerError::Storage(error));
             }
-            if target.replace(source).is_some() {
-                return Err(StorageError::StableRecordConflict {
-                    record_kind: "Session title source",
-                }
-                .into());
-            }
-        }
-        let Some(target) = target else {
-            return Ok(None);
+            Err(_) => return Ok(None),
         };
-        let metadata = match self.inspect_source(target) {
+        self.metrics.source_opens = self.metrics.source_opens.saturating_add(1);
+        let metadata = match self.inspect_pinned_source(&mut file) {
             Ok(metadata) => metadata,
             Err(
                 SourceInspectionError::RecordTooLarge
@@ -3632,6 +3630,55 @@ fn replay_chain_step(
 fn opaque_file_identity(key: &[u8; 32], identity: PlatformFileIdentity) -> String {
     let bytes = platform_identity_bytes(identity);
     opaque_hex(key, b"wokcore.codex.file-identity.v1", &[&bytes])
+}
+
+pub(crate) fn open_source_for_paging(
+    root: &SessionRootLease,
+    domain_key: &[u8; 32],
+    cursor: &SessionScanCursor,
+    maximum_size: u64,
+) -> Result<SessionFile, CodexScannerError> {
+    let discovered = discover_codex_sessions(root, DiscoveryLimits::default())?;
+    let mut target = None;
+    for source in &discovered {
+        let identity =
+            SessionFileIdentity::new(opaque_file_identity(domain_key, source.identity()))
+                .expect("opaque platform identity is a valid storage key");
+        if identity != cursor.file_identity {
+            continue;
+        }
+        if target.replace(source).is_some() {
+            return Err(StorageError::StableRecordConflict {
+                record_kind: "Session paging source",
+            }
+            .into());
+        }
+    }
+    let mut file = target
+        .ok_or(CodexScannerError::Read)?
+        .open(root, maximum_size)
+        .map_err(|error| match error {
+            SessionError::ReadLimitExceeded => CodexScannerError::RecordTooLarge,
+            _ => CodexScannerError::Read,
+        })?;
+    let snapshot = file.snapshot();
+    if snapshot.size != cursor.observed_size
+        || system_time_utc(snapshot.modified) != cursor.modified_at
+        || cursor.complete_byte_offset > snapshot.size
+    {
+        return Err(CodexScannerError::Parse);
+    }
+    let (head, boundary) = fingerprints_with_extent(
+        &mut file,
+        cursor.complete_byte_offset,
+        cursor.observed_size,
+        domain_key,
+    )
+    .map_err(|_| CodexScannerError::Read)?;
+    if head != cursor.head_fingerprint || boundary != cursor.boundary_fingerprint {
+        return Err(CodexScannerError::Parse);
+    }
+    Ok(file)
 }
 
 fn platform_identity_bytes(identity: PlatformFileIdentity) -> Vec<u8> {
