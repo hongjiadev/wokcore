@@ -28,6 +28,7 @@ fn private_tempdir_has_exact_owner_only_mode() {
 
 #[test]
 fn simultaneous_acquisitions_produce_one_owner_and_one_already_running() {
+    let _runtime_lease_test_guard = isolate_runtime_lease_test();
     let directory = private_tempdir();
     let paths = test_paths(directory.path());
     let start = Arc::new(Barrier::new(3));
@@ -63,6 +64,7 @@ fn simultaneous_acquisitions_produce_one_owner_and_one_already_running() {
 
 #[test]
 fn existing_only_acquisition_never_creates_runtime_state() {
+    let _runtime_lease_test_guard = isolate_runtime_lease_test();
     let directory = private_tempdir();
     let paths = test_paths(&directory.path().join("missing"));
 
@@ -76,6 +78,7 @@ fn existing_only_acquisition_never_creates_runtime_state() {
 
 #[test]
 fn existing_only_acquisition_is_byte_and_mtime_read_only() {
+    let _runtime_lease_test_guard = isolate_runtime_lease_test();
     let directory = private_tempdir();
     let paths = test_paths(directory.path());
     drop(RuntimeLease::acquire(&paths).unwrap());
@@ -88,6 +91,7 @@ fn existing_only_acquisition_is_byte_and_mtime_read_only() {
 
 #[test]
 fn existing_only_acquisition_observes_the_current_owner() {
+    let _runtime_lease_test_guard = isolate_runtime_lease_test();
     let directory = private_tempdir();
     let paths = test_paths(directory.path());
     let owner = RuntimeLease::acquire(&paths).unwrap();
@@ -103,6 +107,7 @@ fn existing_only_acquisition_observes_the_current_owner() {
 #[cfg(windows)]
 #[test]
 fn existing_only_lease_prevents_replacing_its_windows_lock_file() {
+    let _runtime_lease_test_guard = isolate_runtime_lease_test();
     let directory = private_tempdir();
     let paths = test_paths(directory.path());
     drop(RuntimeLease::acquire(&paths).unwrap());
@@ -116,6 +121,7 @@ fn existing_only_lease_prevents_replacing_its_windows_lock_file() {
 
 #[test]
 fn separate_processes_contend_for_the_same_operating_system_lock() {
+    let _runtime_lease_test_guard = isolate_runtime_lease_test();
     let directory = private_tempdir();
     let paths = test_paths(directory.path());
     let ready = directory.path().join("holder-ready");
@@ -144,6 +150,7 @@ fn separate_processes_contend_for_the_same_operating_system_lock() {
 #[test]
 #[ignore = "spawned only by separate_processes_contend_for_the_same_operating_system_lock"]
 fn cross_process_lease_holder_helper() {
+    let _runtime_lease_test_guard = isolate_runtime_lease_test();
     let Some(root) = env::var_os("WOKCORE_TEST_RUNTIME_ROOT") else {
         return;
     };
@@ -158,6 +165,7 @@ fn cross_process_lease_holder_helper() {
 #[cfg(unix)]
 #[test]
 fn exec_child_does_not_extend_the_runtime_lease_lifetime() {
+    let _runtime_lease_test_guard = isolate_runtime_lease_test();
     let directory = private_tempdir();
     let paths = test_paths(directory.path());
     let owner = RuntimeLease::acquire(&paths).unwrap();
@@ -188,6 +196,7 @@ fn exec_child_does_not_extend_the_runtime_lease_lifetime() {
 fn replacing_the_runtime_directory_path_does_not_create_a_second_lock_domain() {
     use std::os::unix::fs::PermissionsExt;
 
+    let _runtime_lease_test_guard = isolate_runtime_lease_test();
     let directory = private_tempdir();
     let paths = test_paths(directory.path());
     let moved_runtime = directory.path().join("original-runtime");
@@ -209,6 +218,7 @@ fn replacing_the_runtime_directory_path_does_not_create_a_second_lock_domain() {
 fn namespace_lock_is_a_fixed_owner_only_file_in_the_secure_runtime_parent() {
     use std::os::unix::fs::PermissionsExt;
 
+    let _runtime_lease_test_guard = isolate_runtime_lease_test();
     let directory = private_tempdir();
     let paths = test_paths(directory.path());
     let namespace_lock = directory.path().join(".wokcore-runtime-namespace.lock");
@@ -226,6 +236,7 @@ fn namespace_lock_is_a_fixed_owner_only_file_in_the_secure_runtime_parent() {
 fn runtime_parent_must_be_private_to_the_current_user() {
     use std::os::unix::fs::PermissionsExt;
 
+    let _runtime_lease_test_guard = isolate_runtime_lease_test();
     let directory = private_tempdir();
     let paths = test_paths(directory.path());
     fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o755)).unwrap();
@@ -239,6 +250,7 @@ fn runtime_parent_must_be_private_to_the_current_user() {
 #[cfg(unix)]
 #[test]
 fn different_runtime_parents_have_independent_lock_domains() {
+    let _runtime_lease_test_guard = isolate_runtime_lease_test();
     let directory = private_tempdir();
     let first = RuntimeLease::acquire(&test_paths(&directory.path().join("first"))).unwrap();
     let second = RuntimeLease::acquire(&test_paths(&directory.path().join("second"))).unwrap();
@@ -258,6 +270,7 @@ fn exec_waiting_child_helper() {
 
 #[test]
 fn dropping_the_owner_releases_the_operating_system_lock() {
+    let _runtime_lease_test_guard = isolate_runtime_lease_test();
     let directory = private_tempdir();
     let paths = test_paths(directory.path());
     let owner = RuntimeLease::acquire(&paths).unwrap();
@@ -275,6 +288,7 @@ fn dropping_the_owner_releases_the_operating_system_lock() {
 
 #[test]
 fn stale_lock_file_contents_do_not_claim_or_grant_ownership() {
+    let _runtime_lease_test_guard = isolate_runtime_lease_test();
     let directory = private_tempdir();
     let paths = test_paths(directory.path());
     drop(RuntimeLease::acquire(&paths).unwrap());
@@ -295,6 +309,7 @@ fn stale_lock_file_contents_do_not_claim_or_grant_ownership() {
 
 #[test]
 fn existing_lock_symlink_or_reparse_target_fails_closed() {
+    let _runtime_lease_test_guard = isolate_runtime_lease_test();
     let directory = private_tempdir();
     let paths = test_paths(directory.path());
     drop(RuntimeLease::acquire(&paths).unwrap());
@@ -310,6 +325,7 @@ fn existing_lock_symlink_or_reparse_target_fails_closed() {
 
 #[test]
 fn runtime_acquisition_rejects_a_non_directory_target() {
+    let _runtime_lease_test_guard = isolate_runtime_lease_test();
     let directory = private_tempdir();
     let paths = test_paths(directory.path());
     fs::write(&paths.runtime_dir, b"not a directory").unwrap();
@@ -322,6 +338,7 @@ fn runtime_acquisition_rejects_a_non_directory_target() {
 
 #[test]
 fn runtime_acquisition_rejects_a_symlink_or_reparse_target() {
+    let _runtime_lease_test_guard = isolate_runtime_lease_test();
     let directory = private_tempdir();
     let paths = test_paths(directory.path());
     let target = directory.path().join("runtime-target");
@@ -336,6 +353,7 @@ fn runtime_acquisition_rejects_a_symlink_or_reparse_target() {
 
 #[test]
 fn runtime_acquisition_touches_only_the_runtime_directory_and_lock() {
+    let _runtime_lease_test_guard = isolate_runtime_lease_test();
     let directory = private_tempdir();
     let paths = test_paths(directory.path());
     let owner = RuntimeLease::acquire(&paths).unwrap();
@@ -367,6 +385,7 @@ fn runtime_acquisition_touches_only_the_runtime_directory_and_lock() {
 fn unix_runtime_and_lock_have_owner_only_modes() {
     use std::os::unix::fs::PermissionsExt;
 
+    let _runtime_lease_test_guard = isolate_runtime_lease_test();
     let directory = private_tempdir();
     let paths = test_paths(directory.path());
     let owner = RuntimeLease::acquire(&paths).unwrap();
@@ -393,6 +412,7 @@ fn unix_runtime_and_lock_have_owner_only_modes() {
 #[cfg(windows)]
 #[test]
 fn windows_runtime_and_lock_use_protected_current_user_only_dacls() {
+    let _runtime_lease_test_guard = isolate_runtime_lease_test();
     let directory = private_tempdir();
     let paths = test_paths(directory.path());
     let owner = RuntimeLease::acquire(&paths).unwrap();
@@ -421,6 +441,28 @@ fn directory_entries(path: &Path) -> Vec<std::ffi::OsString> {
         .collect::<Vec<_>>();
     entries.sort();
     entries
+}
+
+struct RuntimeLeaseTestGuard {
+    #[cfg(unix)]
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+fn isolate_runtime_lease_test() -> RuntimeLeaseTestGuard {
+    #[cfg(unix)]
+    static TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    // Command::spawn can fork before exec, while O_CLOEXEC closes lease descriptors only at exec.
+    // Serialize this binary's lease tests so a helper cannot briefly inherit another test's flock.
+    #[cfg(unix)]
+    let guard = TEST_GUARD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    RuntimeLeaseTestGuard {
+        #[cfg(unix)]
+        _guard: guard,
+    }
 }
 
 fn wait_until_exists(path: &Path, timeout: Duration) {
