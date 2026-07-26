@@ -829,7 +829,7 @@ fn verify_windows_file(file: &File, kind: WindowsFileKind) -> Result<(), Platfor
 }
 
 #[cfg(windows)]
-fn with_current_user_security_attributes<T>(
+pub(crate) fn with_current_user_security_attributes<T>(
     inherit_to_children: bool,
     operation: impl FnOnce(
         *const windows_sys::Win32::Security::SECURITY_ATTRIBUTES,

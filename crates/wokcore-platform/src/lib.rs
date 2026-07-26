@@ -1,6 +1,7 @@
 //! Platform-specific WokCore path discovery.
 
 pub mod runtime;
+pub mod sessions;
 pub mod system;
 
 pub use runtime::{DiscoveryRecord, DiscoveryStore, MAX_DISCOVERY_BYTES, RuntimeLease};
