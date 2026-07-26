@@ -157,7 +157,6 @@ fn render_error(error: ControlClientError, output: &mut dyn CommandOutput, json:
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct LifecycleResponse {
     phase: String,
     active_requests: usize,

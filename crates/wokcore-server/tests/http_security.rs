@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use axum::{
     Router,
@@ -18,6 +21,7 @@ use wokcore_server::{
     api::build_router,
     auth::{AuthMetadataStore, AuthRegistry, EntropySource, TokenError, TokenMaterial},
     lifecycle::ServiceLifecycle,
+    runtime::SystemTokenMetadata,
 };
 use wokcore_storage::{ClientTokenMetadata, MemorySecretStore, RuntimeSecretBinding, StorageError};
 
@@ -30,6 +34,26 @@ struct FixedEntropy;
 impl EntropySource for FixedEntropy {
     fn fill(&self, output: &mut [u8; 32]) -> Result<(), TokenError> {
         output.fill(0x41);
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct FailingEntropy;
+
+impl EntropySource for FailingEntropy {
+    fn fill(&self, _output: &mut [u8; 32]) -> Result<(), TokenError> {
+        Err(TokenError::EntropyUnavailable)
+    }
+}
+
+#[derive(Debug, Default)]
+struct IncrementingEntropy(AtomicUsize);
+
+impl EntropySource for IncrementingEntropy {
+    fn fill(&self, output: &mut [u8; 32]) -> Result<(), TokenError> {
+        let value = self.0.fetch_add(1, Ordering::AcqRel) + 1;
+        output.fill(u8::try_from(value).unwrap());
         Ok(())
     }
 }
@@ -90,6 +114,10 @@ impl AuthMetadataStore for TestMetadata {
 }
 
 async fn router() -> Router {
+    router_with_request_id_entropy(Arc::new(IncrementingEntropy::default())).await
+}
+
+async fn router_with_request_id_entropy(request_id_entropy: Arc<dyn EntropySource>) -> Router {
     let scope = SecretScope {
         provider_id: ProviderId::new("wokcore-runtime").unwrap(),
         account_id: None,
@@ -106,11 +134,13 @@ async fn router() -> Router {
     .unwrap();
     let lifecycle = ServiceLifecycle::new();
     lifecycle.mark_running().unwrap();
-    build_router(ServerState::new(
+    build_router(ServerState::new_with_runtime_sources(
         AUTHORITY,
         Uuid::parse_str("019844f0-4de0-7000-8000-000000000001").unwrap(),
         Arc::new(auth),
         lifecycle,
+        Arc::new(SystemTokenMetadata::new(Arc::new(FixedEntropy))),
+        request_id_entropy,
     ))
 }
 
@@ -188,6 +218,28 @@ async fn caller_request_id_is_ignored() {
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_ne!(response.headers()["x-request-id"], supplied);
+}
+
+#[tokio::test]
+async fn request_id_entropy_failure_returns_a_stable_safe_error_envelope() {
+    let response = router_with_request_id_entropy(Arc::new(FailingEntropy))
+        .await
+        .oneshot(request("GET", Some(AUTHORITY), None))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+    let header_request_id = response.headers()["x-request-id"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert!(Uuid::parse_str(&header_request_id).is_ok());
+    let body = response_body(response).await;
+    assert_eq!(body["error"]["code"], "internal_error");
+    assert_eq!(body["error"]["request_id"], header_request_id);
+    assert!(!body.to_string().contains("entropy"));
 }
 
 #[tokio::test]

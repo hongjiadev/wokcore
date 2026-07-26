@@ -108,6 +108,7 @@ impl CommandOutput for BufferOutput {
     }
 }
 
+#[derive(Clone)]
 pub struct RunDependencies {
     pub(crate) paths: AppPaths,
     pub(crate) secrets: Arc<dyn SecretStore>,

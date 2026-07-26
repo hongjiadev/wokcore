@@ -49,6 +49,9 @@ pub fn build_router(state: ServerState) -> Router {
             state.clone(),
             enforce_request_security,
         ))
-        .layer(middleware::from_fn(apply_response_envelope))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            apply_response_envelope,
+        ))
         .with_state(state)
 }

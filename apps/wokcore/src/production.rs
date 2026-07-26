@@ -8,7 +8,10 @@ use std::{
 
 use uuid::Uuid;
 use wokcore_platform::{AppPaths, is_process_running};
-use wokcore_server::auth::OsEntropy;
+use wokcore_server::{
+    auth::{EntropySource, OsEntropy},
+    runtime::generate_uuid_v4,
+};
 use wokcore_storage::NativeSecretStore;
 
 use crate::{
@@ -31,12 +34,13 @@ pub async fn run_production(cli: Cli) -> ExitCode {
             return ExitCode::InvalidInput;
         }
     };
+    let entropy: Arc<dyn EntropySource> = Arc::new(OsEntropy);
     let dependencies = RunDependencies::new(
         paths,
         Arc::new(NativeSecretStore::new()),
-        Arc::new(OsEntropy),
+        entropy.clone(),
         Arc::new(SystemClock),
-        Arc::new(SystemIds),
+        Arc::new(SystemIds::new(entropy)),
         Arc::new(SystemProcessIdentity),
         Arc::new(ControlCSignal),
     );
@@ -65,15 +69,25 @@ impl Clock for SystemClock {
     }
 }
 
-struct SystemIds;
+struct SystemIds {
+    entropy: Arc<dyn EntropySource>,
+}
+
+impl SystemIds {
+    fn new(entropy: Arc<dyn EntropySource>) -> Self {
+        Self { entropy }
+    }
+}
 
 impl IdSource for SystemIds {
     fn new_instance_id(&self) -> Result<Uuid, RuntimeValueError> {
-        Ok(Uuid::new_v4())
+        generate_uuid_v4(self.entropy.as_ref()).map_err(|_| RuntimeValueError)
     }
 
     fn new_token_id(&self) -> Result<String, RuntimeValueError> {
-        Ok(Uuid::new_v4().to_string())
+        generate_uuid_v4(self.entropy.as_ref())
+            .map(|uuid| uuid.to_string())
+            .map_err(|_| RuntimeValueError)
     }
 }
 
@@ -112,5 +126,30 @@ impl CommandOutput for StandardOutput {
         let mut stderr = io::stderr().lock();
         stderr.write_all(value.as_bytes())?;
         stderr.flush()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use wokcore_server::auth::{EntropySource, TokenError};
+
+    use super::{IdSource, SystemIds};
+
+    struct FailingEntropy;
+
+    impl EntropySource for FailingEntropy {
+        fn fill(&self, _output: &mut [u8; 32]) -> Result<(), TokenError> {
+            Err(TokenError::EntropyUnavailable)
+        }
+    }
+
+    #[test]
+    fn production_ids_map_entropy_failure_without_panicking() {
+        let ids = SystemIds::new(Arc::new(FailingEntropy));
+
+        assert!(ids.new_instance_id().is_err());
+        assert!(ids.new_token_id().is_err());
     }
 }

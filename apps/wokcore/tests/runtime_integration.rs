@@ -3,7 +3,10 @@ use std::{
     net::TcpListener as StdTcpListener,
     path::{Path, PathBuf},
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -113,6 +116,56 @@ impl EntropySource for FixedRuntimeValues {
     }
 }
 
+struct GatedEntropy {
+    calls: AtomicUsize,
+    block_on_call: usize,
+    blocked: AtomicBool,
+    released: Mutex<bool>,
+    release: Condvar,
+}
+
+impl GatedEntropy {
+    fn new(block_on_call: usize) -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            block_on_call,
+            blocked: AtomicBool::new(false),
+            released: Mutex::new(false),
+            release: Condvar::new(),
+        }
+    }
+
+    async fn wait_until_blocked(&self) {
+        timeout(Duration::from_secs(5), async {
+            while !self.blocked.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("entropy call did not reach its deterministic gate");
+    }
+
+    fn release(&self) {
+        *self.released.lock().unwrap() = true;
+        self.release.notify_all();
+    }
+}
+
+impl EntropySource for GatedEntropy {
+    fn fill(&self, output: &mut [u8; 32]) -> Result<(), TokenError> {
+        output.fill(0x42);
+        let call = self.calls.fetch_add(1, Ordering::AcqRel) + 1;
+        if call == self.block_on_call {
+            self.blocked.store(true, Ordering::Release);
+            let mut released = self.released.lock().unwrap();
+            while !*released {
+                released = self.release.wait(released).unwrap();
+            }
+        }
+        Ok(())
+    }
+}
+
 struct DeadProcess;
 
 impl ProcessIdentity for DeadProcess {
@@ -159,6 +212,20 @@ impl DiscoveryPublisher for PublishThenFail {
         Err(PlatformError::Io {
             source: std::io::Error::other("injected post-commit publish failure"),
         })
+    }
+}
+
+#[derive(Default)]
+struct RecordingDiscoveryPublisher(AtomicBool);
+
+impl DiscoveryPublisher for RecordingDiscoveryPublisher {
+    fn publish(
+        &self,
+        store: &DiscoveryStore,
+        record: &DiscoveryRecord,
+    ) -> Result<(), PlatformError> {
+        self.0.store(true, Ordering::Release);
+        store.publish(record)
     }
 }
 
@@ -234,6 +301,24 @@ fn runtime_dependencies(
         paths,
         secrets,
         values.clone(),
+        values.clone(),
+        values.clone(),
+        values,
+        shutdown,
+    )
+}
+
+fn runtime_dependencies_with_entropy(
+    paths: AppPaths,
+    secrets: Arc<MemorySecretStore>,
+    entropy: Arc<dyn EntropySource>,
+    shutdown: Arc<ManualShutdown>,
+) -> RunDependencies {
+    let values = Arc::new(FixedRuntimeValues);
+    RunDependencies::new(
+        paths,
+        secrets,
+        entropy,
         values.clone(),
         values.clone(),
         values,
@@ -433,6 +518,87 @@ async fn status_rejects_an_oversized_chunk_before_the_stream_ends() {
     server.abort();
 }
 
+async fn status_with_loopback_responses(
+    health: String,
+    capabilities: String,
+) -> (ExitCode, BufferOutput) {
+    let directory = TestDirectory::new();
+    let paths = paths(directory.path());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    publish_record(
+        &paths,
+        &DiscoveryRecord {
+            base_url: format!("http://127.0.0.1:{port}"),
+            pid: 4242,
+            instance_id: Uuid::parse_str(INSTANCE_ID).unwrap(),
+            wokcore_version: env!("CARGO_PKG_VERSION").to_owned(),
+            api_major: 1,
+        },
+    );
+    let mut server = tokio::spawn(async move {
+        for (expected_path, body) in [
+            ("/wokcore/v1/health", health),
+            ("/wokcore/v1/capabilities", capabilities),
+        ] {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut stream).await;
+            assert_eq!(request.split_whitespace().nth(1), Some(expected_path));
+            write_http_response(&mut stream, "200 OK", &body).await;
+        }
+    });
+    let dependencies = doctor_dependencies(paths, Arc::new(FixedRuntimeValues));
+    let mut output = BufferOutput::default();
+
+    let exit = run_with_dependencies(
+        Cli::try_parse_from(["wokcore", "status", "--json"]).unwrap(),
+        &dependencies,
+        &mut output,
+    )
+    .await;
+
+    if timeout(Duration::from_secs(1), &mut server).await.is_err() {
+        server.abort();
+        let _ = server.await;
+    }
+    (exit, output)
+}
+
+fn compatible_health_response(extra: &str) -> String {
+    format!(r#"{{"status":"ok","instance_id":"{INSTANCE_ID}"{extra}}}"#)
+}
+
+fn compatible_capabilities_response(extra: &str) -> String {
+    format!(
+        r#"{{"wokcore_version":"{}","management_api_major":1,"minimum_management_api_major":1,"maximum_management_api_major":1,"provider_protocols":[],"capabilities":[],"instance_id":"{INSTANCE_ID}"{extra}}}"#,
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+#[tokio::test]
+async fn status_accepts_unknown_health_response_fields_within_the_same_api_major() {
+    let (exit, output) = status_with_loopback_responses(
+        compatible_health_response(r#","future_health":"available""#),
+        compatible_capabilities_response(""),
+    )
+    .await;
+
+    assert_eq!(exit, ExitCode::Success);
+    assert_eq!(output.stderr(), "");
+}
+
+#[tokio::test]
+async fn status_accepts_unknown_capability_response_fields_within_the_same_api_major() {
+    let (exit, output) = status_with_loopback_responses(
+        compatible_health_response(""),
+        compatible_capabilities_response(r#","future_capability":"available""#),
+    )
+    .await;
+
+    assert_eq!(exit, ExitCode::Success);
+    assert_eq!(output.stderr(), "");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn serve_publishes_only_a_ready_loopback_identity_and_removes_its_discovery() {
     let directory = TestDirectory::new();
@@ -509,6 +675,210 @@ async fn serve_publishes_only_a_ready_loopback_identity_and_removes_its_discover
     );
     assert_eq!(serve_output.stderr(), "");
     assert!(!paths.discovery_file.exists());
+}
+
+async fn wait_for_discovery(paths: &AppPaths) -> DiscoveryRecord {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(store) = DiscoveryStore::new(paths)
+                && let Ok(record) = store.read()
+            {
+                break record;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap()
+}
+
+async fn wait_for_lease_release(paths: &AppPaths) {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            match RuntimeLease::acquire(paths) {
+                Ok(lease) => {
+                    drop(lease);
+                    break;
+                }
+                Err(PlatformError::AlreadyRunning) => tokio::task::yield_now().await,
+                Err(error) => panic!("unexpected lease acquisition error: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("cancelled service did not finish releasing its lease");
+}
+
+async fn competing_serve_exit(
+    paths: AppPaths,
+    secrets: Arc<MemorySecretStore>,
+) -> Option<ExitCode> {
+    let shutdown = Arc::new(ManualShutdown::default());
+    shutdown.trigger();
+    let dependencies = runtime_dependencies(paths, secrets, shutdown);
+    let mut output = BufferOutput::default();
+    timeout(
+        Duration::from_secs(5),
+        run_with_dependencies(
+            Cli::try_parse_from(["wokcore", "serve", "--json"]).unwrap(),
+            &dependencies,
+            &mut output,
+        ),
+    )
+    .await
+    .ok()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn aborting_serve_during_bootstrap_retains_the_lease_until_bootstrap_finishes() {
+    let directory = TestDirectory::new();
+    let paths = paths(directory.path());
+    persist_port(&paths, reserve_port());
+    let entropy = Arc::new(GatedEntropy::new(1));
+    let publisher = Arc::new(RecordingDiscoveryPublisher::default());
+    let secrets = Arc::new(MemorySecretStore::default());
+    let dependencies = runtime_dependencies_with_entropy(
+        paths.clone(),
+        secrets.clone(),
+        entropy.clone(),
+        Arc::new(ManualShutdown::default()),
+    )
+    .with_discovery_publisher(publisher.clone());
+    let serve = tokio::spawn(async move {
+        let mut output = BufferOutput::default();
+        run_with_dependencies(
+            Cli::try_parse_from(["wokcore", "serve", "--json"]).unwrap(),
+            &dependencies,
+            &mut output,
+        )
+        .await
+    });
+    entropy.wait_until_blocked().await;
+
+    serve.abort();
+    assert!(serve.await.unwrap_err().is_cancelled());
+    let competing_exit = competing_serve_exit(paths.clone(), secrets).await;
+
+    entropy.release();
+    wait_for_lease_release(&paths).await;
+    assert!(
+        competing_exit == Some(ExitCode::AlreadyRunning),
+        "serve cancellation let a second instance start while bootstrap still owned mutation work; \
+         observed {competing_exit:?}"
+    );
+    assert!(!paths.discovery_file.exists());
+    assert!(
+        !publisher.0.load(Ordering::Acquire),
+        "cancelled startup published discovery after bootstrap finished"
+    );
+}
+
+async fn abort_published_service_with_blocked_request(
+    replace_discovery: bool,
+) -> (
+    Option<ExitCode>,
+    Option<DiscoveryRecord>,
+    AppPaths,
+    TestDirectory,
+) {
+    let directory = TestDirectory::new();
+    let paths = paths(directory.path());
+    let port = reserve_port();
+    persist_port(&paths, port);
+    let entropy = Arc::new(GatedEntropy::new(2));
+    let secrets = Arc::new(MemorySecretStore::default());
+    let dependencies = runtime_dependencies_with_entropy(
+        paths.clone(),
+        secrets.clone(),
+        entropy.clone(),
+        Arc::new(ManualShutdown::default()),
+    );
+    let serve = tokio::spawn(async move {
+        let mut output = BufferOutput::default();
+        run_with_dependencies(
+            Cli::try_parse_from(["wokcore", "serve", "--json"]).unwrap(),
+            &dependencies,
+            &mut output,
+        )
+        .await
+    });
+    let record = wait_for_discovery(&paths).await;
+    let state = ReadOnlyStateStore::open_live(&paths.state_db).unwrap();
+    let management_ref = state
+        .runtime_secret_binding("management")
+        .unwrap()
+        .unwrap()
+        .secret_ref;
+    drop(state);
+    let management = secrets.get(&management_ref).await.unwrap();
+    let request = tokio::spawn(async move {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .build()
+            .unwrap()
+            .post(format!("{}/wokcore/v1/clients/authorize", record.base_url))
+            .header(HOST, format!("127.0.0.1:{port}"))
+            .header(
+                AUTHORIZATION,
+                format!("Bearer {}", management.expose_secret()),
+            )
+            .json(&serde_json::json!({"client_id": "wokrouter"}))
+            .send()
+            .await
+            .unwrap()
+    });
+    entropy.wait_until_blocked().await;
+
+    serve.abort();
+    assert!(serve.await.unwrap_err().is_cancelled());
+    let competing_exit = competing_serve_exit(paths.clone(), secrets).await;
+    let replacement = replace_discovery.then(|| {
+        let mut replacement = DiscoveryStore::new(&paths).unwrap().read().unwrap();
+        replacement.instance_id = Uuid::parse_str("019844f0-4de0-7000-8000-000000000088").unwrap();
+        DiscoveryStore::new(&paths)
+            .unwrap()
+            .publish(&replacement)
+            .unwrap();
+        replacement
+    });
+
+    entropy.release();
+    let _ = timeout(Duration::from_secs(5), request)
+        .await
+        .expect("blocked request did not finish after entropy release");
+    wait_for_lease_release(&paths).await;
+    (competing_exit, replacement, paths, directory)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn aborting_serve_after_publish_joins_the_listener_and_removes_owned_discovery_first() {
+    let (competing_exit, replacement, paths, _directory) =
+        abort_published_service_with_blocked_request(false).await;
+
+    assert!(replacement.is_none());
+    assert!(
+        competing_exit == Some(ExitCode::AlreadyRunning),
+        "serve cancellation let a second instance start before its listener joined; observed \
+         {competing_exit:?}"
+    );
+    assert!(!paths.discovery_file.exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn aborting_serve_after_publish_preserves_a_replacement_discovery() {
+    let (competing_exit, replacement, paths, _directory) =
+        abort_published_service_with_blocked_request(true).await;
+
+    assert!(
+        competing_exit == Some(ExitCode::AlreadyRunning),
+        "replacement was installed after the old service had already released ownership; observed \
+         {competing_exit:?}"
+    );
+    assert_eq!(
+        DiscoveryStore::new(&paths).unwrap().read().unwrap(),
+        replacement.unwrap()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1001,11 +1371,11 @@ async fn successful_stop_does_not_send_a_drain_cancellation() {
             ),
             (
                 "/wokcore/v1/service/drain",
-                r#"{"phase":"draining","active_requests":0}"#.to_owned(),
+                r#"{"phase":"draining","active_requests":0,"future_drain":"available"}"#.to_owned(),
             ),
             (
                 "/wokcore/v1/service/stop",
-                r#"{"phase":"stopping","active_requests":0}"#.to_owned(),
+                r#"{"phase":"stopping","active_requests":0,"future_stop":"available"}"#.to_owned(),
             ),
         ] {
             let (mut stream, _) = listener.accept().await.unwrap();
@@ -1043,6 +1413,80 @@ async fn successful_stop_does_not_send_a_drain_cancellation() {
         ]
     );
     assert!(!extra_request, "successful stop unexpectedly sent cancel");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn authorize_accepts_unknown_response_fields_within_the_same_api_major() {
+    let directory = TestDirectory::new();
+    let paths = paths(directory.path());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    publish_record(
+        &paths,
+        &DiscoveryRecord {
+            base_url: format!("http://127.0.0.1:{port}"),
+            pid: 4242,
+            instance_id: Uuid::parse_str(INSTANCE_ID).unwrap(),
+            wokcore_version: env!("CARGO_PKG_VERSION").to_owned(),
+            api_major: 1,
+        },
+    );
+    std::fs::create_dir_all(paths.state_db.parent().unwrap()).unwrap();
+    let mut state = StateStore::open(&paths.state_db).unwrap();
+    let secrets = Arc::new(MemorySecretStore::default());
+    let scope = SecretScope {
+        provider_id: ProviderId::new("wokcore-runtime").unwrap(),
+        account_id: None,
+        purpose: SecretPurpose::Auxiliary,
+    };
+    let management = TokenMaterial::generate_admin(&FixedRuntimeValues)
+        .unwrap()
+        .into_response_value();
+    let secret_ref = secrets.put(&scope, management).await.unwrap();
+    state
+        .bind_runtime_secret_if_absent("management", &secret_ref, "2026-07-26T12:00:00Z")
+        .unwrap();
+    drop(state);
+    let server = tokio::spawn(async move {
+        for (expected_path, status, body) in [
+            (
+                "/wokcore/v1/health",
+                "200 OK",
+                compatible_health_response(""),
+            ),
+            (
+                "/wokcore/v1/capabilities",
+                "200 OK",
+                compatible_capabilities_response(""),
+            ),
+            (
+                "/wokcore/v1/clients/authorize",
+                "201 Created",
+                r#"{"client_id":"wokrouter","token_id":"future-token","token":"wok_proxy_v1_future","future_authorize":"available"}"#.to_owned(),
+            ),
+        ] {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut stream).await;
+            assert_eq!(request.split_whitespace().nth(1), Some(expected_path));
+            write_http_response(&mut stream, status, &body).await;
+        }
+    });
+    let dependencies = runtime_dependencies(paths, secrets, Arc::new(ManualShutdown::default()));
+    let mut output = BufferOutput::default();
+
+    let exit = run_with_dependencies(
+        Cli::try_parse_from(["wokcore", "authorize", "--client", "wokrouter", "--json"]).unwrap(),
+        &dependencies,
+        &mut output,
+    )
+    .await;
+
+    server.await.unwrap();
+    assert_eq!(exit, ExitCode::Success);
+    assert_eq!(output.stderr(), "");
+    let rendered: serde_json::Value = serde_json::from_str(output.stdout()).unwrap();
+    assert_eq!(rendered["token_id"], "future-token");
+    assert_eq!(rendered["token"], "wok_proxy_v1_future");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::{
     api::build_router,
-    auth::AuthRegistry,
+    auth::{AuthRegistry, EntropySource, OsEntropy},
     lifecycle::ServiceLifecycle,
     runtime::{SystemTokenMetadata, TokenMetadataSource},
 };
@@ -20,6 +20,7 @@ pub struct ServerState {
     pub(crate) auth: Arc<AuthRegistry>,
     pub(crate) lifecycle: ServiceLifecycle,
     pub(crate) token_metadata: Arc<dyn TokenMetadataSource>,
+    pub(crate) request_id_entropy: Arc<dyn EntropySource>,
     shutdown: watch::Sender<bool>,
 }
 
@@ -30,12 +31,13 @@ impl ServerState {
         auth: Arc<AuthRegistry>,
         lifecycle: ServiceLifecycle,
     ) -> Self {
-        Self::new_with_token_metadata(
+        Self::new_with_runtime_sources(
             authority,
             instance_id,
             auth,
             lifecycle,
-            Arc::new(SystemTokenMetadata),
+            Arc::new(SystemTokenMetadata::default()),
+            Arc::new(OsEntropy),
         )
     }
 
@@ -46,6 +48,24 @@ impl ServerState {
         lifecycle: ServiceLifecycle,
         token_metadata: Arc<dyn TokenMetadataSource>,
     ) -> Self {
+        Self::new_with_runtime_sources(
+            authority,
+            instance_id,
+            auth,
+            lifecycle,
+            token_metadata,
+            Arc::new(OsEntropy),
+        )
+    }
+
+    pub fn new_with_runtime_sources(
+        authority: impl Into<Arc<str>>,
+        instance_id: Uuid,
+        auth: Arc<AuthRegistry>,
+        lifecycle: ServiceLifecycle,
+        token_metadata: Arc<dyn TokenMetadataSource>,
+        request_id_entropy: Arc<dyn EntropySource>,
+    ) -> Self {
         let (shutdown, _) = watch::channel(false);
         Self {
             authority: authority.into(),
@@ -53,6 +73,7 @@ impl ServerState {
             auth,
             lifecycle,
             token_metadata,
+            request_id_entropy,
             shutdown,
         }
     }

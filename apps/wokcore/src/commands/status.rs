@@ -202,14 +202,12 @@ enum ReadDiscoveryError {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct HealthResponse {
     status: String,
     instance_id: uuid::Uuid,
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct CapabilitiesResponse {
     wokcore_version: String,
     management_api_major: u8,

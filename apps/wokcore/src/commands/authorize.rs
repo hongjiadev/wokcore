@@ -114,7 +114,6 @@ struct AuthorizeRequest {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct AuthorizeResponseWire {
     client_id: ClientId,
     token_id: String,
