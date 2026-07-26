@@ -236,6 +236,28 @@ async fn duplicate_host_is_rejected_and_forwarded_headers_never_override_authori
 }
 
 #[tokio::test]
+async fn absolute_form_request_target_must_use_the_configured_authority() {
+    let mismatched = Request::builder()
+        .method("GET")
+        .uri("http://attacker.invalid/wokcore/v1/health")
+        .header(header::HOST, AUTHORITY)
+        .body(Body::empty())
+        .unwrap();
+    let rejected = router().await.oneshot(mismatched).await.unwrap();
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(error_code(rejected).await, "invalid_authority");
+
+    let exact = Request::builder()
+        .method("GET")
+        .uri(format!("http://{AUTHORITY}/wokcore/v1/health"))
+        .header(header::HOST, AUTHORITY)
+        .body(Body::empty())
+        .unwrap();
+    let accepted = router().await.oneshot(exact).await.unwrap();
+    assert_eq!(accepted.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn every_present_origin_is_rejected_without_cors_headers() {
     for origin in [
         "null",

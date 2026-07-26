@@ -8,7 +8,7 @@ use axum::{
     Router,
     extract::DefaultBodyLimit,
     middleware,
-    routing::{delete, get, post},
+    routing::{MethodFilter, delete, on, post},
 };
 
 use crate::ServerState;
@@ -22,9 +22,18 @@ use security::enforce_request_security;
 
 pub fn build_router(state: ServerState) -> Router {
     Router::new()
-        .route("/wokcore/v1/health", get(health))
-        .route("/wokcore/v1/capabilities", get(capabilities))
-        .route("/wokcore/v1/service/status", get(service_status))
+        .route(
+            "/wokcore/v1/health",
+            on(MethodFilter::GET, health).on(MethodFilter::HEAD, method_not_allowed),
+        )
+        .route(
+            "/wokcore/v1/capabilities",
+            on(MethodFilter::GET, capabilities).on(MethodFilter::HEAD, method_not_allowed),
+        )
+        .route(
+            "/wokcore/v1/service/status",
+            on(MethodFilter::GET, service_status).on(MethodFilter::HEAD, method_not_allowed),
+        )
         .route("/wokcore/v1/service/drain", post(drain))
         .route("/wokcore/v1/service/drain/cancel", post(cancel_drain))
         .route("/wokcore/v1/service/stop", post(stop))

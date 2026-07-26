@@ -8,6 +8,7 @@ pub(crate) struct HealthResponse {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct AuthorizeRequest {
     pub client_id: ClientId,
 }

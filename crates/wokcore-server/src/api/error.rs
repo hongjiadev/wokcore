@@ -117,11 +117,29 @@ impl ApiError {
         )
     }
 
+    pub(crate) fn invalid_path_parameters(request_id: RequestId) -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_path_parameters",
+            "path parameters are invalid",
+            request_id,
+        )
+    }
+
     pub(crate) fn storage_failure(request_id: RequestId) -> Self {
         Self::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal_error",
             "authentication metadata operation failed",
+            request_id,
+        )
+    }
+
+    pub(crate) fn internal_failure(request_id: RequestId) -> Self {
+        Self::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "control-plane request failed",
             request_id,
         )
     }

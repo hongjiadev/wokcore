@@ -25,7 +25,11 @@ pub(crate) async fn enforce_request_security(
         (hosts.next(), hosts.next()),
         (Some(host), None) if host.as_bytes() == state.authority.as_bytes()
     );
-    if !valid_host {
+    let valid_target_authority = request
+        .uri()
+        .authority()
+        .is_none_or(|authority| authority.as_str().as_bytes() == state.authority.as_bytes());
+    if !valid_host || !valid_target_authority {
         return ApiError::invalid_authority(request_id).into_response();
     }
     if request.headers().get_all(ORIGIN).iter().next().is_some() {
@@ -44,20 +48,40 @@ pub(crate) async fn enforce_request_security(
         if !candidate.is_some_and(|candidate| state.auth.validate_management(candidate)) {
             return ApiError::unauthorized(request_id).into_response();
         }
-        let phase = state.lifecycle.snapshot().phase;
-        if phase != LifecyclePhase::Running && !allowed_during_maintenance(request.uri().path()) {
-            return ApiError::service_maintenance(request_id).into_response();
+        if is_metadata_mutation_path(request.uri().path()) {
+            let guard = match state.lifecycle.admission_controller().try_enter() {
+                Ok(guard) => guard,
+                Err(_) => return ApiError::service_maintenance(request_id).into_response(),
+            };
+            let owned = tokio::spawn(async move {
+                let _guard = guard;
+                run_bounded_request(request, next, request_id).await
+            });
+            return match owned.await {
+                Ok(response) => response,
+                Err(_) => ApiError::internal_failure(request_id).into_response(),
+            };
+        } else {
+            let phase = state.lifecycle.snapshot().phase;
+            if phase != LifecyclePhase::Running && !allowed_during_maintenance(request.uri().path())
+            {
+                return ApiError::service_maintenance(request_id).into_response();
+            }
         }
     }
     if management {
-        let (parts, body) = request.into_parts();
-        let body = match to_bytes(body, 16 * 1024).await {
-            Ok(body) => body,
-            Err(_) => return ApiError::payload_too_large(request_id).into_response(),
-        };
-        return next.run(Request::from_parts(parts, Body::from(body))).await;
+        return run_bounded_request(request, next, request_id).await;
     }
     next.run(request).await
+}
+
+async fn run_bounded_request(request: Request, next: Next, request_id: RequestId) -> Response {
+    let (parts, body) = request.into_parts();
+    let body = match to_bytes(body, 16 * 1024).await {
+        Ok(body) => body,
+        Err(_) => return ApiError::payload_too_large(request_id).into_response(),
+    };
+    next.run(Request::from_parts(parts, Body::from(body))).await
 }
 
 fn allowed_during_maintenance(path: &str) -> bool {
@@ -77,5 +101,26 @@ fn is_management_path(path: &str) -> bool {
             | "/wokcore/v1/service/drain/cancel"
             | "/wokcore/v1/service/stop"
             | "/wokcore/v1/clients/authorize"
-    ) || (path.starts_with("/wokcore/v1/clients/") && path.contains("/tokens/"))
+    ) || is_revoke_path(path)
+}
+
+fn is_metadata_mutation_path(path: &str) -> bool {
+    path == "/wokcore/v1/clients/authorize" || is_revoke_path(path)
+}
+
+fn is_revoke_path(path: &str) -> bool {
+    let Some(segments) = path.strip_prefix("/wokcore/v1/clients/") else {
+        return false;
+    };
+    let mut segments = segments.split('/');
+    matches!(
+        (
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next()
+        ),
+        (Some(client_id), Some("tokens"), Some(token_id), None)
+            if !client_id.is_empty() && !token_id.is_empty()
+    )
 }

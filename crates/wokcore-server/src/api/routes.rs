@@ -2,7 +2,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::{
     Json,
-    extract::{Extension, Path, State, rejection::JsonRejection},
+    extract::{
+        Extension, Path, State,
+        rejection::{JsonRejection, PathRejection},
+    },
     http::StatusCode,
 };
 use secrecy::ExposeSecret;
@@ -121,8 +124,10 @@ pub(crate) async fn authorize(
 pub(crate) async fn revoke(
     Extension(request_id): Extension<RequestId>,
     State(state): State<ServerState>,
-    Path((client_id, token_id)): Path<(String, String)>,
+    path: Result<Path<(String, String)>, PathRejection>,
 ) -> Result<Json<RevokeResponse>, ApiError> {
+    let Path((client_id, token_id)) =
+        path.map_err(|_| ApiError::invalid_path_parameters(request_id))?;
     let client_id =
         ClientId::new(client_id).map_err(|_| ApiError::invalid_client_id(request_id))?;
     let revoked = state

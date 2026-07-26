@@ -9,7 +9,7 @@
       "url": "http://127.0.0.1:{port}",
       "variables": {
         "port": {
-          "default": "0"
+          "default": "43127"
         }
       }
     }
@@ -22,6 +22,11 @@
         "responses": {
           "200": {
             "description": "Service health",
+            "headers": {
+              "X-Request-Id": {"$ref": "#/components/headers/XRequestId"},
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
+              "X-Content-Type-Options": {"$ref": "#/components/headers/XContentTypeOptions"}
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -43,6 +48,11 @@
         "responses": {
           "200": {
             "description": "Versioned capability handshake",
+            "headers": {
+              "X-Request-Id": {"$ref": "#/components/headers/XRequestId"},
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
+              "X-Content-Type-Options": {"$ref": "#/components/headers/XContentTypeOptions"}
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -68,6 +78,11 @@
         "responses": {
           "200": {
             "description": "Service lifecycle status",
+            "headers": {
+              "X-Request-Id": {"$ref": "#/components/headers/XRequestId"},
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
+              "X-Content-Type-Options": {"$ref": "#/components/headers/XContentTypeOptions"}
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -93,6 +108,11 @@
         "responses": {
           "200": {
             "description": "Drain state",
+            "headers": {
+              "X-Request-Id": {"$ref": "#/components/headers/XRequestId"},
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
+              "X-Content-Type-Options": {"$ref": "#/components/headers/XContentTypeOptions"}
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -118,6 +138,11 @@
         "responses": {
           "200": {
             "description": "Running state",
+            "headers": {
+              "X-Request-Id": {"$ref": "#/components/headers/XRequestId"},
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
+              "X-Content-Type-Options": {"$ref": "#/components/headers/XContentTypeOptions"}
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -143,6 +168,11 @@
         "responses": {
           "200": {
             "description": "Stopping state",
+            "headers": {
+              "X-Request-Id": {"$ref": "#/components/headers/XRequestId"},
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
+              "X-Content-Type-Options": {"$ref": "#/components/headers/XContentTypeOptions"}
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -178,6 +208,11 @@
         "responses": {
           "201": {
             "description": "One-time proxy token response",
+            "headers": {
+              "X-Request-Id": {"$ref": "#/components/headers/XRequestId"},
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
+              "X-Content-Type-Options": {"$ref": "#/components/headers/XContentTypeOptions"}
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -222,6 +257,11 @@
         "responses": {
           "200": {
             "description": "Revocation result",
+            "headers": {
+              "X-Request-Id": {"$ref": "#/components/headers/XRequestId"},
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
+              "X-Content-Type-Options": {"$ref": "#/components/headers/XContentTypeOptions"}
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -238,6 +278,29 @@
     }
   },
   "components": {
+    "headers": {
+      "XRequestId": {
+        "description": "Fresh server-generated request UUID",
+        "schema": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "CacheControl": {
+        "description": "Disables response storage",
+        "schema": {
+          "type": "string",
+          "const": "no-store"
+        }
+      },
+      "XContentTypeOptions": {
+        "description": "Disables content-type sniffing",
+        "schema": {
+          "type": "string",
+          "const": "nosniff"
+        }
+      }
+    },
     "securitySchemes": {
       "managementBearer": {
         "type": "http",
@@ -248,6 +311,11 @@
     "responses": {
       "Error": {
         "description": "Stable control-plane error",
+        "headers": {
+          "X-Request-Id": {"$ref": "#/components/headers/XRequestId"},
+          "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
+          "X-Content-Type-Options": {"$ref": "#/components/headers/XContentTypeOptions"}
+        },
         "content": {
           "application/json": {
             "schema": {
