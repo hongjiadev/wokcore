@@ -96,15 +96,12 @@ impl RunningServer {
     }
 
     async fn join(&mut self) -> Result<(), ServerError> {
-        let result = self
-            .task
-            .as_mut()
+        self.task
+            .take()
             .expect("running server task is joined at most once")
             .await
             .map_err(|_| ServerError::ServerTask)?
-            .map_err(ServerError::Listener);
-        self.task.take();
-        result
+            .map_err(ServerError::Listener)
     }
 }
 
@@ -134,4 +131,35 @@ pub enum ServerError {
     AuthorityMismatch,
     #[error("server task failed")]
     ServerTask,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{future, net::SocketAddr};
+
+    use tokio::sync::watch;
+
+    use super::{RunningServer, ServerError};
+
+    #[tokio::test]
+    async fn join_error_consumes_the_completed_task_handle() {
+        let (shutdown, _) = watch::channel(false);
+        let task = tokio::spawn(async {
+            future::pending::<()>().await;
+            Ok::<(), std::io::Error>(())
+        });
+        task.abort();
+        let mut server = RunningServer {
+            local_addr: SocketAddr::from(([127, 0, 0, 1], 43127)),
+            shutdown,
+            task: Some(task),
+        };
+
+        let result = server.join().await;
+        let task_remained = server.task.is_some();
+        server.task.take();
+
+        assert!(matches!(result, Err(ServerError::ServerTask)));
+        assert!(!task_remained, "JoinError left a completed task handle");
+    }
 }
