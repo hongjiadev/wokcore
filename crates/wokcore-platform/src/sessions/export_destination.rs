@@ -148,6 +148,11 @@ impl PinnedExportDestination {
             self.temporary_name.as_deref(),
             &self.target_name,
         )?;
+        #[cfg(target_vendor = "apple")]
+        {
+            validate_export_boundary(&self.parent, &self.session_roots)?;
+            temporary.disarm_published()?;
+        }
         self.committed = true;
         self.temporary = None;
         Ok(())
@@ -1142,6 +1147,13 @@ mod apple {
                 });
             }
             self.object.reference = unsafe { published.assume_init() };
+            Ok(())
+        }
+
+        pub(super) fn disarm_published(&mut self) -> Result<(), SessionError> {
+            if self.fork.is_some() || !self.object.owned {
+                return Err(SessionError::UnsafePath);
+            }
             self.object.owned = false;
             Ok(())
         }
@@ -1170,6 +1182,10 @@ mod apple {
         let stability = parent.capture_stability()?;
         let path = CString::new(parent.path().as_os_str().as_bytes())
             .map_err(|_| SessionError::UnsafePath)?;
+        #[cfg(test)]
+        super::apple_synchronization_tests::hit(
+            super::AppleSynchronizationPoint::BeforePathMakeRef,
+        );
         let mut reference = MaybeUninit::<FsRef>::uninit();
         let mut is_directory = 0;
         let status = unsafe {
@@ -1217,6 +1233,10 @@ mod apple {
             });
         }
         let verified = unsafe { File::from_raw_fd(descriptor) };
+        #[cfg(test)]
+        super::apple_synchronization_tests::hit(
+            super::AppleSynchronizationPoint::AfterIdentityOpen,
+        );
         let pinned_identity = file_identity(parent.file())?;
         if file_identity(&verified)? != pinned_identity {
             return Err(SessionError::UnsafePath);
@@ -1230,6 +1250,10 @@ mod apple {
         reference: &FsRef,
         pinned_identity: SessionFileIdentity,
     ) -> Result<(), SessionError> {
+        #[cfg(test)]
+        if super::apple_catalog_node_id_check_skipped() {
+            return Ok(());
+        }
         let SessionFileIdentity::Unix { inode, .. } = pinned_identity;
         let Ok(inode) = u32::try_from(inode) else {
             return Ok(());
@@ -1293,6 +1317,8 @@ std::thread_local! {
     static FAIL_APPLE_CLOSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     #[cfg(target_vendor = "apple")]
     static FAIL_APPLE_DELETE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    #[cfg(target_vendor = "apple")]
+    static SKIP_APPLE_CATALOG_NODE_ID: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -1321,17 +1347,27 @@ fn apple_delete_failure_injected() -> bool {
 }
 
 #[cfg(all(test, target_vendor = "apple"))]
+fn apple_catalog_node_id_check_skipped() -> bool {
+    SKIP_APPLE_CATALOG_NODE_ID.with(|skipped| skipped.replace(false))
+}
+
+#[cfg(all(test, target_vendor = "apple"))]
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum AppleSynchronizationPoint {
+    BeforePathMakeRef,
     AfterPathMakeRef,
     BeforeIdentityOpen,
+    AfterIdentityOpen,
     BeforeObjectBoundPublish,
 }
 
 #[cfg(all(test, target_vendor = "apple"))]
 mod apple_synchronization_tests {
     use std::{
-        sync::{Arc, Barrier, Mutex},
+        sync::{
+            Arc, Barrier, Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
         thread::{self, ThreadId},
     };
 
@@ -1344,6 +1380,7 @@ mod apple_synchronization_tests {
     }
 
     pub(super) struct HookWindow {
+        arrived: AtomicBool,
         reached: Barrier,
         resume: Barrier,
     }
@@ -1351,14 +1388,20 @@ mod apple_synchronization_tests {
     impl HookWindow {
         pub(super) fn new() -> Self {
             Self {
+                arrived: AtomicBool::new(false),
                 reached: Barrier::new(2),
                 resume: Barrier::new(2),
             }
         }
 
         fn pause_operation(&self) {
+            self.arrived.store(true, Ordering::Release);
             self.reached.wait();
             self.resume.wait();
+        }
+
+        pub(super) fn has_arrived(&self) -> bool {
+            self.arrived.load(Ordering::Acquire)
         }
 
         pub(super) fn wait_until_reached(&self) {
@@ -1739,6 +1782,7 @@ mod apple_regression_tests {
         path::Path,
         sync::{Arc, mpsc},
         thread,
+        time::{Duration, Instant},
     };
 
     use crate::sessions::{SessionError, SessionRootLease};
@@ -1791,6 +1835,31 @@ mod apple_regression_tests {
                 || directory_entries(&fixture.export_parent)
                     == vec![OsString::from("diagnostics.zip")]
         );
+    }
+
+    #[test]
+    fn object_bound_publish_rolls_back_after_destination_parent_enters_session_root() {
+        let fixture = AppleFixture::new();
+        let target = fixture.export_parent.join("diagnostics.zip");
+        let mut destination =
+            PinnedExportDestination::create(&target, &[&fixture.session]).unwrap();
+        destination.write_all(b"owned temporary").unwrap();
+        let relocated_parent = fixture.session_path.join("relocated-exports");
+
+        let result = run_commit_at_hook(
+            destination,
+            AppleSynchronizationPoint::BeforeObjectBoundPublish,
+            || fs::rename(&fixture.export_parent, &relocated_parent).unwrap(),
+        );
+
+        assert!(matches!(
+            result,
+            Err(SessionError::UnsafePath | SessionError::Io { .. })
+        ));
+        assert!(!target.exists());
+        assert!(directory_entries(&relocated_parent).is_empty());
+        fs::remove_dir(&relocated_parent).unwrap();
+        assert!(directory_entries(&fixture.session_path).is_empty());
     }
 
     #[test]
@@ -1872,6 +1941,59 @@ mod apple_regression_tests {
         assert!(!target.exists());
     }
 
+    #[test]
+    fn parent_fsref_conversion_detects_ancestor_aba_across_distinct_lookups() {
+        let root = tempfile::tempdir().unwrap();
+        let session_path = root.path().join("sessions");
+        fs::create_dir(&session_path).unwrap();
+        let session = SessionRootLease::open(&session_path).unwrap();
+        let export_ancestor = root.path().join("export-ancestor");
+        let alternate_ancestor = root.path().join("alternate-ancestor");
+        fs::create_dir(export_ancestor.join("exports")).unwrap();
+        fs::create_dir(alternate_ancestor.join("exports")).unwrap();
+        let holding_ancestor = root.path().join("holding-ancestor");
+        let target = export_ancestor.join("exports").join("diagnostics.zip");
+
+        let (thread_tx, thread_rx) = mpsc::channel();
+        let (start_tx, start_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            thread_tx.send(thread::current().id()).unwrap();
+            start_rx.recv().unwrap();
+            super::SKIP_APPLE_CATALOG_NODE_ID.with(|skipped| skipped.set(true));
+            result_tx
+                .send(PinnedExportDestination::create(&target, &[&session]))
+                .unwrap();
+        });
+        let worker_id = thread_rx.recv().unwrap();
+        let before_path =
+            install_apple_hook(worker_id, AppleSynchronizationPoint::BeforePathMakeRef);
+        let after_path = install_apple_hook(worker_id, AppleSynchronizationPoint::AfterPathMakeRef);
+        let before_open =
+            install_apple_hook(worker_id, AppleSynchronizationPoint::BeforeIdentityOpen);
+        let after_open =
+            install_apple_hook(worker_id, AppleSynchronizationPoint::AfterIdentityOpen);
+        start_tx.send(()).unwrap();
+
+        let result = 'operation: {
+            for window in [&before_path, &after_path, &before_open, &after_open] {
+                if let Some(result) = wait_for_hook_or_result(window, &result_rx) {
+                    break 'operation result;
+                }
+                swap_ancestor_directories(&export_ancestor, &alternate_ancestor, &holding_ancestor);
+                window.resume_operation();
+            }
+            break 'operation result_rx.recv().unwrap();
+        };
+        worker.join().unwrap();
+        super::apple_synchronization_tests::uninstall(worker_id);
+
+        assert!(matches!(result, Err(SessionError::UnsafePath)));
+        assert!(directory_entries(&export_ancestor.join("exports")).is_empty());
+        assert!(directory_entries(&alternate_ancestor.join("exports")).is_empty());
+        assert!(directory_entries(&session_path).is_empty());
+    }
+
     fn assert_parent_fsref_swap_restore_fails_closed(point: AppleSynchronizationPoint) {
         let fixture = AppleFixture::new();
         let replacement_parent = fixture.root.path().join("replacement");
@@ -1930,6 +2052,44 @@ mod apple_regression_tests {
         let result = worker.join().unwrap();
         super::apple_synchronization_tests::uninstall(worker_id);
         result
+    }
+
+    fn install_apple_hook(
+        worker_id: thread::ThreadId,
+        point: AppleSynchronizationPoint,
+    ) -> Arc<super::apple_synchronization_tests::HookWindow> {
+        let window = Arc::new(super::apple_synchronization_tests::HookWindow::new());
+        super::apple_synchronization_tests::install(worker_id, point, Arc::clone(&window));
+        window
+    }
+
+    fn wait_for_hook_or_result<T>(
+        window: &super::apple_synchronization_tests::HookWindow,
+        result: &mpsc::Receiver<T>,
+    ) -> Option<T> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if window.has_arrived() {
+                window.wait_until_reached();
+                return None;
+            }
+            match result.try_recv() {
+                Ok(result) => return Some(result),
+                Err(mpsc::TryRecvError::Empty) if Instant::now() < deadline => {
+                    thread::yield_now();
+                }
+                Err(mpsc::TryRecvError::Empty) => panic!("Apple synchronization hook timed out"),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    panic!("Apple synchronization worker disconnected")
+                }
+            }
+        }
+    }
+
+    fn swap_ancestor_directories(original: &Path, alternate: &Path, holding: &Path) {
+        fs::rename(original, holding).unwrap();
+        fs::rename(alternate, original).unwrap();
+        fs::rename(holding, alternate).unwrap();
     }
 
     struct AppleFixture {
