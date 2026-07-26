@@ -19,6 +19,10 @@ pub enum SessionError {
     EnumerationLimitExceeded,
     #[error("session read exceeds the caller limit")]
     ReadLimitExceeded,
+    #[error("session file changed during a bounded operation")]
+    SessionFileChanged,
+    #[error("session file is unavailable for the bounded operation")]
+    SessionFileUnavailable,
     #[error("session I/O failed")]
     Io {
         #[from]

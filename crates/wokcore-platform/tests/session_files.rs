@@ -209,8 +209,87 @@ fn bounded_reads_reject_growth_beyond_the_caller_limit() {
         .unwrap();
     assert!(matches!(
         opened.read_bounded(8),
-        Err(SessionError::ReadLimitExceeded)
+        Err(SessionError::SessionFileChanged)
     ));
+}
+
+#[test]
+fn bounded_read_revalidates_the_parent_relative_entry_after_every_writer_mutation() {
+    for mutation in [
+        BoundedReadMutation::Append,
+        BoundedReadMutation::Truncate,
+        BoundedReadMutation::Rename,
+        BoundedReadMutation::Delete,
+        BoundedReadMutation::Replace,
+    ] {
+        let fixture = SessionFixture::new(b"original");
+        let root = SessionRootLease::open(fixture.root.path()).unwrap();
+        let mut opened = root.open_file(&fixture.relative_file, 1024).unwrap();
+        let moved = fixture.file.with_extension("moved");
+
+        match mutation {
+            BoundedReadMutation::Append => {
+                OpenOptions::new()
+                    .append(true)
+                    .open(&fixture.file)
+                    .unwrap()
+                    .write_all(b"-append")
+                    .unwrap();
+                assert_eq!(fs::read(&fixture.file).unwrap(), b"original-append");
+            }
+            BoundedReadMutation::Truncate => {
+                OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .open(&fixture.file)
+                    .unwrap();
+                assert!(fs::read(&fixture.file).unwrap().is_empty());
+            }
+            BoundedReadMutation::Rename => {
+                fs::rename(&fixture.file, &moved).unwrap();
+                assert_eq!(fs::read(&moved).unwrap(), b"original");
+            }
+            BoundedReadMutation::Delete => {
+                fs::remove_file(&fixture.file).unwrap();
+                assert!(!fixture.file.exists());
+            }
+            BoundedReadMutation::Replace => {
+                fs::rename(&fixture.file, &moved).unwrap();
+                fs::write(&fixture.file, b"replacement").unwrap();
+                assert_eq!(fs::read(&fixture.file).unwrap(), b"replacement");
+            }
+        }
+
+        assert!(
+            matches!(
+                opened.read_bounded(1024),
+                Err(SessionError::SessionFileChanged | SessionError::SessionFileUnavailable)
+            ),
+            "bounded read accepted mutation {}",
+            mutation.name()
+        );
+    }
+}
+
+#[derive(Clone, Copy)]
+enum BoundedReadMutation {
+    Append,
+    Truncate,
+    Rename,
+    Delete,
+    Replace,
+}
+
+impl BoundedReadMutation {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Append => "append",
+            Self::Truncate => "truncate",
+            Self::Rename => "rename",
+            Self::Delete => "delete",
+            Self::Replace => "replace",
+        }
+    }
 }
 
 #[cfg(windows)]

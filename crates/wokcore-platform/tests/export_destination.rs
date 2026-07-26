@@ -89,16 +89,48 @@ fn temporary_is_exclusive_relative_to_the_pinned_parent_and_drop_removes_only_ow
         destination.write_all(b"partial export").unwrap();
         assert!(!target.exists());
         let during = directory_entries(&fixture.export_parent);
-        assert_eq!(during.len(), before.len() + 1);
-        assert!(during.iter().any(|name| {
-            name.to_string_lossy().starts_with(".wokcore-export-")
-                && name != ".wokcore-export-decoy.tmp"
-        }));
+        #[cfg(windows)]
+        {
+            assert_eq!(during.len(), before.len() + 1);
+            assert!(during.iter().any(|name| {
+                name.to_string_lossy().starts_with(".wokcore-export-")
+                    && name != ".wokcore-export-decoy.tmp"
+            }));
+        }
+        #[cfg(unix)]
+        assert_eq!(during, before);
     }
 
     assert_eq!(directory_entries(&fixture.export_parent), before);
     assert_eq!(fs::read(decoy).unwrap(), b"decoy");
     assert!(!target.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_commit_publishes_owned_anonymous_contents_without_a_source_name() {
+    let fixture = ExportFixture::new();
+    let target = fixture.export_parent.join("anonymous.zip");
+    let mut destination = PinnedExportDestination::create(&target, &[&fixture.session]).unwrap();
+    destination.write_all(b"owned anonymous contents").unwrap();
+    let decoy = fixture.export_parent.join(".wokcore-export-forged.tmp");
+    fs::write(&decoy, b"forged replacement").unwrap();
+
+    assert_eq!(
+        directory_entries(&fixture.export_parent),
+        vec![OsString::from(".wokcore-export-forged.tmp")]
+    );
+    destination.commit().unwrap();
+
+    assert_eq!(fs::read(&target).unwrap(), b"owned anonymous contents");
+    assert_eq!(fs::read(&decoy).unwrap(), b"forged replacement");
+    assert_eq!(
+        directory_entries(&fixture.export_parent),
+        vec![
+            OsString::from(".wokcore-export-forged.tmp"),
+            OsString::from("anonymous.zip"),
+        ]
+    );
 }
 
 #[test]

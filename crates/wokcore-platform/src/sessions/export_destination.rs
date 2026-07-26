@@ -6,19 +6,55 @@ use std::{
 };
 
 use super::SessionError;
+#[cfg(windows)]
+use super::file::recheck_regular_child_identity;
 use super::file::{
     DirectoryChain, SessionFileIdentity, SessionRootLease, child_exists, file_identity,
-    recheck_regular_child_identity, validate_child_name, validate_directory_chain,
+    validate_child_name, validate_directory_chain,
 };
 
 pub struct PinnedExportDestination {
     parent: DirectoryChain,
     session_roots: Vec<DirectoryChain>,
     target_name: OsString,
-    temporary_name: OsString,
+    temporary_name: Option<OsString>,
     temporary: Option<File>,
     temporary_identity: SessionFileIdentity,
     committed: bool,
+}
+
+struct CreatedTemporary {
+    file: File,
+    source_name: Option<OsString>,
+}
+
+struct TemporaryCreationGuard<'a> {
+    parent: &'a DirectoryChain,
+    temporary: Option<CreatedTemporary>,
+}
+
+impl TemporaryCreationGuard<'_> {
+    fn file(&self) -> &File {
+        &self
+            .temporary
+            .as_ref()
+            .expect("a creation guard owns its temporary")
+            .file
+    }
+
+    fn disarm(mut self) -> CreatedTemporary {
+        self.temporary
+            .take()
+            .expect("a creation guard owns its temporary")
+    }
+}
+
+impl Drop for TemporaryCreationGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(temporary) = self.temporary.take() {
+            let _ = remove_unidentified_temporary(self.parent, temporary);
+        }
+    }
 }
 
 impl PinnedExportDestination {
@@ -49,13 +85,24 @@ impl PinnedExportDestination {
             uuid::Uuid::new_v4().simple()
         ));
         let temporary = create_relative_temporary(&parent, &temporary_name)?;
-        let temporary_identity = file_identity(&temporary)?;
+        let temporary = TemporaryCreationGuard {
+            parent: &parent,
+            temporary: Some(temporary),
+        };
+        #[cfg(test)]
+        if temporary_identity_failure_injected() {
+            return Err(SessionError::Io {
+                source: io::Error::other("injected temporary identity failure"),
+            });
+        }
+        let temporary_identity = file_identity(temporary.file())?;
+        let temporary = temporary.disarm();
         Ok(Self {
             parent,
             session_roots,
             target_name,
-            temporary_name,
-            temporary: Some(temporary),
+            temporary_name: temporary.source_name,
+            temporary: Some(temporary.file),
             temporary_identity,
             committed: false,
         })
@@ -68,19 +115,22 @@ impl PinnedExportDestination {
             .expect("an uncommitted export owns its temporary file");
         temporary.sync_all()?;
         validate_export_boundary(&self.parent, &self.session_roots)?;
-        ensure_single_link(temporary)?;
+        ensure_unpublished_temporary(temporary)?;
+        #[cfg(windows)]
         recheck_regular_child_identity(
             &self.parent,
-            &self.temporary_name,
+            self.temporary_name
+                .as_deref()
+                .expect("a Windows temporary has a source name"),
             self.temporary_identity,
         )?;
         if child_exists(&self.parent, &self.target_name)? {
             return Err(SessionError::UnsafePath);
         }
-        rename_relative_noreplace(
+        publish_relative_noreplace(
             &self.parent,
             temporary,
-            &self.temporary_name,
+            self.temporary_name.as_deref(),
             &self.target_name,
         )?;
         self.committed = true;
@@ -114,7 +164,7 @@ impl Drop for PinnedExportDestination {
             let _ = remove_owned_temporary(
                 &self.parent,
                 temporary,
-                &self.temporary_name,
+                self.temporary_name.as_deref(),
                 self.temporary_identity,
             );
         }
@@ -151,8 +201,40 @@ fn validate_export_boundary(
     Ok(())
 }
 
-#[cfg(unix)]
-fn create_relative_temporary(parent: &DirectoryChain, name: &OsStr) -> Result<File, SessionError> {
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn create_relative_temporary(
+    parent: &DirectoryChain,
+    _name: &OsStr,
+) -> Result<CreatedTemporary, SessionError> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let descriptor = unsafe {
+        libc::openat(
+            parent.file().as_raw_fd(),
+            c".".as_ptr(),
+            libc::O_RDWR | libc::O_TMPFILE | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if descriptor < 0 {
+        let source = std::io::Error::last_os_error();
+        return Err(if source.kind() == io::ErrorKind::AlreadyExists {
+            SessionError::UnsafePath
+        } else {
+            SessionError::Io { source }
+        });
+    }
+    Ok(CreatedTemporary {
+        file: unsafe { File::from_raw_fd(descriptor) },
+        source_name: None,
+    })
+}
+
+#[cfg(target_vendor = "apple")]
+fn create_relative_temporary(
+    parent: &DirectoryChain,
+    name: &OsStr,
+) -> Result<CreatedTemporary, SessionError> {
     use std::os::{
         fd::{AsRawFd, FromRawFd},
         unix::ffi::OsStrExt,
@@ -175,11 +257,23 @@ fn create_relative_temporary(parent: &DirectoryChain, name: &OsStr) -> Result<Fi
             SessionError::Io { source }
         });
     }
-    Ok(unsafe { File::from_raw_fd(descriptor) })
+    let file = unsafe { File::from_raw_fd(descriptor) };
+    if unsafe { libc::unlinkat(parent.file().as_raw_fd(), name.as_ptr(), 0) } != 0 {
+        return Err(SessionError::Io {
+            source: io::Error::last_os_error(),
+        });
+    }
+    Ok(CreatedTemporary {
+        file,
+        source_name: None,
+    })
 }
 
 #[cfg(windows)]
-fn create_relative_temporary(parent: &DirectoryChain, name: &OsStr) -> Result<File, SessionError> {
+fn create_relative_temporary(
+    parent: &DirectoryChain,
+    name: &OsStr,
+) -> Result<CreatedTemporary, SessionError> {
     use std::{
         ffi::c_void,
         mem::size_of,
@@ -306,21 +400,24 @@ fn create_relative_temporary(parent: &DirectoryChain, name: &OsStr) -> Result<Fi
     if handle == INVALID_HANDLE_VALUE {
         return Err(SessionError::UnsafePath);
     }
-    Ok(unsafe { File::from_raw_handle(handle) })
+    Ok(CreatedTemporary {
+        file: unsafe { File::from_raw_handle(handle) },
+        source_name: Some(name.to_os_string()),
+    })
 }
 
 #[cfg(unix)]
-fn ensure_single_link(file: &File) -> Result<(), SessionError> {
+fn ensure_unpublished_temporary(file: &File) -> Result<(), SessionError> {
     use std::os::unix::fs::MetadataExt;
 
-    if file.metadata()?.nlink() != 1 {
+    if file.metadata()?.nlink() != 0 {
         return Err(SessionError::UnsafePath);
     }
     Ok(())
 }
 
 #[cfg(windows)]
-fn ensure_single_link(file: &File) -> Result<(), SessionError> {
+fn ensure_unpublished_temporary(file: &File) -> Result<(), SessionError> {
     use std::os::windows::io::AsRawHandle;
 
     use windows_sys::Win32::Storage::FileSystem::{
@@ -339,43 +436,29 @@ fn ensure_single_link(file: &File) -> Result<(), SessionError> {
     Ok(())
 }
 
-#[cfg(unix)]
-fn rename_relative_noreplace(
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn publish_relative_noreplace(
     parent: &DirectoryChain,
-    _temporary: &File,
-    temporary_name: &OsStr,
+    temporary: &File,
+    temporary_name: Option<&OsStr>,
     target_name: &OsStr,
 ) -> Result<(), SessionError> {
     use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
 
-    let temporary_name =
-        std::ffi::CString::new(temporary_name.as_bytes()).map_err(|_| SessionError::UnsafePath)?;
+    if temporary_name.is_some() {
+        return Err(SessionError::UnsafePath);
+    }
     let target_name =
         std::ffi::CString::new(target_name.as_bytes()).map_err(|_| SessionError::UnsafePath)?;
-    let descriptor = parent.file().as_raw_fd();
-    #[cfg(any(target_os = "linux", target_os = "android"))]
     let result = unsafe {
-        libc::renameat2(
-            descriptor,
-            temporary_name.as_ptr(),
-            descriptor,
+        libc::linkat(
+            temporary.as_raw_fd(),
+            c"".as_ptr(),
+            parent.file().as_raw_fd(),
             target_name.as_ptr(),
-            libc::RENAME_NOREPLACE,
+            libc::AT_EMPTY_PATH,
         )
     };
-    #[cfg(target_vendor = "apple")]
-    let result = unsafe {
-        libc::renameatx_np(
-            descriptor,
-            temporary_name.as_ptr(),
-            descriptor,
-            target_name.as_ptr(),
-            libc::RENAME_EXCL,
-        )
-    };
-    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
-    return Err(SessionError::UnsafePath);
-
     if result != 0 {
         let source = io::Error::last_os_error();
         return Err(if source.kind() == io::ErrorKind::AlreadyExists {
@@ -387,11 +470,44 @@ fn rename_relative_noreplace(
     Ok(())
 }
 
-#[cfg(windows)]
-fn rename_relative_noreplace(
+#[cfg(target_vendor = "apple")]
+fn publish_relative_noreplace(
     parent: &DirectoryChain,
     temporary: &File,
-    _temporary_name: &OsStr,
+    temporary_name: Option<&OsStr>,
+    target_name: &OsStr,
+) -> Result<(), SessionError> {
+    use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
+
+    if temporary_name.is_some() {
+        return Err(SessionError::UnsafePath);
+    }
+    let target_name =
+        std::ffi::CString::new(target_name.as_bytes()).map_err(|_| SessionError::UnsafePath)?;
+    if unsafe {
+        libc::fclonefileat(
+            temporary.as_raw_fd(),
+            parent.file().as_raw_fd(),
+            target_name.as_ptr(),
+            0,
+        )
+    } != 0
+    {
+        let source = io::Error::last_os_error();
+        return Err(if source.kind() == io::ErrorKind::AlreadyExists {
+            SessionError::UnsafePath
+        } else {
+            SessionError::Io { source }
+        });
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn publish_relative_noreplace(
+    parent: &DirectoryChain,
+    temporary: &File,
+    _temporary_name: Option<&OsStr>,
     target_name: &OsStr,
 ) -> Result<(), SessionError> {
     use std::{
@@ -477,38 +593,27 @@ fn rename_relative_noreplace(
 
 #[cfg(unix)]
 fn remove_owned_temporary(
-    parent: &DirectoryChain,
+    _parent: &DirectoryChain,
     temporary: File,
-    temporary_name: &OsStr,
+    temporary_name: Option<&OsStr>,
     expected: SessionFileIdentity,
 ) -> Result<(), SessionError> {
-    use std::os::{
-        fd::{AsRawFd, FromRawFd},
-        unix::ffi::OsStrExt,
-    };
-
-    let name =
-        std::ffi::CString::new(temporary_name.as_bytes()).map_err(|_| SessionError::UnsafePath)?;
-    let descriptor = unsafe {
-        libc::openat(
-            parent.file().as_raw_fd(),
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0,
-        )
-    };
-    if descriptor < 0 {
-        return Ok(());
-    }
-    let opened = unsafe { File::from_raw_fd(descriptor) };
-    if file_identity(&opened)? != expected || file_identity(&temporary)? != expected {
+    if temporary_name.is_some() || file_identity(&temporary)? != expected {
         return Err(SessionError::UnsafePath);
     }
-    if unsafe { libc::unlinkat(parent.file().as_raw_fd(), name.as_ptr(), 0) } != 0 {
-        return Err(SessionError::Io {
-            source: io::Error::last_os_error(),
-        });
+    drop(temporary);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn remove_unidentified_temporary(
+    _parent: &DirectoryChain,
+    temporary: CreatedTemporary,
+) -> Result<(), SessionError> {
+    if temporary.source_name.is_some() {
+        return Err(SessionError::UnsafePath);
     }
+    drop(temporary.file);
     Ok(())
 }
 
@@ -516,8 +621,24 @@ fn remove_owned_temporary(
 fn remove_owned_temporary(
     _parent: &DirectoryChain,
     temporary: File,
-    _temporary_name: &OsStr,
+    _temporary_name: Option<&OsStr>,
     expected: SessionFileIdentity,
+) -> Result<(), SessionError> {
+    remove_windows_temporary(temporary, Some(expected))
+}
+
+#[cfg(windows)]
+fn remove_unidentified_temporary(
+    _parent: &DirectoryChain,
+    temporary: CreatedTemporary,
+) -> Result<(), SessionError> {
+    remove_windows_temporary(temporary.file, None)
+}
+
+#[cfg(windows)]
+fn remove_windows_temporary(
+    temporary: File,
+    expected: Option<SessionFileIdentity>,
 ) -> Result<(), SessionError> {
     use std::{mem::size_of, os::windows::io::AsRawHandle};
 
@@ -525,7 +646,9 @@ fn remove_owned_temporary(
         FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
     };
 
-    if file_identity(&temporary)? != expected {
+    if let Some(expected) = expected
+        && file_identity(&temporary)? != expected
+    {
         return Err(SessionError::UnsafePath);
     }
     let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
@@ -546,14 +669,28 @@ fn remove_owned_temporary(
     Ok(())
 }
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
+std::thread_local! {
+    static FAIL_TEMPORARY_IDENTITY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn temporary_identity_failure_injected() -> bool {
+    FAIL_TEMPORARY_IDENTITY.with(|injected| injected.replace(false))
+}
+
+#[cfg(test)]
 mod tests {
-    use std::{ffi::OsString, fs, io::Write};
+    use std::{ffi::OsString, fs};
+
+    #[cfg(windows)]
+    use std::io::Write;
 
     use crate::sessions::{SessionError, SessionRootLease};
 
     use super::PinnedExportDestination;
 
+    #[cfg(windows)]
     #[test]
     fn injected_parent_identity_change_fails_closed_and_cleans_only_the_owned_temporary() {
         let root = tempfile::tempdir().unwrap();
@@ -585,6 +722,68 @@ mod tests {
         assert_eq!(fs::read(decoy).unwrap(), b"decoy");
         assert!(!target.exists());
         assert!(directory_entries(&session_path).is_empty());
+    }
+
+    #[test]
+    fn identity_failure_before_destination_construction_cleans_the_owned_temporary() {
+        let root = tempfile::tempdir().unwrap();
+        let session_path = root.path().join("sessions");
+        fs::create_dir(&session_path).unwrap();
+        let session = SessionRootLease::open(&session_path).unwrap();
+        let export_parent = root.path().join("exports");
+        fs::create_dir(&export_parent).unwrap();
+        let target = export_parent.join("diagnostics.zip");
+        super::FAIL_TEMPORARY_IDENTITY.with(|injected| injected.set(true));
+
+        assert!(matches!(
+            PinnedExportDestination::create(&target, &[&session]),
+            Err(SessionError::Io { .. })
+        ));
+        assert!(directory_entries(&export_parent).is_empty());
+        assert!(directory_entries(&session_path).is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn drop_deletes_the_owned_handle_without_deleting_a_source_name_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let session_path = root.path().join("sessions");
+        fs::create_dir(&session_path).unwrap();
+        let session = SessionRootLease::open(&session_path).unwrap();
+        let export_parent = root.path().join("exports");
+        fs::create_dir(&export_parent).unwrap();
+        let target = export_parent.join("diagnostics.zip");
+        let mut destination = PinnedExportDestination::create(&target, &[&session]).unwrap();
+        destination.write_all(b"owned temporary").unwrap();
+        let temporary_name = destination.temporary_name.clone().unwrap();
+        let temporary_path = export_parent.join(&temporary_name);
+        let moved_owned = export_parent.join("moved-owned.tmp");
+        fs::rename(&temporary_path, &moved_owned).unwrap();
+        fs::write(&temporary_path, b"replacement").unwrap();
+
+        drop(destination);
+
+        assert!(!moved_owned.exists());
+        assert_eq!(fs::read(&temporary_path).unwrap(), b"replacement");
+        assert_eq!(directory_entries(&export_parent), vec![temporary_name]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_destination_never_exposes_a_temporary_source_name() {
+        let root = tempfile::tempdir().unwrap();
+        let session_path = root.path().join("sessions");
+        fs::create_dir(&session_path).unwrap();
+        let session = SessionRootLease::open(&session_path).unwrap();
+        let export_parent = root.path().join("exports");
+        fs::create_dir(&export_parent).unwrap();
+        let target = export_parent.join("diagnostics.zip");
+        let destination = PinnedExportDestination::create(&target, &[&session]).unwrap();
+
+        assert!(destination.temporary_name.is_none());
+        assert!(directory_entries(&export_parent).is_empty());
+        drop(destination);
+        assert!(directory_entries(&export_parent).is_empty());
     }
 
     fn directory_entries(path: &std::path::Path) -> Vec<OsString> {
