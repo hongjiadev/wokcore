@@ -354,6 +354,15 @@ struct TestDirectory(PathBuf);
 impl TestDirectory {
     fn new() -> Self {
         let path = std::env::temp_dir().join(format!("wokcore-task5-{}", Uuid::new_v4()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+            let mut builder = std::fs::DirBuilder::new();
+            builder.mode(0o700).create(&path).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        #[cfg(not(unix))]
         std::fs::create_dir(&path).unwrap();
         Self(path)
     }
@@ -361,6 +370,22 @@ impl TestDirectory {
     fn path(&self) -> &Path {
         &self.0
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn test_directory_is_private_to_the_current_user() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = TestDirectory::new();
+    assert_eq!(
+        std::fs::metadata(directory.path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o700
+    );
 }
 
 impl Drop for TestDirectory {

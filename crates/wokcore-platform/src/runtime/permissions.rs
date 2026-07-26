@@ -120,6 +120,11 @@ fn unix_child_name(path: &Path) -> Result<std::ffi::CString, PlatformError> {
 }
 
 #[cfg(unix)]
+fn promote_openat_mode(mode: libc::mode_t) -> libc::c_uint {
+    mode as libc::c_uint
+}
+
+#[cfg(unix)]
 fn unix_openat(
     directory: &File,
     name: &std::ffi::CStr,
@@ -133,7 +138,7 @@ fn unix_openat(
             directory.as_raw_fd(),
             name.as_ptr(),
             flags | libc::O_CLOEXEC,
-            mode,
+            promote_openat_mode(mode),
         )
     };
     if descriptor < 0 {
@@ -1916,10 +1921,22 @@ mod tests {
     use crate::PlatformError;
 
     use super::{
-        open_existing_runtime_directory, open_existing_secure_file, remove_open_secure_file,
-        with_unix_remove_after_identity_check_hook,
+        open_existing_runtime_directory, open_existing_secure_file, promote_openat_mode,
+        remove_open_secure_file, with_unix_remove_after_identity_check_hook,
         with_unix_remove_after_quarantine_verification_hook,
     };
+
+    #[test]
+    fn openat_mode_promotion_preserves_owner_only_mode_bits() {
+        assert_eq!(
+            promote_openat_mode(0o600 as libc::mode_t),
+            0o600 as libc::c_uint
+        );
+        assert_eq!(
+            promote_openat_mode(0o700 as libc::mode_t),
+            0o700 as libc::c_uint
+        );
+    }
 
     #[test]
     fn child_open_remains_anchored_to_verified_directory_handle_after_path_swap() {
