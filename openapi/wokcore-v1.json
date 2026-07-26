@@ -1,0 +1,435 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "WokCore Local Control Plane",
+    "version": "1.0.0"
+  },
+  "servers": [
+    {
+      "url": "http://127.0.0.1:{port}",
+      "variables": {
+        "port": {
+          "default": "0"
+        }
+      }
+    }
+  ],
+  "paths": {
+    "/wokcore/v1/health": {
+      "get": {
+        "operationId": "getHealth",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Service health",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Health"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/wokcore/v1/capabilities": {
+      "get": {
+        "operationId": "getCapabilities",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Versioned capability handshake",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Capabilities"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/wokcore/v1/service/status": {
+      "get": {
+        "operationId": "getServiceStatus",
+        "security": [
+          {
+            "managementBearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Service lifecycle status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Lifecycle"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/wokcore/v1/service/drain": {
+      "post": {
+        "operationId": "beginServiceDrain",
+        "security": [
+          {
+            "managementBearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Drain state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Lifecycle"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/wokcore/v1/service/drain/cancel": {
+      "post": {
+        "operationId": "cancelServiceDrain",
+        "security": [
+          {
+            "managementBearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Running state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Lifecycle"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/wokcore/v1/service/stop": {
+      "post": {
+        "operationId": "stopService",
+        "security": [
+          {
+            "managementBearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Stopping state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Lifecycle"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/wokcore/v1/clients/authorize": {
+      "post": {
+        "operationId": "authorizeClient",
+        "security": [
+          {
+            "managementBearer": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AuthorizeRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "One-time proxy token response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthorizeResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/wokcore/v1/clients/{client_id}/tokens/{token_id}": {
+      "delete": {
+        "operationId": "revokeClientToken",
+        "security": [
+          {
+            "managementBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "client_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/ClientId"
+            }
+          },
+          {
+            "name": "token_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Revocation result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RevokeResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "managementBearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "WokCore management token"
+      }
+    },
+    "responses": {
+      "Error": {
+        "description": "Stable control-plane error",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorEnvelope"
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "ClientId": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[a-z0-9._-]*[a-z0-9][a-z0-9._-]*$"
+      },
+      "Health": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "status",
+          "instance_id"
+        ],
+        "properties": {
+          "status": {
+            "const": "ok"
+          },
+          "instance_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "Capabilities": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "wokcore_version",
+          "management_api_major",
+          "minimum_management_api_major",
+          "maximum_management_api_major",
+          "provider_protocols",
+          "capabilities",
+          "instance_id"
+        ],
+        "properties": {
+          "wokcore_version": {
+            "type": "string"
+          },
+          "management_api_major": {
+            "const": 1
+          },
+          "minimum_management_api_major": {
+            "const": 1
+          },
+          "maximum_management_api_major": {
+            "const": 1
+          },
+          "provider_protocols": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "uniqueItems": true
+          },
+          "capabilities": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "uniqueItems": true
+          },
+          "instance_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "Lifecycle": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "phase",
+          "active_requests"
+        ],
+        "properties": {
+          "phase": {
+            "type": "string",
+            "enum": [
+              "starting",
+              "running",
+              "draining",
+              "awaiting_cancellation",
+              "stopping"
+            ]
+          },
+          "active_requests": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "AuthorizeRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "client_id"
+        ],
+        "properties": {
+          "client_id": {
+            "$ref": "#/components/schemas/ClientId"
+          }
+        }
+      },
+      "AuthorizeResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "client_id",
+          "token_id",
+          "token"
+        ],
+        "properties": {
+          "client_id": {
+            "$ref": "#/components/schemas/ClientId"
+          },
+          "token_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "token": {
+            "type": "string",
+            "readOnly": true
+          }
+        }
+      },
+      "RevokeResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "revoked"
+        ],
+        "properties": {
+          "revoked": {
+            "type": "boolean"
+          }
+        }
+      },
+      "ErrorEnvelope": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/Error"
+          }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "code",
+          "message",
+          "request_id"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]*$"
+          },
+          "message": {
+            "type": "string"
+          },
+          "request_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      }
+    }
+  }
+}

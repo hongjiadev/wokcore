@@ -2,9 +2,17 @@
 
 WokCore is the independently released local Provider gateway for WokRouter, WokCode, and third-party clients.
 
-The repository is in foundation stage. The only implemented CLI surface is currently `wokcore --version`; Provider and management HTTP APIs will arrive in reviewed follow-up changes.
+The repository is in foundation stage. The only implemented CLI surface is currently `wokcore --version`; runtime composition and end-user Provider forwarding arrive in reviewed follow-up changes.
 
-WokCore is an independent program. Its internal Rust packages are not a supported embeddable library API. The future public product contract is a versioned local HTTP/JSON + SSE API.
+WokCore is an independent program. Its internal Rust packages are not a supported embeddable library API. The supported management contract is the versioned loopback-only HTTP/JSON API in [`openapi/wokcore-v1.json`](openapi/wokcore-v1.json).
+
+## Local control plane
+
+The service binds only an explicitly configured IPv4-loopback listener and accepts only its exact `127.0.0.1:port` authority. Native clients omit `Origin`; browser-origin requests and implicit CORS access are rejected.
+
+Health and the versioned capability handshake are public. Service coordination and client-token issue/revoke operations use the management Bearer token referenced by local discovery and resolved through the configured secret backend. Raw proxy tokens are returned only by a successful authorize response and are never recoverable from SQLite or discovery.
+
+Provider protocol identifiers in the capability response describe implemented codecs only. They do not indicate that a Provider, account, credential, Session, or upstream is configured.
 
 ## Development
 

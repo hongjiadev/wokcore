@@ -17,6 +17,15 @@ pub use outbound::{
 /// `{message_index, block_index, role, block}` records.
 pub const ANTHROPIC_KNOWN_BLOCKS_EXTENSION_KEY: &str = "anthropic.known_blocks";
 
+pub const IMPLEMENTED_PROVIDER_PROTOCOLS: &[&str] = &[
+    "anthropic.messages.v1",
+    "azure.openai.v1",
+    "cursor.connect.v1",
+    "google.gemini.v1",
+    "openai.chat_completions.v1",
+    "openai.responses.v1",
+];
+
 pub(crate) fn valid_chat_function_name(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 64
