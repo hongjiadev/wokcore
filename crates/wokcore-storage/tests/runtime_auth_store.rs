@@ -455,6 +455,42 @@ fn read_only_inspection_reports_a_corrupt_crash_wal_without_writes() {
 }
 
 #[test]
+fn read_only_inspection_reports_a_truncated_main_database_as_corrupt_without_writes() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.db");
+    fs::write(&path, vec![0_u8; 99]).unwrap();
+    fs::write(path.with_extension("db-wal"), vec![0_u8; 32]).unwrap();
+    fs::write(path.with_extension("db-shm"), b"unchanged shm").unwrap();
+    let before = directory_snapshot(directory.path());
+
+    let result = ReadOnlyStateStore::open(&path);
+
+    assert!(matches!(
+        result,
+        Err(StorageError::StateDatabaseCorrupt { .. })
+    ));
+    assert_snapshot_unchanged(directory.path(), &before);
+}
+
+#[test]
+fn read_only_inspection_reports_a_truncated_nonempty_wal_as_corrupt_without_writes() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.db");
+    drop(StateStore::open(&path).unwrap());
+    fs::write(path.with_extension("db-wal"), vec![0_u8; 31]).unwrap();
+    fs::write(path.with_extension("db-shm"), b"unchanged shm").unwrap();
+    let before = directory_snapshot(directory.path());
+
+    let result = ReadOnlyStateStore::open(&path);
+
+    assert!(matches!(
+        result,
+        Err(StorageError::StateDatabaseCorrupt { .. })
+    ));
+    assert_snapshot_unchanged(directory.path(), &before);
+}
+
+#[test]
 #[ignore = "spawned only by crash-WAL inspection tests"]
 fn crash_wal_writer_helper() {
     let Some(path) = env::var_os("WOKCORE_CRASH_WAL_PATH") else {

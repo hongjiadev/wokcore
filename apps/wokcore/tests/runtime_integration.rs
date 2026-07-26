@@ -1320,6 +1320,66 @@ async fn doctor_offline_matrix_has_stable_codes_and_never_writes() {
 }
 
 #[tokio::test]
+async fn doctor_json_reports_a_truncated_main_database_as_storage_corrupt_without_writes() {
+    let directory = TestDirectory::new();
+    let paths = paths(directory.path());
+    std::fs::create_dir_all(paths.state_db.parent().unwrap()).unwrap();
+    std::fs::write(&paths.state_db, vec![0_u8; 99]).unwrap();
+    std::fs::write(paths.state_db.with_extension("sqlite3-wal"), vec![0_u8; 32]).unwrap();
+    std::fs::write(
+        paths.state_db.with_extension("sqlite3-shm"),
+        b"unchanged shm",
+    )
+    .unwrap();
+    drop(RuntimeLease::acquire(&paths).unwrap());
+    let dependencies = doctor_dependencies(paths, Arc::new(UnexpectedRuntimeValues));
+    let before = tree_snapshot(directory.path());
+    let mut output = BufferOutput::default();
+
+    let exit = run_with_dependencies(
+        Cli::try_parse_from(["wokcore", "doctor", "--json"]).unwrap(),
+        &dependencies,
+        &mut output,
+    )
+    .await;
+
+    assert_eq!(exit, ExitCode::StorageCorruption);
+    assert_eq!(output.stdout(), "{\"code\":\"storage_corrupt\"}\n");
+    assert_eq!(output.stderr(), "");
+    assert_eq!(tree_snapshot(directory.path()), before);
+}
+
+#[tokio::test]
+async fn doctor_json_reports_a_truncated_nonempty_wal_as_storage_corrupt_without_writes() {
+    let directory = TestDirectory::new();
+    let paths = paths(directory.path());
+    std::fs::create_dir_all(paths.state_db.parent().unwrap()).unwrap();
+    drop(StateStore::open(&paths.state_db).unwrap());
+    std::fs::write(paths.state_db.with_extension("sqlite3-wal"), vec![0_u8; 31]).unwrap();
+    std::fs::write(
+        paths.state_db.with_extension("sqlite3-shm"),
+        b"unchanged shm",
+    )
+    .unwrap();
+    drop(RuntimeLease::acquire(&paths).unwrap());
+    let dependencies = doctor_dependencies(paths, Arc::new(UnexpectedRuntimeValues));
+    let before = tree_snapshot(directory.path());
+    let mut output = BufferOutput::default();
+
+    let exit = run_with_dependencies(
+        Cli::try_parse_from(["wokcore", "doctor", "--json"]).unwrap(),
+        &dependencies,
+        &mut output,
+    )
+    .await;
+
+    assert_eq!(exit, ExitCode::StorageCorruption);
+    assert_eq!(output.stdout(), "{\"code\":\"storage_corrupt\"}\n");
+    assert_eq!(output.stderr(), "");
+    assert_eq!(tree_snapshot(directory.path()), before);
+}
+
+#[tokio::test]
 async fn doctor_offline_state_inspection_yields_to_the_runtime_writer_lease() {
     let directory = TestDirectory::new();
     let paths = paths(directory.path());

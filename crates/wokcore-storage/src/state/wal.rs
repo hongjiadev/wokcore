@@ -101,7 +101,12 @@ pub(super) fn open_replayed(path: &Path, wal_path: &Path) -> Result<Connection, 
 }
 
 fn inspect_main_database(database: &mut File, database_len: u64) -> Result<u32, WalError> {
-    if !(DATABASE_HEADER_BYTES as u64..=MAX_DATABASE_BYTES).contains(&database_len) {
+    if database_len < DATABASE_HEADER_BYTES as u64 {
+        return Err(WalError::Corrupt(
+            "state database is shorter than its header",
+        ));
+    }
+    if database_len > MAX_DATABASE_BYTES {
         return Err(WalError::Limit(
             "state database exceeds the inspection limit",
         ));
@@ -134,7 +139,12 @@ fn analyze_wal<R: Read + Seek>(
     main_page_size: u32,
     main_pages: u32,
 ) -> Result<WalPlan, WalError> {
-    if !(WAL_HEADER_BYTES..=MAX_WAL_BYTES).contains(&wal_len) {
+    if wal_len < WAL_HEADER_BYTES {
+        return Err(WalError::Corrupt(
+            "state database WAL is shorter than its header",
+        ));
+    }
+    if wal_len > MAX_WAL_BYTES {
         return Err(WalError::Limit(
             "state database WAL exceeds the inspection limit",
         ));
@@ -166,7 +176,12 @@ fn analyze_wal<R: Read + Seek>(
         }
         let page_number = u32::from_be_bytes(frame_header[..4].try_into().unwrap());
         let committed_pages = u32::from_be_bytes(frame_header[4..8].try_into().unwrap());
-        if page_number == 0 || page_number > maximum_pages {
+        if page_number == 0 {
+            return Err(WalError::Corrupt(
+                "state database WAL contains a zero page number",
+            ));
+        }
+        if page_number > maximum_pages {
             return Err(WalError::Limit(
                 "state database WAL contains an invalid page number",
             ));
@@ -524,6 +539,83 @@ mod tests {
             result,
             Err(WalError::Corrupt(
                 "state database WAL contains a damaged committed frame"
+            ))
+        ));
+    }
+
+    #[test]
+    fn classifies_a_main_database_shorter_than_its_header_as_corrupt() {
+        for database_len in 0..DATABASE_HEADER_BYTES as u64 {
+            let temporary = tempfile::NamedTempFile::new().unwrap();
+            temporary.as_file().set_len(database_len).unwrap();
+            let mut database = temporary.reopen().unwrap();
+
+            let result = inspect_main_database(&mut database, database_len);
+
+            assert!(
+                matches!(
+                    result,
+                    Err(WalError::Corrupt(
+                        "state database is shorter than its header"
+                    ))
+                ),
+                "database length {database_len} was not classified as corruption"
+            );
+        }
+    }
+
+    #[test]
+    fn classifies_every_nonempty_wal_shorter_than_its_header_as_corrupt() {
+        for wal_len in 1..WAL_HEADER_BYTES {
+            let result = analyze_wal(&mut Cursor::new(Vec::new()), wal_len, PAGE_SIZE, 1);
+
+            assert!(
+                matches!(
+                    result,
+                    Err(WalError::Corrupt(
+                        "state database WAL is shorter than its header"
+                    ))
+                ),
+                "WAL length {wal_len} was not classified as corruption"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_a_zero_page_number_as_corrupt() {
+        let wal = test_wal(&[TestFrame::valid(0, 0)]);
+
+        let result = analyze_wal(&mut Cursor::new(&wal), wal.len() as u64, PAGE_SIZE, 1);
+
+        assert!(matches!(
+            result,
+            Err(WalError::Corrupt(
+                "state database WAL contains a zero page number"
+            ))
+        ));
+    }
+
+    #[test]
+    fn retains_main_database_and_wal_upper_bounds_as_resource_limits() {
+        let temporary = tempfile::NamedTempFile::new().unwrap();
+        temporary.as_file().set_len(MAX_DATABASE_BYTES + 1).unwrap();
+        let mut database = temporary.reopen().unwrap();
+
+        assert!(matches!(
+            inspect_main_database(&mut database, MAX_DATABASE_BYTES + 1),
+            Err(WalError::Limit(
+                "state database exceeds the inspection limit"
+            ))
+        ));
+        assert!(matches!(
+            analyze_wal(
+                &mut Cursor::new(Vec::new()),
+                MAX_WAL_BYTES + 1,
+                PAGE_SIZE,
+                1
+            ),
+            Err(WalError::Limit(
+                "state database WAL exceeds the inspection limit"
             ))
         ));
     }
