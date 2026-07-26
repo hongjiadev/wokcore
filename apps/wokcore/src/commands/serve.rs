@@ -13,7 +13,7 @@ use wokcore_core::{
 use wokcore_platform::{DiscoveryRecord, DiscoveryStore, PlatformError, RuntimeLease};
 use wokcore_server::{
     RunningServer, ServerState,
-    auth::{AuthRegistry, StateAuthMetadataStore},
+    auth::{AuthError, AuthRegistry, StateAuthMetadataStore},
     lifecycle::ServiceLifecycle,
     runtime::{TokenMetadataError, TokenMetadataSource},
 };
@@ -50,6 +50,7 @@ async fn run_service(
     if port == 0 {
         return Err(ServeError::InvalidConfig);
     }
+    let discovery = DiscoveryStore::new(&dependencies.paths).map_err(ServeError::Platform)?;
 
     if let Some(parent) = dependencies.paths.state_db.parent() {
         std::fs::create_dir_all(parent).map_err(|_| ServeError::Io)?;
@@ -73,7 +74,7 @@ async fn run_service(
         created_at,
     )
     .await
-    .map_err(|_| ServeError::Auth)?;
+    .map_err(map_auth_error)?;
 
     let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
         .await
@@ -119,7 +120,6 @@ async fn run_service(
         return Err(ServeError::Readiness);
     }
 
-    let discovery = DiscoveryStore::new(&dependencies.paths).map_err(ServeError::Platform)?;
     if let Err(error) = dependencies
         .discovery_publisher
         .publish(&discovery, &record)
@@ -163,6 +163,15 @@ async fn run_service(
     cleanup_result.map_err(ServeError::Platform)?;
     announced.map_err(|_| ServeError::Io)?;
     Ok(())
+}
+
+fn map_auth_error(error: AuthError) -> ServeError {
+    match error {
+        AuthError::Storage(error @ StorageError::StateDatabaseCorrupt { .. }) => {
+            ServeError::Storage(error)
+        }
+        _ => ServeError::Auth,
+    }
 }
 
 struct InjectedTokenMetadata {

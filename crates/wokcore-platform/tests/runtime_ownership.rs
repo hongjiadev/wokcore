@@ -46,6 +46,59 @@ fn simultaneous_acquisitions_produce_one_owner_and_one_already_running() {
 }
 
 #[test]
+fn existing_only_acquisition_never_creates_runtime_state() {
+    let directory = tempdir().unwrap();
+    let paths = test_paths(&directory.path().join("missing"));
+
+    assert!(matches!(
+        RuntimeLease::acquire_existing(&paths),
+        Err(PlatformError::UnsafeRuntimePath)
+    ));
+    assert!(!paths.runtime_dir.exists());
+    assert!(!paths.instance_lock.exists());
+}
+
+#[test]
+fn existing_only_acquisition_is_byte_and_mtime_read_only() {
+    let directory = tempdir().unwrap();
+    let paths = test_paths(directory.path());
+    drop(RuntimeLease::acquire(&paths).unwrap());
+    let before = tree_snapshot(directory.path());
+
+    drop(RuntimeLease::acquire_existing(&paths).unwrap());
+
+    assert_eq!(tree_snapshot(directory.path()), before);
+}
+
+#[test]
+fn existing_only_acquisition_observes_the_current_owner() {
+    let directory = tempdir().unwrap();
+    let paths = test_paths(directory.path());
+    let owner = RuntimeLease::acquire(&paths).unwrap();
+
+    assert!(matches!(
+        RuntimeLease::acquire_existing(&paths),
+        Err(PlatformError::AlreadyRunning)
+    ));
+
+    drop(owner);
+}
+
+#[cfg(windows)]
+#[test]
+fn existing_only_lease_prevents_replacing_its_windows_lock_file() {
+    let directory = tempdir().unwrap();
+    let paths = test_paths(directory.path());
+    drop(RuntimeLease::acquire(&paths).unwrap());
+    let lease = RuntimeLease::acquire_existing(&paths).unwrap();
+
+    assert!(fs::remove_file(&paths.instance_lock).is_err());
+
+    drop(lease);
+    fs::remove_file(&paths.instance_lock).unwrap();
+}
+
+#[test]
 fn separate_processes_contend_for_the_same_operating_system_lock() {
     let directory = tempdir().unwrap();
     let paths = test_paths(directory.path());
@@ -364,6 +417,40 @@ fn wait_until_exists(path: &Path, timeout: Duration) {
         );
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn tree_snapshot(root: &Path) -> Vec<(String, Option<Vec<u8>>, std::time::SystemTime)> {
+    fn visit(
+        root: &Path,
+        path: &Path,
+        entries: &mut Vec<(String, Option<Vec<u8>>, std::time::SystemTime)>,
+    ) {
+        for entry in fs::read_dir(path).unwrap() {
+            let entry = entry.unwrap();
+            let metadata = entry.metadata().unwrap();
+            let relative = entry
+                .path()
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            if metadata.is_dir() {
+                entries.push((relative, None, metadata.modified().unwrap()));
+                visit(root, &entry.path(), entries);
+            } else {
+                entries.push((
+                    relative,
+                    Some(fs::read(entry.path()).unwrap()),
+                    metadata.modified().unwrap(),
+                ));
+            }
+        }
+    }
+
+    let mut entries = Vec::new();
+    visit(root, root, &mut entries);
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    entries
 }
 
 #[cfg(unix)]

@@ -25,6 +25,20 @@ pub(super) fn acquire(runtime_path: &Path) -> Result<File, PlatformError> {
     }
 }
 
+pub(super) fn acquire_existing(runtime_path: &Path) -> Result<File, PlatformError> {
+    validate_runtime_path(runtime_path)?;
+    let parent_path = runtime_path
+        .parent()
+        .ok_or(PlatformError::UnsafeRuntimePath)?;
+    let parent = open_existing_private_parent(parent_path)?;
+    let lock = open_existing_lock_file(&parent)?;
+    match lock.try_lock_exclusive() {
+        Ok(true) => Ok(lock),
+        Ok(false) => Err(PlatformError::AlreadyRunning),
+        Err(source) => Err(PlatformError::Io { source }),
+    }
+}
+
 fn validate_runtime_path(path: &Path) -> Result<(), PlatformError> {
     if !path.is_absolute() {
         return Err(PlatformError::UnsafeRuntimePath);
@@ -55,6 +69,21 @@ fn open_or_create_private_parent(path: &Path) -> Result<File, PlatformError> {
         Err(source) => return Err(PlatformError::Io { source }),
     }
 
+    let parent = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(map_unsafe_open_error)?;
+    let metadata = parent.metadata()?;
+    if !metadata.is_dir()
+        || !directory_is_private_to(metadata.mode(), metadata.uid(), unsafe { libc::geteuid() })
+    {
+        return Err(PlatformError::UnsafeRuntimePath);
+    }
+    Ok(parent)
+}
+
+fn open_existing_private_parent(path: &Path) -> Result<File, PlatformError> {
     let parent = fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
@@ -106,6 +135,33 @@ fn open_or_create_lock_file(parent: &File) -> Result<File, PlatformError> {
     if created {
         file.set_permissions(fs::Permissions::from_mode(0o600))?;
     }
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o7777 != 0o600
+    {
+        return Err(PlatformError::UnsafeRuntimePath);
+    }
+    Ok(file)
+}
+
+fn open_existing_lock_file(parent: &File) -> Result<File, PlatformError> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let name =
+        CString::new(NAMESPACE_LOCK_NAME).expect("fixed namespace lock name contains no NUL");
+    let descriptor = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
+        )
+    };
+    if descriptor < 0 {
+        return Err(map_unsafe_open_error(std::io::Error::last_os_error()));
+    }
+    let file = unsafe { File::from_raw_fd(descriptor) };
     let metadata = file.metadata()?;
     if !metadata.is_file()
         || metadata.uid() != unsafe { libc::geteuid() }

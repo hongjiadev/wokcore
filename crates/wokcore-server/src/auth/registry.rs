@@ -379,7 +379,9 @@ fn active_client_map(
             )
             .is_some()
         {
-            return Err(AuthError::Storage);
+            return Err(AuthError::Storage(StorageError::StateDatabaseCorrupt {
+                message: "active client token metadata contains a duplicate digest".to_owned(),
+            }));
         }
     }
     Ok(clients)
@@ -395,7 +397,7 @@ where
     task::spawn_blocking(move || operation(metadata.as_ref()))
         .await
         .map_err(|_| AuthError::BlockingTask)?
-        .map_err(|_| AuthError::Storage)
+        .map_err(AuthError::Storage)
 }
 
 async fn await_mutation_task<T>(
@@ -407,7 +409,7 @@ async fn await_mutation_task<T>(
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
     #[error("runtime authentication metadata operation failed")]
-    Storage,
+    Storage(#[source] StorageError),
     #[error("runtime secret store operation failed")]
     SecretStore,
     #[error("runtime management secret has an invalid format")]

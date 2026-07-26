@@ -10,6 +10,8 @@ use wokcore_core::{id::ClientId, secret::SecretRef};
 
 use crate::StorageError;
 
+use super::wal;
+
 const INITIAL_MIGRATION: &str = include_str!("../../migrations/0001_initial.sql");
 const RUNTIME_AUTH_MIGRATION: &str = include_str!("../../migrations/0002_runtime_auth.sql");
 const LATEST_SCHEMA_VERSION: i64 = 2;
@@ -67,13 +69,35 @@ pub struct ReadOnlyStateStore {
     connection: Connection,
 }
 
+#[derive(Clone, Copy)]
+enum ReadOnlyAccess {
+    Offline,
+    Live,
+}
+
 impl ReadOnlyStateStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
-        Self::open_uri(read_only_database_uri(path.as_ref(), true)?)
+        Self::open_path(path.as_ref(), ReadOnlyAccess::Offline)
     }
 
     pub fn open_live(path: impl AsRef<Path>) -> Result<Self, StorageError> {
-        Self::open_uri(read_only_database_uri(path.as_ref(), false)?)
+        Self::open_path(path.as_ref(), ReadOnlyAccess::Live)
+    }
+
+    fn open_path(path: &Path, access: ReadOnlyAccess) -> Result<Self, StorageError> {
+        let absolute = path
+            .canonicalize()
+            .map_err(|source| StorageError::Io { source })?;
+        let wal_path = sqlite_sidecar_path(&absolute, "-wal");
+        let has_wal = match fs::metadata(&wal_path) {
+            Ok(metadata) => metadata.len() > 0,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => false,
+            Err(source) => return Err(StorageError::Io { source }),
+        };
+        if has_wal && matches!(access, ReadOnlyAccess::Offline) {
+            return Self::from_connection(wal::open_replayed(&absolute, &wal_path)?);
+        }
+        Self::open_uri(read_only_database_uri(&absolute, has_wal)?)
     }
 
     fn open_uri(uri: String) -> Result<Self, StorageError> {
@@ -84,6 +108,10 @@ impl ReadOnlyStateStore {
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .map_err(map_database_error)?;
+        Self::from_connection(connection)
+    }
+
+    fn from_connection(connection: Connection) -> Result<Self, StorageError> {
         connection
             .execute_batch("PRAGMA query_only = ON;")
             .map_err(map_database_error)?;
@@ -504,11 +532,8 @@ fn query_runtime_secret_binding(
     }))
 }
 
-fn read_only_database_uri(path: &Path, immutable: bool) -> Result<String, StorageError> {
-    let absolute = path
-        .canonicalize()
-        .map_err(|source| StorageError::Io { source })?;
-    let value = absolute
+fn read_only_database_uri(path: &Path, has_wal: bool) -> Result<String, StorageError> {
+    let value = path
         .to_str()
         .ok_or_else(|| StorageError::Io {
             source: io::Error::new(
@@ -534,12 +559,17 @@ fn read_only_database_uri(path: &Path, immutable: bool) -> Result<String, Storag
     if !encoded.starts_with('/') {
         encoded.insert(0, '/');
     }
-    let options = if immutable {
-        "mode=ro&immutable=1"
-    } else {
-        "mode=ro"
+    let options = match has_wal {
+        false => "mode=ro&immutable=1",
+        true => "mode=ro&readonly_shm=1",
     };
     Ok(format!("file:{encoded}?{options}"))
+}
+
+fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut sidecar = path.as_os_str().to_os_string();
+    sidecar.push(suffix);
+    sidecar.into()
 }
 
 fn apply_ordered_migrations(connection: &mut Connection) -> Result<(), StorageError> {

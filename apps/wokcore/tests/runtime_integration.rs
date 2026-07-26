@@ -10,7 +10,11 @@ use std::{
 use clap::Parser;
 use reqwest::header::{AUTHORIZATION, HOST};
 use secrecy::ExposeSecret;
-use tokio::{sync::Notify, time::timeout};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    sync::Notify,
+    time::timeout,
+};
 use uuid::Uuid;
 use wokcore::{
     BufferOutput, Clock, DiscoveryPublisher, ExitCode, IdSource, LifecycleObserver,
@@ -18,7 +22,7 @@ use wokcore::{
     run_with_dependencies,
 };
 use wokcore_core::{
-    id::ProviderId,
+    id::{ClientId, ProviderId},
     secret::{SecretPurpose, SecretScope},
 };
 use wokcore_platform::{AppPaths, DiscoveryRecord, DiscoveryStore, PlatformError, RuntimeLease};
@@ -27,8 +31,8 @@ use wokcore_server::auth::{
 };
 use wokcore_server::lifecycle::{LifecyclePhase, ServiceLifecycle};
 use wokcore_storage::{
-    AppConfig, ConfigStore, MemorySecretStore, ReadOnlyStateStore, SecretStore, ServerConfig,
-    StateStore,
+    AppConfig, ClientTokenMetadata, ConfigStore, MemorySecretStore, ReadOnlyStateStore,
+    SecretStore, ServerConfig, StateStore,
 };
 
 const INSTANCE_ID: &str = "019844f0-4de0-7000-8000-000000000010";
@@ -297,6 +301,138 @@ async fn absent_status_and_doctor_have_stable_json_without_creating_files() {
     assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
 }
 
+#[tokio::test]
+async fn status_times_out_when_loopback_accepts_without_response_headers() {
+    let directory = TestDirectory::new();
+    let paths = paths(directory.path());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    publish_record(
+        &paths,
+        &DiscoveryRecord {
+            base_url: format!("http://127.0.0.1:{port}"),
+            pid: 4242,
+            instance_id: Uuid::parse_str(INSTANCE_ID).unwrap(),
+            wokcore_version: env!("CARGO_PKG_VERSION").to_owned(),
+            api_major: 1,
+        },
+    );
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = [0_u8; 1024];
+        let _ = stream.read(&mut request).await.unwrap();
+        std::future::pending::<()>().await;
+    });
+    let dependencies = doctor_dependencies(paths, Arc::new(FixedRuntimeValues));
+    let mut output = BufferOutput::default();
+
+    let exit = timeout(
+        Duration::from_secs(3),
+        run_with_dependencies(
+            Cli::try_parse_from(["wokcore", "status", "--json"]).unwrap(),
+            &dependencies,
+            &mut output,
+        ),
+    )
+    .await
+    .expect("identity request must have a bounded header deadline");
+
+    assert_eq!(exit, ExitCode::NotRunning);
+    server.abort();
+}
+
+#[tokio::test]
+async fn status_times_out_when_loopback_stalls_after_response_headers() {
+    let directory = TestDirectory::new();
+    let paths = paths(directory.path());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    publish_record(
+        &paths,
+        &DiscoveryRecord {
+            base_url: format!("http://127.0.0.1:{port}"),
+            pid: 4242,
+            instance_id: Uuid::parse_str(INSTANCE_ID).unwrap(),
+            wokcore_version: env!("CARGO_PKG_VERSION").to_owned(),
+            api_major: 1,
+        },
+    );
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = [0_u8; 1024];
+        let _ = stream.read(&mut request).await.unwrap();
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 64\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        std::future::pending::<()>().await;
+    });
+    let dependencies = doctor_dependencies(paths, Arc::new(FixedRuntimeValues));
+    let mut output = BufferOutput::default();
+
+    let exit = timeout(
+        Duration::from_secs(3),
+        run_with_dependencies(
+            Cli::try_parse_from(["wokcore", "status", "--json"]).unwrap(),
+            &dependencies,
+            &mut output,
+        ),
+    )
+    .await
+    .expect("identity request must have a bounded body-read deadline");
+
+    assert_eq!(exit, ExitCode::NotRunning);
+    server.abort();
+}
+
+#[tokio::test]
+async fn status_rejects_an_oversized_chunk_before_the_stream_ends() {
+    let directory = TestDirectory::new();
+    let paths = paths(directory.path());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    publish_record(
+        &paths,
+        &DiscoveryRecord {
+            base_url: format!("http://127.0.0.1:{port}"),
+            pid: 4242,
+            instance_id: Uuid::parse_str(INSTANCE_ID).unwrap(),
+            wokcore_version: env!("CARGO_PKG_VERSION").to_owned(),
+            api_major: 1,
+        },
+    );
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = [0_u8; 1024];
+        let _ = stream.read(&mut request).await.unwrap();
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n10001\r\n",
+            )
+            .await
+            .unwrap();
+        stream.write_all(&vec![b' '; 64 * 1024 + 1]).await.unwrap();
+        stream.write_all(b"\r\n").await.unwrap();
+        std::future::pending::<()>().await;
+    });
+    let dependencies = doctor_dependencies(paths, Arc::new(FixedRuntimeValues));
+    let mut output = BufferOutput::default();
+
+    let exit = timeout(
+        Duration::from_secs(3),
+        run_with_dependencies(
+            Cli::try_parse_from(["wokcore", "status", "--json"]).unwrap(),
+            &dependencies,
+            &mut output,
+        ),
+    )
+    .await
+    .expect("identity reader must reject before an oversized stream terminates");
+
+    assert_eq!(exit, ExitCode::NotRunning);
+    server.abort();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn serve_publishes_only_a_ready_loopback_identity_and_removes_its_discovery() {
     let directory = TestDirectory::new();
@@ -475,6 +611,42 @@ async fn fixed_port_conflict_has_no_fallback_and_preserves_config_and_discovery(
     );
 }
 
+#[tokio::test]
+async fn serve_classifies_corrupt_active_token_metadata_as_storage_corruption() {
+    let directory = TestDirectory::new();
+    let paths = paths(directory.path());
+    persist_port(&paths, reserve_port());
+    std::fs::create_dir_all(paths.state_db.parent().unwrap()).unwrap();
+    let mut state = StateStore::open(&paths.state_db).unwrap();
+    state
+        .issue_client_token(&ClientTokenMetadata {
+            token_id: "corrupt-token".to_owned(),
+            client_id: ClientId::new("wokrouter").unwrap(),
+            digest: [0x11; 32],
+            issued_at: "2026-07-26T12:00:00Z".to_owned(),
+        })
+        .unwrap();
+    drop(state);
+    replace_state_bytes(paths.state_db.parent().unwrap(), b"wokrouter", b"bad/id___");
+    let dependencies = runtime_dependencies(
+        paths,
+        Arc::new(MemorySecretStore::default()),
+        Arc::new(ManualShutdown::default()),
+    );
+    let mut output = BufferOutput::default();
+
+    let exit = run_with_dependencies(
+        Cli::try_parse_from(["wokcore", "serve", "--json"]).unwrap(),
+        &dependencies,
+        &mut output,
+    )
+    .await;
+
+    assert_eq!(exit, ExitCode::StorageCorruption);
+    assert_eq!(output.stdout(), "{\"code\":\"storage_corrupt\"}\n");
+    assert_eq!(output.stderr(), "");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn publish_failure_after_commit_removes_only_the_owned_discovery_record() {
     let owned_directory = TestDirectory::new();
@@ -601,6 +773,276 @@ async fn composition_root_waits_for_admitted_work_after_shutdown_timeout() {
         ExitCode::Success
     );
     assert!(!paths.discovery_file.exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelling_stop_caller_does_not_strand_the_service_in_drain() {
+    let directory = TestDirectory::new();
+    let paths = paths(directory.path());
+    persist_port(&paths, reserve_port());
+    let secrets = Arc::new(MemorySecretStore::default());
+    let shutdown = Arc::new(ManualShutdown::default());
+    let observer = Arc::new(CapturingLifecycle::default());
+    let serve_dependencies = runtime_dependencies(paths.clone(), secrets.clone(), shutdown.clone())
+        .with_lifecycle_observer(observer.clone());
+    let mut serve = tokio::spawn(async move {
+        let mut output = BufferOutput::default();
+        run_with_dependencies(
+            Cli::try_parse_from(["wokcore", "serve", "--json"]).unwrap(),
+            &serve_dependencies,
+            &mut output,
+        )
+        .await
+    });
+    let lifecycle = timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(lifecycle) = observer.get()
+                && lifecycle.snapshot().phase == LifecyclePhase::Running
+            {
+                break lifecycle;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if DiscoveryStore::new(&paths)
+                .and_then(|store| store.read())
+                .is_ok()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let admitted = lifecycle.admission_controller().try_enter().unwrap();
+    let stop_dependencies =
+        runtime_dependencies(paths.clone(), secrets, Arc::new(ManualShutdown::default()));
+    let stop = tokio::spawn(async move {
+        let mut output = BufferOutput::default();
+        run_with_dependencies(
+            Cli::try_parse_from(["wokcore", "stop", "--json"]).unwrap(),
+            &stop_dependencies,
+            &mut output,
+        )
+        .await
+    });
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if lifecycle.snapshot().phase == LifecyclePhase::Draining {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    stop.abort();
+    assert!(stop.await.unwrap_err().is_cancelled());
+    drop(admitted);
+    let completed = timeout(Duration::from_secs(2), &mut serve).await;
+    if completed.is_err() {
+        let _ = lifecycle.cancel_drain();
+        shutdown.trigger();
+        let _ = timeout(Duration::from_secs(5), serve).await;
+    }
+
+    assert_eq!(
+        completed
+            .expect(
+                "caller cancellation abandoned an accepted drain instead of completing owned stop work",
+            )
+            .unwrap(),
+        ExitCode::Success
+    );
+    assert_eq!(lifecycle.snapshot().phase, LifecyclePhase::Stopping);
+    assert!(!paths.discovery_file.exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn malformed_drain_response_attempts_cancel_without_overwriting_the_original_error() {
+    let directory = TestDirectory::new();
+    let paths = paths(directory.path());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let record = DiscoveryRecord {
+        base_url: format!("http://127.0.0.1:{port}"),
+        pid: 4242,
+        instance_id: Uuid::parse_str(INSTANCE_ID).unwrap(),
+        wokcore_version: env!("CARGO_PKG_VERSION").to_owned(),
+        api_major: 1,
+    };
+    publish_record(&paths, &record);
+    std::fs::create_dir_all(paths.state_db.parent().unwrap()).unwrap();
+    let mut state = StateStore::open(&paths.state_db).unwrap();
+    let secrets = Arc::new(MemorySecretStore::default());
+    let scope = SecretScope {
+        provider_id: ProviderId::new("wokcore-runtime").unwrap(),
+        account_id: None,
+        purpose: SecretPurpose::Auxiliary,
+    };
+    let management = TokenMaterial::generate_admin(&FixedRuntimeValues)
+        .unwrap()
+        .into_response_value();
+    let secret_ref = secrets.put(&scope, management).await.unwrap();
+    state
+        .bind_runtime_secret_if_absent("management", &secret_ref, "2026-07-26T12:00:00Z")
+        .unwrap();
+    drop(state);
+    let mut server = tokio::spawn(async move {
+        let mut paths = Vec::new();
+        for (expected_path, status, body) in [
+            (
+                "/wokcore/v1/health",
+                "200 OK",
+                format!(r#"{{"status":"ok","instance_id":"{INSTANCE_ID}"}}"#),
+            ),
+            (
+                "/wokcore/v1/capabilities",
+                "200 OK",
+                format!(
+                    r#"{{"wokcore_version":"{}","management_api_major":1,"minimum_management_api_major":1,"maximum_management_api_major":1,"provider_protocols":[],"capabilities":[],"instance_id":"{INSTANCE_ID}"}}"#,
+                    env!("CARGO_PKG_VERSION")
+                ),
+            ),
+            ("/wokcore/v1/service/drain", "200 OK", "{".to_owned()),
+            (
+                "/wokcore/v1/service/drain/cancel",
+                "500 Internal Server Error",
+                "{".to_owned(),
+            ),
+        ] {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut stream).await;
+            let path = request.split_whitespace().nth(1).unwrap().to_owned();
+            assert_eq!(path, expected_path);
+            paths.push(path);
+            write_http_response(&mut stream, status, &body).await;
+        }
+        paths
+    });
+    let dependencies = runtime_dependencies(paths, secrets, Arc::new(ManualShutdown::default()));
+    let mut output = BufferOutput::default();
+
+    let exit = run_with_dependencies(
+        Cli::try_parse_from(["wokcore", "stop", "--json"]).unwrap(),
+        &dependencies,
+        &mut output,
+    )
+    .await;
+    let observed = timeout(Duration::from_secs(1), &mut server).await;
+    if observed.is_err() {
+        server.abort();
+    }
+
+    assert_eq!(exit, ExitCode::InternalFailure);
+    assert_eq!(output.stdout(), "{\"code\":\"internal_error\"}\n");
+    assert_eq!(
+        observed.unwrap().unwrap(),
+        [
+            "/wokcore/v1/health",
+            "/wokcore/v1/capabilities",
+            "/wokcore/v1/service/drain",
+            "/wokcore/v1/service/drain/cancel",
+        ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn successful_stop_does_not_send_a_drain_cancellation() {
+    let directory = TestDirectory::new();
+    let paths = paths(directory.path());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    publish_record(
+        &paths,
+        &DiscoveryRecord {
+            base_url: format!("http://127.0.0.1:{port}"),
+            pid: 4242,
+            instance_id: Uuid::parse_str(INSTANCE_ID).unwrap(),
+            wokcore_version: env!("CARGO_PKG_VERSION").to_owned(),
+            api_major: 1,
+        },
+    );
+    std::fs::create_dir_all(paths.state_db.parent().unwrap()).unwrap();
+    let mut state = StateStore::open(&paths.state_db).unwrap();
+    let secrets = Arc::new(MemorySecretStore::default());
+    let scope = SecretScope {
+        provider_id: ProviderId::new("wokcore-runtime").unwrap(),
+        account_id: None,
+        purpose: SecretPurpose::Auxiliary,
+    };
+    let management = TokenMaterial::generate_admin(&FixedRuntimeValues)
+        .unwrap()
+        .into_response_value();
+    let secret_ref = secrets.put(&scope, management).await.unwrap();
+    state
+        .bind_runtime_secret_if_absent("management", &secret_ref, "2026-07-26T12:00:00Z")
+        .unwrap();
+    drop(state);
+    let server = tokio::spawn(async move {
+        let mut observed = Vec::new();
+        for (expected_path, body) in [
+            (
+                "/wokcore/v1/health",
+                format!(r#"{{"status":"ok","instance_id":"{INSTANCE_ID}"}}"#),
+            ),
+            (
+                "/wokcore/v1/capabilities",
+                format!(
+                    r#"{{"wokcore_version":"{}","management_api_major":1,"minimum_management_api_major":1,"maximum_management_api_major":1,"provider_protocols":[],"capabilities":[],"instance_id":"{INSTANCE_ID}"}}"#,
+                    env!("CARGO_PKG_VERSION")
+                ),
+            ),
+            (
+                "/wokcore/v1/service/drain",
+                r#"{"phase":"draining","active_requests":0}"#.to_owned(),
+            ),
+            (
+                "/wokcore/v1/service/stop",
+                r#"{"phase":"stopping","active_requests":0}"#.to_owned(),
+            ),
+        ] {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut stream).await;
+            let path = request.split_whitespace().nth(1).unwrap().to_owned();
+            assert_eq!(path, expected_path);
+            observed.push(path);
+            write_http_response(&mut stream, "200 OK", &body).await;
+        }
+        let extra_request = timeout(Duration::from_millis(200), listener.accept())
+            .await
+            .is_ok();
+        (observed, extra_request)
+    });
+    let dependencies = runtime_dependencies(paths, secrets, Arc::new(ManualShutdown::default()));
+    let mut output = BufferOutput::default();
+
+    let exit = run_with_dependencies(
+        Cli::try_parse_from(["wokcore", "stop", "--json"]).unwrap(),
+        &dependencies,
+        &mut output,
+    )
+    .await;
+    let (observed, extra_request) = server.await.unwrap();
+
+    assert_eq!(exit, ExitCode::Success);
+    assert_eq!(output.stdout(), "{\"code\":\"stopped\"}\n");
+    assert_eq!(
+        observed,
+        [
+            "/wokcore/v1/health",
+            "/wokcore/v1/capabilities",
+            "/wokcore/v1/service/drain",
+            "/wokcore/v1/service/stop",
+        ]
+    );
+    assert!(!extra_request, "successful stop unexpectedly sent cancel");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -866,6 +1308,7 @@ async fn doctor_offline_matrix_has_stable_codes_and_never_writes() {
     let corrupt_paths = paths(corrupt_dir.path());
     std::fs::create_dir_all(corrupt_paths.state_db.parent().unwrap()).unwrap();
     std::fs::write(&corrupt_paths.state_db, b"not a sqlite database").unwrap();
+    drop(RuntimeLease::acquire(&corrupt_paths).unwrap());
     let corrupt_dependencies =
         doctor_dependencies(corrupt_paths, Arc::new(UnexpectedRuntimeValues));
     let corrupt_before = tree_snapshot(corrupt_dir.path());
@@ -874,6 +1317,25 @@ async fn doctor_offline_matrix_has_stable_codes_and_never_writes() {
         (ExitCode::StorageCorruption, "storage_corrupt".to_owned())
     );
     assert_eq!(tree_snapshot(corrupt_dir.path()), corrupt_before);
+}
+
+#[tokio::test]
+async fn doctor_offline_state_inspection_yields_to_the_runtime_writer_lease() {
+    let directory = TestDirectory::new();
+    let paths = paths(directory.path());
+    std::fs::create_dir_all(paths.state_db.parent().unwrap()).unwrap();
+    StateStore::open(&paths.state_db).unwrap();
+    let lease = RuntimeLease::acquire(&paths).unwrap();
+    let dependencies = doctor_dependencies(paths, Arc::new(UnexpectedRuntimeValues));
+    let before = tree_snapshot(directory.path());
+
+    assert_eq!(
+        doctor_code(&dependencies).await,
+        (ExitCode::NotRunning, "unreachable".to_owned())
+    );
+    assert_eq!(tree_snapshot(directory.path()), before);
+
+    drop(lease);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1143,4 +1605,50 @@ fn assert_tree_does_not_contain(root: &Path, canary: &str) {
             );
         }
     }
+}
+
+fn replace_state_bytes(directory: &Path, from: &[u8], to: &[u8]) {
+    assert_eq!(from.len(), to.len());
+    let mut replacements = 0;
+    for entry in std::fs::read_dir(directory).unwrap() {
+        let path = entry.unwrap().path();
+        if !path.is_file() {
+            continue;
+        }
+        let mut contents = std::fs::read(&path).unwrap();
+        for offset in 0..=contents.len().saturating_sub(from.len()) {
+            if contents[offset..].starts_with(from) {
+                contents[offset..offset + from.len()].copy_from_slice(to);
+                replacements += 1;
+            }
+        }
+        std::fs::write(path, contents).unwrap();
+    }
+    assert_eq!(replacements, 1, "expected one active client identifier");
+}
+
+async fn read_http_request(stream: &mut tokio::net::TcpStream) -> String {
+    let mut request = Vec::new();
+    loop {
+        let mut chunk = [0_u8; 1024];
+        let read = stream.read(&mut chunk).await.unwrap();
+        assert_ne!(read, 0, "client closed before sending complete headers");
+        request.extend_from_slice(&chunk[..read]);
+        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+            return String::from_utf8(request).unwrap();
+        }
+    }
+}
+
+async fn write_http_response(stream: &mut tokio::net::TcpStream, status: &str, body: &str) {
+    stream
+        .write_all(
+            format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
 }

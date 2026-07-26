@@ -161,6 +161,57 @@ fn production_main_uses_discovered_paths_and_returns_the_command_exit_code() {
     remove_test_directory(root);
 }
 
+#[test]
+fn json_commands_report_path_discovery_failure_as_stable_json() {
+    for arguments in [
+        &["serve", "--json"][..],
+        &["status", "--json"],
+        &["stop", "--json"],
+        &["doctor", "--json"],
+        &["authorize", "--client", "wokrouter", "--json"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_wokcore"))
+            .args(arguments)
+            .env_remove("APPDATA")
+            .env_remove("LOCALAPPDATA")
+            .env_remove("HOME")
+            .env_remove("USERPROFILE")
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("XDG_STATE_HOME")
+            .env_remove("XDG_RUNTIME_DIR")
+            .output()
+            .expect("wokcore binary should start");
+
+        assert_eq!(
+            output.status.code(),
+            Some(ExitCode::InvalidInput.as_i32()),
+            "{arguments:?}"
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            "{\"code\":\"invalid_runtime\"}\n",
+            "{arguments:?}"
+        );
+        assert!(output.stderr.is_empty(), "{arguments:?}");
+    }
+}
+
+#[test]
+fn serve_constructs_discovery_before_starting_the_listener_owner() {
+    let source = include_str!("../src/commands/serve.rs");
+    let discovery = source
+        .find("let discovery = DiscoveryStore::new")
+        .expect("serve must construct its discovery store");
+    let server = source
+        .find("let running = RunningServer::start")
+        .expect("serve must start its listener owner");
+
+    assert!(
+        discovery < server,
+        "a fallible discovery constructor must not run after the server starts"
+    );
+}
+
 fn remove_test_directory(path: PathBuf) {
     if path.starts_with(std::env::temp_dir()) {
         std::fs::remove_dir_all(path).unwrap();

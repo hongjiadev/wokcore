@@ -1,6 +1,7 @@
 mod authorize;
 mod client;
 mod doctor;
+mod response;
 mod serve;
 mod status;
 mod stop;

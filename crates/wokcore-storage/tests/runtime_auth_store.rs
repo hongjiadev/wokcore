@@ -1,6 +1,7 @@
 use std::{
-    fs,
+    env, fs,
     path::Path,
+    process::Command,
     sync::{Arc, Barrier},
     thread,
     time::SystemTime,
@@ -352,7 +353,7 @@ fn auth_metadata_reads_do_not_change_database_or_wal() {
 }
 
 #[test]
-fn immutable_read_only_inspection_reads_health_and_management_binding_without_writes() {
+fn read_only_inspection_reads_health_and_management_binding_without_writes() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("state.db");
     let mut store = StateStore::open(&path).unwrap();
@@ -378,7 +379,127 @@ fn immutable_read_only_inspection_reads_health_and_management_binding_without_wr
     );
     drop(read_only);
 
-    assert_eq!(directory_snapshot(directory.path()), before);
+    assert_snapshot_unchanged(directory.path(), &before);
+}
+
+#[test]
+fn read_only_inspection_sees_a_valid_committed_crash_wal_without_writes() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.db");
+    create_schema_one_main_with_wal(&path);
+    run_crash_wal_helper(&path, "migrate-two");
+    assert!(fs::metadata(path.with_extension("db-wal")).unwrap().len() > 0);
+    let before = directory_snapshot(directory.path());
+
+    let read_only = ReadOnlyStateStore::open(&path).unwrap();
+
+    assert_eq!(read_only.health().unwrap().schema_version, 2);
+    drop(read_only);
+    assert_snapshot_unchanged(directory.path(), &before);
+}
+
+#[test]
+fn read_only_inspection_rebuilds_a_missing_crash_wal_index_in_memory() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.db");
+    create_schema_one_main_with_wal(&path);
+    run_crash_wal_helper(&path, "migrate-two");
+    fs::remove_file(path.with_extension("db-shm")).unwrap();
+    let before = directory_snapshot(directory.path());
+
+    let read_only = ReadOnlyStateStore::open(&path).unwrap();
+
+    assert_eq!(read_only.health().unwrap().schema_version, 2);
+    drop(read_only);
+    assert_snapshot_unchanged(directory.path(), &before);
+}
+
+#[test]
+fn read_only_inspection_rebuilds_a_corrupt_crash_wal_index_in_memory() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.db");
+    create_schema_one_main_with_wal(&path);
+    run_crash_wal_helper(&path, "migrate-two");
+    let shm_path = path.with_extension("db-shm");
+    let mut shm = fs::read(&shm_path).unwrap();
+    shm[0] ^= 0x01;
+    fs::write(&shm_path, shm).unwrap();
+    let before = directory_snapshot(directory.path());
+
+    let read_only = ReadOnlyStateStore::open(&path).unwrap();
+
+    assert_eq!(read_only.health().unwrap().schema_version, 2);
+    drop(read_only);
+    assert_snapshot_unchanged(directory.path(), &before);
+}
+
+#[test]
+fn read_only_inspection_reports_a_corrupt_crash_wal_without_writes() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.db");
+    create_schema_one_main_with_wal(&path);
+    run_crash_wal_helper(&path, "migrate-two");
+    let wal_path = path.with_extension("db-wal");
+    let mut wal = fs::read(&wal_path).unwrap();
+    *wal.last_mut().unwrap() ^= 0x01;
+    fs::write(&wal_path, wal).unwrap();
+    let before = directory_snapshot(directory.path());
+
+    let result = ReadOnlyStateStore::open(&path);
+
+    assert!(matches!(
+        result,
+        Err(StorageError::StateDatabaseCorrupt { .. }) | Err(StorageError::StateDatabase { .. })
+    ));
+    assert_snapshot_unchanged(directory.path(), &before);
+}
+
+#[test]
+#[ignore = "spawned only by crash-WAL inspection tests"]
+fn crash_wal_writer_helper() {
+    let Some(path) = env::var_os("WOKCORE_CRASH_WAL_PATH") else {
+        return;
+    };
+    let mode = env::var("WOKCORE_CRASH_WAL_MODE").unwrap();
+    let connection = Connection::open(path).unwrap();
+    connection
+        .execute_batch("PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0;")
+        .unwrap();
+    match mode.as_str() {
+        "migrate-two" => connection
+            .execute_batch(include_str!("../migrations/0002_runtime_auth.sql"))
+            .unwrap(),
+        _ => panic!("unexpected crash WAL helper mode"),
+    }
+    std::process::exit(0);
+}
+
+fn create_schema_one_main_with_wal(path: &Path) {
+    let connection = Connection::open(path).unwrap();
+    connection
+        .execute_batch("PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0;")
+        .unwrap();
+    connection
+        .execute_batch(include_str!("../migrations/0001_initial.sql"))
+        .unwrap();
+    connection
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .unwrap();
+}
+
+fn run_crash_wal_helper(path: &Path, mode: &str) {
+    let status = Command::new(env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "crash_wal_writer_helper",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("WOKCORE_CRASH_WAL_PATH", path)
+        .env("WOKCORE_CRASH_WAL_MODE", mode)
+        .status()
+        .unwrap();
+    assert!(status.success());
 }
 
 fn table_columns(connection: &Connection, table: &str) -> Vec<String> {
@@ -410,4 +531,32 @@ fn directory_snapshot(path: &Path) -> Vec<(String, Vec<u8>, SystemTime)> {
         .collect::<Vec<_>>();
     snapshot.sort_by(|left, right| left.0.cmp(&right.0));
     snapshot
+}
+
+fn assert_snapshot_unchanged(path: &Path, before: &[(String, Vec<u8>, SystemTime)]) {
+    let after = directory_snapshot(path);
+    let before_names = before.iter().map(|(name, _, _)| name).collect::<Vec<_>>();
+    let after_names = after.iter().map(|(name, _, _)| name).collect::<Vec<_>>();
+    assert_eq!(after_names, before_names, "directory entries changed");
+    for ((name, before_bytes, before_modified), (_, after_bytes, after_modified)) in
+        before.iter().zip(&after)
+    {
+        assert_eq!(
+            after_bytes.len(),
+            before_bytes.len(),
+            "{name} length changed"
+        );
+        let first_difference = before_bytes
+            .iter()
+            .zip(after_bytes)
+            .position(|(before, after)| before != after);
+        assert!(
+            after_bytes == before_bytes,
+            "{name} bytes changed at offset {first_difference:?}"
+        );
+        assert_eq!(
+            after_modified, before_modified,
+            "{name} modified time changed"
+        );
+    }
 }

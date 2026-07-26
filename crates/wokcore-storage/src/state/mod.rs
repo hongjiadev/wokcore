@@ -1,4 +1,5 @@
 mod store;
+mod wal;
 
 pub use store::{
     CheckpointResult, ClientTokenMetadata, ReadOnlyStateStore, RequestMetric, RuntimeSecretBinding,

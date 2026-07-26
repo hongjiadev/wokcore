@@ -1,7 +1,7 @@
 use std::{io, net::TcpListener};
 
 use serde_json::json;
-use wokcore_platform::{DiscoveryRecord, DiscoveryStore, PlatformError};
+use wokcore_platform::{DiscoveryRecord, DiscoveryStore, PlatformError, RuntimeLease};
 use wokcore_storage::{ConfigStore, ReadOnlyStateStore, StorageError};
 
 use crate::{CommandOutput, ExitCode, RunDependencies, cli::JsonOutput};
@@ -16,42 +16,16 @@ pub(super) async fn run(
     dependencies: &RunDependencies,
     output: &mut dyn CommandOutput,
 ) -> ExitCode {
-    let discovery = match read_discovery(dependencies) {
-        Ok(record) => Some(record),
-        Err(DoctorProbe::Absent) => None,
+    match read_discovery(dependencies) {
+        Ok(record) => return inspect_online(record, options, dependencies, output).await,
+        Err(DoctorProbe::Absent) => {}
         Err(result) => return render(result, options.json, output, None),
-    };
-
-    if let Some(record) = discovery {
-        if !dependencies.process.is_running(record.pid) {
-            return render(
-                DoctorProbe::PidMismatch,
-                options.json,
-                output,
-                Some(&record),
-            );
-        }
-        let result = match verify_identity(&record).await {
-            Ok(()) => DoctorProbe::Healthy,
-            Err(IdentityError::Unreachable) => DoctorProbe::Unreachable,
-            Err(IdentityError::InstanceMismatch) => DoctorProbe::InstanceMismatch,
-            Err(IdentityError::ApiMismatch) => DoctorProbe::ApiMismatch,
-            Err(
-                IdentityError::InvalidAuthority
-                | IdentityError::InvalidResponse
-                | IdentityError::Internal,
-            ) => DoctorProbe::UnsafeRuntime,
-        };
-        if result == DoctorProbe::Healthy
-            && let Err(error) = inspect_state(dependencies, true)
-        {
-            return render(error, options.json, output, Some(&record));
-        }
-        return render(result, options.json, output, Some(&record));
     }
 
-    if let Err(error) = inspect_state(dependencies, false) {
-        return render(error, options.json, output, None);
+    match inspect_offline_state(dependencies) {
+        Ok(Some(record)) => return inspect_online(record, options, dependencies, output).await,
+        Ok(None) => {}
+        Err(error) => return render(error, options.json, output, None),
     }
     if dependencies.paths.config_file.try_exists().unwrap_or(false) {
         let config = match ConfigStore::new(&dependencies.paths.config_file).load() {
@@ -79,6 +53,39 @@ pub(super) async fn run(
     render(DoctorProbe::Absent, options.json, output, None)
 }
 
+async fn inspect_online(
+    record: DiscoveryRecord,
+    options: JsonOutput,
+    dependencies: &RunDependencies,
+    output: &mut dyn CommandOutput,
+) -> ExitCode {
+    if !dependencies.process.is_running(record.pid) {
+        return render(
+            DoctorProbe::PidMismatch,
+            options.json,
+            output,
+            Some(&record),
+        );
+    }
+    let result = match verify_identity(&record).await {
+        Ok(()) => DoctorProbe::Healthy,
+        Err(IdentityError::Unreachable) => DoctorProbe::Unreachable,
+        Err(IdentityError::InstanceMismatch) => DoctorProbe::InstanceMismatch,
+        Err(IdentityError::ApiMismatch) => DoctorProbe::ApiMismatch,
+        Err(
+            IdentityError::InvalidAuthority
+            | IdentityError::InvalidResponse
+            | IdentityError::Internal,
+        ) => DoctorProbe::UnsafeRuntime,
+    };
+    if result == DoctorProbe::Healthy
+        && let Err(error) = inspect_live_state(dependencies)
+    {
+        return render(error, options.json, output, Some(&record));
+    }
+    render(result, options.json, output, Some(&record))
+}
+
 fn read_discovery(dependencies: &RunDependencies) -> Result<DiscoveryRecord, DoctorProbe> {
     let store = DiscoveryStore::new(&dependencies.paths).map_err(map_discovery_error)?;
     store.read().map_err(map_discovery_error)
@@ -99,22 +106,50 @@ fn map_discovery_error(error: PlatformError) -> DoctorProbe {
     }
 }
 
-fn inspect_state(dependencies: &RunDependencies, live: bool) -> Result<(), DoctorProbe> {
+fn inspect_live_state(dependencies: &RunDependencies) -> Result<(), DoctorProbe> {
     match dependencies.paths.state_db.try_exists() {
-        Ok(false) if live => return Err(DoctorProbe::StorageCorrupt),
-        Ok(false) => return Ok(()),
+        Ok(false) => return Err(DoctorProbe::StorageCorrupt),
         Err(_) => return Err(DoctorProbe::Internal),
         Ok(true) => {}
     }
-    let state = if live {
-        ReadOnlyStateStore::open_live(&dependencies.paths.state_db)
-    } else {
-        ReadOnlyStateStore::open(&dependencies.paths.state_db)
-    };
+    let state = ReadOnlyStateStore::open_live(&dependencies.paths.state_db);
     match state {
         Ok(state) => state.health().map(|_| ()).map_err(map_storage_error),
         Err(error) => Err(map_storage_error(error)),
     }
+}
+
+fn inspect_offline_state(
+    dependencies: &RunDependencies,
+) -> Result<Option<DiscoveryRecord>, DoctorProbe> {
+    match dependencies.paths.state_db.try_exists() {
+        Ok(false) => return Ok(None),
+        Err(_) => return Err(DoctorProbe::Internal),
+        Ok(true) => {}
+    }
+    let lease = match RuntimeLease::acquire_existing(&dependencies.paths) {
+        Ok(lease) => lease,
+        Err(PlatformError::AlreadyRunning) => {
+            return match read_discovery(dependencies) {
+                Ok(record) => Ok(Some(record)),
+                Err(DoctorProbe::Absent) => Err(DoctorProbe::Unreachable),
+                Err(error) => Err(error),
+            };
+        }
+        Err(PlatformError::UnsafeRuntimePath) => return Err(DoctorProbe::UnsafeRuntime),
+        Err(_) => return Err(DoctorProbe::Internal),
+    };
+    match read_discovery(dependencies) {
+        Ok(record) => return Ok(Some(record)),
+        Err(DoctorProbe::Absent) => {}
+        Err(error) => return Err(error),
+    }
+    let state =
+        ReadOnlyStateStore::open(&dependencies.paths.state_db).map_err(map_storage_error)?;
+    state.health().map_err(map_storage_error)?;
+    drop(state);
+    drop(lease);
+    Ok(None)
 }
 
 fn map_storage_error(error: StorageError) -> DoctorProbe {

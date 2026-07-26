@@ -1,4 +1,4 @@
-use std::io;
+use std::{io, time::Duration};
 
 use reqwest::header::HOST;
 use serde::Deserialize;
@@ -8,9 +8,11 @@ use wokcore_platform::{DiscoveryRecord, DiscoveryStore, PlatformError};
 
 use crate::{CommandOutput, ExitCode, RunDependencies, cli::JsonOutput};
 
-use super::{internal_failure, write_json};
+use super::{internal_failure, response::read_bounded, write_json};
 
-const MAX_IDENTITY_BODY_BYTES: usize = 64 * 1024;
+const IDENTITY_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+const IDENTITY_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+const IDENTITY_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(super) async fn run(
     options: JsonOutput,
@@ -69,6 +71,9 @@ pub(crate) async fn verify_identity(record: &DiscoveryRecord) -> Result<(), Iden
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
+        .connect_timeout(IDENTITY_CONNECT_TIMEOUT)
+        .timeout(IDENTITY_REQUEST_TIMEOUT)
+        .read_timeout(IDENTITY_READ_TIMEOUT)
         .build()
         .map_err(|_| IdentityError::Internal)?;
     let health: HealthResponse =
@@ -125,20 +130,12 @@ async fn get_json<T: for<'de> Deserialize<'de>>(
         .send()
         .await
         .map_err(|_| IdentityError::Unreachable)?;
-    if !response.status().is_success()
-        || response
-            .content_length()
-            .is_some_and(|length| length > MAX_IDENTITY_BODY_BYTES as u64)
-    {
+    if !response.status().is_success() {
         return Err(IdentityError::InvalidResponse);
     }
-    let body = response
-        .bytes()
+    let body = read_bounded(response)
         .await
         .map_err(|_| IdentityError::InvalidResponse)?;
-    if body.len() > MAX_IDENTITY_BODY_BYTES {
-        return Err(IdentityError::InvalidResponse);
-    }
     serde_json::from_slice(&body).map_err(|_| IdentityError::InvalidResponse)
 }
 

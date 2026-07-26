@@ -13,7 +13,9 @@ use wokcore_storage::NativeSecretStore;
 
 use crate::{
     Clock, CommandOutput, ExitCode, IdSource, ProcessIdentity, RunDependencies, RuntimeValueError,
-    ShutdownSignal, cli::Cli, run_with_dependencies,
+    ShutdownSignal,
+    cli::{Cli, Command},
+    run_with_dependencies,
 };
 
 pub async fn run_production(cli: Cli) -> ExitCode {
@@ -21,7 +23,11 @@ pub async fn run_production(cli: Cli) -> ExitCode {
     let paths = match AppPaths::discover() {
         Ok(paths) => paths,
         Err(_) => {
-            let _ = output.write_stderr("WokCore application paths are unavailable.\n");
+            if requests_json(&cli) {
+                let _ = output.write_stdout("{\"code\":\"invalid_runtime\"}\n");
+            } else {
+                let _ = output.write_stderr("WokCore application paths are unavailable.\n");
+            }
             return ExitCode::InvalidInput;
         }
     };
@@ -35,6 +41,16 @@ pub async fn run_production(cli: Cli) -> ExitCode {
         Arc::new(ControlCSignal),
     );
     run_with_dependencies(cli, &dependencies, &mut output).await
+}
+
+fn requests_json(cli: &Cli) -> bool {
+    match &cli.command {
+        Command::Serve(options)
+        | Command::Status(options)
+        | Command::Stop(options)
+        | Command::Doctor(options) => options.json,
+        Command::Authorize(options) => options.json,
+    }
 }
 
 struct SystemClock;

@@ -1,6 +1,10 @@
+use std::time::Duration;
+
 use reqwest::StatusCode;
+use secrecy::SecretString;
 use serde::Deserialize;
 use serde_json::json;
+use tokio::{task::JoinError, time::timeout};
 
 use crate::{CommandOutput, ExitCode, RunDependencies, cli::JsonOutput};
 
@@ -8,6 +12,8 @@ use super::{
     client::{ControlClient, ControlClientError, response_body},
     write_json,
 };
+
+const CANCEL_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(super) async fn run(
     options: JsonOutput,
@@ -34,8 +40,26 @@ pub(super) async fn run(
 async fn stop(dependencies: &RunDependencies) -> Result<(), ControlClientError> {
     let client = ControlClient::connect(dependencies).await?;
     let management = client.management_secret(dependencies).await?;
+    map_owned_stop(tokio::spawn(stop_owned(client, management)).await)
+}
+
+async fn stop_owned(
+    client: ControlClient,
+    management: SecretString,
+) -> Result<(), ControlClientError> {
+    let result = drain_and_stop(&client, &management).await;
+    if result.is_err() {
+        best_effort_cancel_drain(&client, &management).await;
+    }
+    result
+}
+
+async fn drain_and_stop(
+    client: &ControlClient,
+    management: &SecretString,
+) -> Result<(), ControlClientError> {
     let drain = client
-        .post_json::<()>("/wokcore/v1/service/drain", &management, None)
+        .post_json::<()>("/wokcore/v1/service/drain", management, None)
         .await?;
     let drain_status = drain.status();
     let drain_body = response_body(drain).await?;
@@ -47,12 +71,12 @@ async fn stop(dependencies: &RunDependencies) -> Result<(), ControlClientError> 
     }
     let drained: LifecycleResponse =
         serde_json::from_slice(&drain_body).map_err(|_| ControlClientError::Internal)?;
-    if drained.active_requests != 0 {
+    if drained.phase != "draining" || drained.active_requests != 0 {
         return Err(ControlClientError::Internal);
     }
 
     let stop = client
-        .post_json::<()>("/wokcore/v1/service/stop", &management, None)
+        .post_json::<()>("/wokcore/v1/service/stop", management, None)
         .await?;
     let stop_status = stop.status();
     let stop_body = response_body(stop).await?;
@@ -68,6 +92,28 @@ async fn stop(dependencies: &RunDependencies) -> Result<(), ControlClientError> 
         return Err(ControlClientError::Internal);
     }
     Ok(())
+}
+
+async fn best_effort_cancel_drain(client: &ControlClient, management: &SecretString) {
+    let _ = timeout(CANCEL_DRAIN_TIMEOUT, async {
+        let response = client
+            .post_json::<()>("/wokcore/v1/service/drain/cancel", management, None)
+            .await?;
+        let status = response.status();
+        let _ = response_body(response).await?;
+        if status.is_success() {
+            Ok(())
+        } else {
+            Err(ControlClientError::Internal)
+        }
+    })
+    .await;
+}
+
+fn map_owned_stop(
+    result: Result<Result<(), ControlClientError>, JoinError>,
+) -> Result<(), ControlClientError> {
+    result.unwrap_or(Err(ControlClientError::Internal))
 }
 
 fn render_error(error: ControlClientError, output: &mut dyn CommandOutput, json: bool) -> ExitCode {
@@ -115,4 +161,21 @@ fn render_error(error: ControlClientError, output: &mut dyn CommandOutput, json:
 struct LifecycleResponse {
     phase: String,
     active_requests: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ControlClientError, map_owned_stop};
+
+    #[tokio::test]
+    async fn owned_stop_join_failure_maps_to_internal() {
+        let joined = tokio::spawn(async {
+            panic!("simulated owned stop failure");
+            #[allow(unreachable_code)]
+            Ok::<(), ControlClientError>(())
+        })
+        .await;
+
+        assert_eq!(map_owned_stop(joined), Err(ControlClientError::Internal));
+    }
 }

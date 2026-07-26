@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use reqwest::{Response, header::HOST};
 use secrecy::{SecretString, zeroize::Zeroizing};
 use serde::Serialize;
@@ -6,9 +8,14 @@ use wokcore_storage::{ReadOnlyStateStore, StorageError};
 
 use crate::RunDependencies;
 
-use super::status::{validated_authority, verify_identity};
+use super::{
+    response::read_bounded,
+    status::{validated_authority, verify_identity},
+};
 
-const MAX_MANAGEMENT_BODY_BYTES: usize = 64 * 1024;
+const MANAGEMENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const MANAGEMENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(40);
+const MANAGEMENT_READ_TIMEOUT: Duration = Duration::from_secs(40);
 
 pub(super) struct ControlClient {
     record: DiscoveryRecord,
@@ -33,6 +40,9 @@ impl ControlClient {
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy()
+            .connect_timeout(MANAGEMENT_CONNECT_TIMEOUT)
+            .timeout(MANAGEMENT_REQUEST_TIMEOUT)
+            .read_timeout(MANAGEMENT_READ_TIMEOUT)
             .build()
             .map_err(|_| ControlClientError::Internal)?;
         Ok(Self {
@@ -85,20 +95,9 @@ impl ControlClient {
 pub(super) async fn response_body(
     response: Response,
 ) -> Result<Zeroizing<Vec<u8>>, ControlClientError> {
-    if response
-        .content_length()
-        .is_some_and(|length| length > MAX_MANAGEMENT_BODY_BYTES as u64)
-    {
-        return Err(ControlClientError::Internal);
-    }
-    let body = response
-        .bytes()
+    read_bounded(response)
         .await
-        .map_err(|_| ControlClientError::Internal)?;
-    if body.len() > MAX_MANAGEMENT_BODY_BYTES {
-        return Err(ControlClientError::Internal);
-    }
-    Ok(Zeroizing::new(body.to_vec()))
+        .map_err(|_| ControlClientError::Internal)
 }
 
 fn map_platform(error: PlatformError) -> ControlClientError {
@@ -131,4 +130,91 @@ pub(super) enum ControlClientError {
     Authentication,
     StorageCorruption,
     Internal,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        time::timeout,
+    };
+
+    use super::{ControlClientError, response_body};
+    use crate::commands::response::MAX_RESPONSE_BODY_BYTES;
+
+    #[tokio::test]
+    async fn management_body_rejects_overflow_before_stream_completion() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n10001\r\n",
+                )
+                .await
+                .unwrap();
+            stream
+                .write_all(&vec![b'x'; MAX_RESPONSE_BODY_BYTES + 1])
+                .await
+                .unwrap();
+            stream.write_all(b"\r\n").await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://{address}/"))
+            .send()
+            .await
+            .unwrap();
+
+        let result = timeout(Duration::from_secs(1), response_body(response))
+            .await
+            .expect("bounded reader must reject before the stream terminates");
+
+        assert_eq!(result.unwrap_err(), ControlClientError::Internal);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn management_body_accepts_exactly_the_limit() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n10000\r\n",
+                )
+                .await
+                .unwrap();
+            stream
+                .write_all(&vec![b'x'; MAX_RESPONSE_BODY_BYTES])
+                .await
+                .unwrap();
+            stream.write_all(b"\r\n0\r\n\r\n").await.unwrap();
+        });
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://{address}/"))
+            .send()
+            .await
+            .unwrap();
+
+        let body = response_body(response).await.unwrap();
+
+        assert_eq!(body.len(), MAX_RESPONSE_BODY_BYTES);
+        server.await.unwrap();
+    }
 }
