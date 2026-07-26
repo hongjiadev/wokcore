@@ -208,3 +208,16 @@ The private pre-rewrite recovery bundle is stored in WokDocs, not this public re
   - `cargo +1.97.1 test --offline -p wokcore-storage --test runtime_auth_store --locked`
   - `cargo +1.97.1 test --offline -p wokcore-server --test auth_registry --locked`
   - `cargo +1.97.1 clippy --offline -p wokcore-storage -p wokcore-server --all-targets --all-features --locked -- -D warnings`
+
+## Runtime foundation 9: Session and supplemental state schema
+
+- SQLite schema 3 adds opaque Session source/generation pointers, bounded scan cursors and typed parser checkpoints, compact Session index and usage rows, content-free Codex replay signatures, bounded request supplemental metadata, and normalized client-token scopes.
+- Every Session-derived row carries its opaque source key and generation. Replacement data is committed into a hidden staging generation in batches capped at 512 rows and 512 KiB; one pointer-flip transaction promotes it and retires the prior successful generation without synchronously deleting that history.
+- Current-generation joins prevent staging or retired rows from appearing in Session index, usage, or replay-signature queries. Interrupted candidates and failed source observations preserve the last successful aggregate, while staging and retired cleanup removes at most 512 rows and 512 KiB per transaction.
+- Existing schema-2 client tokens receive exactly `proxy.use`. New token metadata stores only exact allow-listed scope rows and does not support wildcards or implicit expansion.
+- Supplemental request metadata is best-effort and content-free. Each row is capped at 2 KiB; the table is bounded to 24 hours, 32,768 rows, and 64 MiB, with cleanup limited to 512 rows and 512 KiB per call and capacity pressure reported as a drop outcome.
+- The schema stores no Session paths or bodies, request/response content, tool payloads, stream chunks, headers, cookies, credentials, or raw tokens. Offline and live read-only inspection replays committed WAL state in memory without mutating database sidecars.
+- Verification:
+  - `cargo +1.97.1 test -p wokcore-storage --test session_state_store --locked --offline`
+  - `cargo +1.97.1 test -p wokcore-storage --all-features --locked --offline`
+  - `cargo +1.97.1 clippy -p wokcore-storage --all-targets --all-features --locked --offline -- -D warnings`

@@ -18,6 +18,7 @@ All notable WokCore changes are documented in this file.
 - Unlimited lock-free request admission tracking with explicit drain, cancellation, timeout, and graceful stopping lifecycle states.
 - Secure IPv4-loopback HTTP control plane with exact authority/origin enforcement, fresh request IDs, management-first authentication, bounded JSON, versioned capabilities, graceful stop, and an OpenAPI 3.1 contract.
 - Local `serve`, `status`, `stop`, `doctor`, and JSON-only `authorize` commands with stable exit/result codes, fixed-port fail-closed startup, exact loopback identity verification, injected runtime seams, read-only diagnostics, and ownership-conditional discovery cleanup.
+- Ordered SQLite schema 3 Session state with hidden staged generations, atomic promotion, bounded cursor/index/usage/replay batches, exact client-token scopes, and content-free supplemental request metadata with explicit capacity and retention cleanup.
 
 ### Fixed
 

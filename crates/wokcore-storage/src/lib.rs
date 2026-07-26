@@ -10,8 +10,17 @@ pub use secrets::{
     MemorySecretStore, NativeSecretStore, PermissionedFileSecretStore, SecretStore,
 };
 pub use state::{
-    CheckpointResult, ClientTokenMetadata, ReadOnlyStateStore, RequestMetric, RuntimeSecretBinding,
-    StateHealth, StateStore, WAL_CHECKPOINT_THRESHOLD_BYTES,
+    CandidateBeginOutcome, CheckpointResult, CleanupBatchOutcome, ClientTokenMetadata,
+    ClientTokenScope, ClientTokenScopeParseError, CodexReplaySignature, CodexReplaySignaturePage,
+    MAX_CODEX_REPLAY_SIGNATURES, MAX_PARSER_CHECKPOINT_BYTES, MAX_SESSION_BATCH_BYTES,
+    MAX_SESSION_BATCH_ROWS, MAX_SUPPLEMENTAL_BYTES, MAX_SUPPLEMENTAL_ROW_BYTES,
+    MAX_SUPPLEMENTAL_ROWS, ParserCheckpoint, ReadOnlyStateStore, ReplaySignaturePageKey,
+    RequestMetric, RequestSupplementalMetadata, RuntimeSecretBinding, ScopedClientTokenMetadata,
+    SessionAvailability, SessionBatch, SessionGenerationState, SessionIndexPage,
+    SessionIndexPageKey, SessionIndexRecord, SessionScanCursor, SessionSourceErrorCode,
+    SessionSourceKind, SessionSourceState, SessionSourceStatus, SessionUsagePage,
+    SessionUsagePageKey, SessionUsageRecord, StateHealth, StateStore, SupplementalBatchOutcome,
+    SupplementalStorageStats, WAL_CHECKPOINT_THRESHOLD_BYTES,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -36,6 +45,18 @@ pub enum StorageError {
     },
     #[error("runtime secret binding already exists at revision {actual}")]
     RuntimeSecretBindingConflict { actual: u64 },
+    #[error("invalid state record: {message}")]
+    InvalidStateRecord { message: String },
+    #[error("stable {record_kind} identifier conflicts with persisted content")]
+    StableRecordConflict { record_kind: &'static str },
+    #[error("the Session batch exceeds its bounded row or byte limit")]
+    SessionBatchLimitExceeded,
+    #[error("the Session candidate is not in the required generation state")]
+    CandidateStateConflict,
+    #[error("the Session page key is stale")]
+    StalePageKey,
+    #[error("the Codex replay-signature rollout exceeds its hard limit")]
+    ReplaySignatureLimitExceeded,
     #[error("secret was not found")]
     SecretNotFound,
     #[error("the secret backend failed without exposing secret material")]
