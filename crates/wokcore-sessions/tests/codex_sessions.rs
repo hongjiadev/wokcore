@@ -14,7 +14,8 @@ use wokcore_sessions::{
     model::{ReplayResolution, TokenTotals},
 };
 use wokcore_storage::{
-    MAX_CODEX_REPLAY_SIGNATURES, SessionSourceErrorCode, SessionSourceStatus, StateStore,
+    MAX_CODEX_REPLAY_SIGNATURES, MAX_SESSION_BATCH_ROWS, SessionScanResultCode,
+    SessionSourceErrorCode, SessionSourceStatus, StateStore,
 };
 
 const TEST_DOMAIN_KEY: [u8; 32] = [0x5a; 32];
@@ -241,6 +242,42 @@ fn current_and_legacy_parent_fields_must_be_consistent() {
         parse_codex_record(&conflict).unwrap_err().stable_code(),
         "codex_parent_inconsistent"
     );
+}
+
+#[test]
+fn malformed_present_legacy_parent_fields_fail_closed_while_normal_sources_remain_compatible() {
+    for malformed_source in [
+        serde_json::json!({"subagent":{"thread_spawn":{"parent_thread_id":7}}}),
+        serde_json::json!({"subagent":{"thread_spawn":{"parent_thread_id":""}}}),
+        serde_json::json!({"subagent":{"thread_spawn":"not-an-object"}}),
+        serde_json::json!({"subagent":"not-an-object"}),
+    ] {
+        let record = serde_json::json!({
+            "type":"session_meta",
+            "timestamp":"2026-07-26T00:00:00Z",
+            "payload":{"id":"child","source":malformed_source}
+        });
+        assert_eq!(
+            parse_codex_record(&record).unwrap_err().stable_code(),
+            "codex_parent_inconsistent"
+        );
+    }
+
+    for normal_source in [
+        serde_json::json!("cli"),
+        serde_json::json!({"type":"cli"}),
+        serde_json::json!({"subagent":{"kind":"review"}}),
+    ] {
+        let record = serde_json::json!({
+            "type":"session_meta",
+            "timestamp":"2026-07-26T00:00:00Z",
+            "payload":{"id":"normal","source":normal_source}
+        });
+        let CodexStructuralRecord::SessionMeta(meta) = parse_codex_record(&record).unwrap() else {
+            panic!("meta");
+        };
+        assert_eq!(meta.parent_thread_id, None);
+    }
 }
 
 #[test]
@@ -526,6 +563,93 @@ fn interrupted_multibatch_candidate_stays_hidden_and_resumes() {
             .unwrap(),
         Some(1)
     );
+}
+
+#[test]
+fn interrupted_current_append_is_deferred_until_eof_and_resumes_without_losing_tail() {
+    let root = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let relative = "sessions/2026/07/26/current-append-crash.jsonl";
+    write_session(
+        root.path(),
+        relative,
+        &[
+            meta(
+                "current-append-crash",
+                serde_json::json!("2026-07-26T12:00:00Z"),
+            ),
+            token("2026-07-26T12:00:01Z", 1, 1, 0),
+        ],
+    );
+    let mut initial = scanner(&root, &state);
+    let first = initial.scan(NOW, ScanControl::default()).unwrap();
+    let key = first.sources[0].source_key.clone();
+    let mut writer = OpenOptions::new()
+        .append(true)
+        .open(root.path().join(relative))
+        .unwrap();
+    for ordinal in 2..=701 {
+        serde_json::to_writer(
+            &mut writer,
+            &token("2026-07-26T12:00:02Z", ordinal, ordinal, 0),
+        )
+        .unwrap();
+        writer.write_all(b"\n").unwrap();
+    }
+    writer.flush().unwrap();
+    drop(writer);
+
+    let interrupted = initial
+        .scan(
+            "2026-07-26T12:01:00Z",
+            ScanControl {
+                stop_after_committed_batches: Some(1),
+            },
+        )
+        .unwrap();
+    assert_eq!(interrupted.outcome, ScanOutcome::Interrupted);
+    let interrupted_cursor = initial
+        .state()
+        .load_current_session_scan_cursor(&key)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        interrupted_cursor.result_code,
+        Some(SessionScanResultCode::Deferred)
+    );
+    let interrupted_source = initial.state().load_session_source(&key).unwrap().unwrap();
+    assert_eq!(interrupted_source.status, SessionSourceStatus::Stale);
+    assert_eq!(
+        interrupted_source.error_code,
+        Some(SessionSourceErrorCode::SourceCandidateInterrupted)
+    );
+    drop(initial);
+
+    let mut restarted = scanner(&root, &state);
+    let completed = restarted
+        .scan("2026-07-26T12:02:00Z", ScanControl::default())
+        .unwrap();
+    assert_eq!(completed.outcome, ScanOutcome::Complete);
+    assert_eq!(completed.advanced_sources, 1);
+    let cursor = restarted
+        .state()
+        .load_current_session_scan_cursor(&key)
+        .unwrap()
+        .unwrap();
+    assert_eq!(cursor.result_code, Some(SessionScanResultCode::Advanced));
+    assert_eq!(
+        cursor.complete_byte_offset,
+        fs::metadata(root.path().join(relative)).unwrap().len()
+    );
+    let index = restarted
+        .state()
+        .load_current_session_index_page(&key, None, 1)
+        .unwrap()
+        .items
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(index.usage_event_count, 701);
 }
 
 #[test]
@@ -901,13 +1025,14 @@ fn long_parent_pages_survive_restart_and_multiple_late_children_reuse_them() {
 }
 
 #[test]
-fn partial_parent_index_tail_is_rebuilt_once_then_all_children_use_committed_pages() {
+fn parent_index_with_a_middle_ordinal_gap_is_rebuilt_once_then_all_children_use_committed_pages() {
     let root = TempDir::new().unwrap();
     let state = TempDir::new().unwrap();
     let parent = vec![
         meta("lease-parent", serde_json::json!("2026-07-26T12:00:00Z")),
         token("2026-07-26T12:00:01Z", 10, 1, 0),
         token("2026-07-26T12:00:02Z", 20, 2, 0),
+        token("2026-07-26T12:00:03Z", 30, 3, 0),
     ];
     write_session(root.path(), "sessions/2026/07/26/parent.jsonl", &parent);
     let mut initial = scanner(&root, &state);
@@ -925,7 +1050,7 @@ fn partial_parent_index_tail_is_rebuilt_once_then_all_children_use_committed_pag
     for index in 1..=2 {
         let mut child_meta = meta(
             &format!("lease-child-{index}"),
-            serde_json::json!("2026-07-26T12:00:03Z"),
+            serde_json::json!("2026-07-26T12:00:04Z"),
         );
         child_meta["payload"]["parent_thread_id"] = serde_json::json!("lease-parent");
         write_session(
@@ -935,7 +1060,8 @@ fn partial_parent_index_tail_is_rebuilt_once_then_all_children_use_committed_pag
                 child_meta,
                 parent[1].clone(),
                 parent[2].clone(),
-                token("2026-07-26T12:00:04Z", 25, 4, 0),
+                parent[3].clone(),
+                token("2026-07-26T12:00:05Z", 35, 4, 0),
             ],
         );
     }
@@ -944,7 +1070,7 @@ fn partial_parent_index_tail_is_rebuilt_once_then_all_children_use_committed_pag
     let rebuilt = rebuild.scan(NOW, ScanControl::default()).unwrap();
     assert_eq!(rebuilt.metrics.parent_index_builds, 1);
     assert_eq!(rebuilt.metrics.full_source_scans, 3);
-    assert_eq!(rebuilt.metrics.maximum_replay_page_rows, 2);
+    assert_eq!(rebuilt.metrics.maximum_replay_page_rows, 3);
     for child in rebuilt.sources.iter().filter(|source| {
         source
             .root_thread_id
@@ -1253,10 +1379,7 @@ fn source_failure_retains_last_promoted_aggregate() {
     let key = first.sources[0].source_key.clone();
     fs::write(root.path().join(relative), vec![b'x'; 16 * 1024 * 1024 + 2]).unwrap();
     let failed = scanner.scan(NOW, ScanControl::default()).unwrap();
-    assert_eq!(
-        failed.sources[0].status,
-        SessionSourceStatus::ResourceLimited
-    );
+    assert_eq!(failed.sources[0].status, SessionSourceStatus::Stale);
     let usage = scanner
         .state()
         .load_current_session_usage_page(&key, None, 500)
@@ -1266,7 +1389,7 @@ fn source_failure_retains_last_promoted_aggregate() {
     let deleted = scanner.scan(NOW, ScanControl::default()).unwrap();
     assert_eq!(deleted.deleted_sources, 1);
     let source = scanner.state().load_session_source(&key).unwrap().unwrap();
-    assert_eq!(source.status, SessionSourceStatus::Unavailable);
+    assert_eq!(source.status, SessionSourceStatus::Stale);
     assert_eq!(
         source.error_code,
         Some(SessionSourceErrorCode::SourceSessionsAbsent)
@@ -1439,7 +1562,7 @@ fn deleted_source_reappearance_recovers_once_then_becomes_write_free() {
             .unwrap()
             .unwrap()
             .status,
-        SessionSourceStatus::Unavailable
+        SessionSourceStatus::Stale
     );
 
     fs::rename(&held, &path).unwrap();
@@ -1516,6 +1639,65 @@ fn persisted_live_to_archive_move_inherits_key_generation_cursor_and_usage_ids()
             .collect::<Vec<_>>(),
         usage_ids
     );
+}
+
+#[test]
+fn archived_old_inode_and_new_live_inode_at_the_same_path_receive_distinct_stable_keys() {
+    let root = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let live = "sessions/2026/07/26/reused-path.jsonl";
+    write_session(
+        root.path(),
+        live,
+        &[
+            meta("archived-a", serde_json::json!("2026-07-26T12:00:00Z")),
+            token("2026-07-26T12:00:01Z", 10, 1, 0),
+        ],
+    );
+    let mut codex_scanner = scanner(&root, &state);
+    let first = codex_scanner.scan(NOW, ScanControl::default()).unwrap();
+    let old_key = first.sources[0].source_key.clone();
+
+    fs::create_dir(root.path().join("archived_sessions")).unwrap();
+    fs::rename(
+        root.path().join(live),
+        root.path().join("archived_sessions/archived-a.jsonl"),
+    )
+    .unwrap();
+    write_session(
+        root.path(),
+        live,
+        &[
+            meta("new-live-b", serde_json::json!("2026-07-26T12:01:00Z")),
+            token("2026-07-26T12:01:01Z", 20, 2, 0),
+        ],
+    );
+
+    let split = codex_scanner
+        .scan("2026-07-26T12:02:00Z", ScanControl::default())
+        .unwrap();
+    assert_eq!(split.sources.len(), 2);
+    let archived = split
+        .sources
+        .iter()
+        .find(|source| source.root_thread_id.as_deref() == Some("archived-a"))
+        .unwrap();
+    let live = split
+        .sources
+        .iter()
+        .find(|source| source.root_thread_id.as_deref() == Some("new-live-b"))
+        .unwrap();
+    assert_eq!(archived.source_key, old_key);
+    assert_ne!(live.source_key, old_key);
+    assert_ne!(archived.source_key, live.source_key);
+
+    let before = snapshot_tree(state.path());
+    let repeated = codex_scanner
+        .scan("2026-07-26T12:03:00Z", ScanControl::default())
+        .unwrap();
+    assert_eq!(repeated.unchanged_sources, 2);
+    assert_eq!(repeated.metrics.full_source_scans, 0);
+    assert_eq!(snapshot_tree(state.path()), before);
 }
 
 #[test]
@@ -1718,6 +1900,170 @@ fn interrupted_replacement_move_to_archive_promotes_the_second_generation() {
         .next()
         .unwrap();
     assert_eq!(index.usage_event_count, 700);
+}
+
+#[test]
+fn retired_replay_history_cleanup_advances_one_bounded_batch_per_scan() {
+    let root = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let relative = "sessions/2026/07/26/bounded-retired.jsonl";
+    let mut original = vec![meta(
+        "bounded-retired",
+        serde_json::json!("2026-07-26T12:00:00Z"),
+    )];
+    for ordinal in 1..=900 {
+        original.push(token("2026-07-26T12:00:01Z", ordinal, ordinal, 0));
+    }
+    write_session(root.path(), relative, &original);
+    let mut codex_scanner = scanner(&root, &state);
+    let first = codex_scanner.scan(NOW, ScanControl::default()).unwrap();
+    let key = first.sources[0].source_key.clone();
+    let state_path = state.path().join("state.sqlite3");
+    let rows_for_generation = |generation: u64| {
+        let connection = rusqlite::Connection::open(&state_path).unwrap();
+        usize::try_from(
+            connection
+                .query_row(
+                    "SELECT
+                    (SELECT COUNT(*) FROM session_index
+                     WHERE source_key = ?1 AND generation = ?2)
+                  + (SELECT COUNT(*) FROM session_usage_records
+                     WHERE source_key = ?1 AND generation = ?2)
+                  + (SELECT COUNT(*) FROM codex_replay_signatures
+                     WHERE parent_source_key = ?1 AND parent_generation = ?2)
+                  + (SELECT COUNT(*) FROM session_scan_cursors
+                     WHERE source_key = ?1 AND generation = ?2)",
+                    rusqlite::params![&key, i64::try_from(generation).unwrap()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+        )
+        .unwrap()
+    };
+    let original_rows = rows_for_generation(1);
+    assert!(original_rows > MAX_SESSION_BATCH_ROWS * 3);
+
+    write_session(
+        root.path(),
+        relative,
+        &[
+            meta("bounded-retired", serde_json::json!("2026-07-26T12:00:00Z")),
+            token("2026-07-26T12:02:00Z", 2, 1, 0),
+        ],
+    );
+    write_session(
+        root.path(),
+        "sessions/2026/07/26/z-cleanup-sibling.jsonl",
+        &[
+            meta(
+                "z-cleanup-sibling",
+                serde_json::json!("2026-07-26T12:02:00Z"),
+            ),
+            token("2026-07-26T12:02:01Z", 3, 1, 0),
+        ],
+    );
+    let replacement = codex_scanner
+        .scan("2026-07-26T12:02:01Z", ScanControl::default())
+        .unwrap();
+    assert_eq!(replacement.outcome, ScanOutcome::Interrupted);
+    assert_eq!(
+        codex_scanner.state().load_current_generation(&key).unwrap(),
+        Some(2)
+    );
+    let after_first_cleanup = rows_for_generation(1);
+    assert!(original_rows - after_first_cleanup <= MAX_SESSION_BATCH_ROWS);
+    assert!(after_first_cleanup > 0);
+    assert!(replacement.sources.iter().any(|source| {
+        source.root_thread_id.as_deref() == Some("z-cleanup-sibling")
+            && source.status == SessionSourceStatus::Available
+    }));
+
+    let mut previous = after_first_cleanup;
+    for attempt in 0..10 {
+        let summary = codex_scanner
+            .scan(
+                &format!("2026-07-26T12:03:{attempt:02}Z"),
+                ScanControl::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            codex_scanner.state().load_current_generation(&key).unwrap(),
+            Some(2)
+        );
+        let remaining = rows_for_generation(1);
+        assert!(previous - remaining <= MAX_SESSION_BATCH_ROWS);
+        previous = remaining;
+        if remaining == 0 {
+            assert_eq!(summary.outcome, ScanOutcome::Complete);
+            break;
+        }
+        assert_eq!(summary.outcome, ScanOutcome::Interrupted);
+    }
+    assert_eq!(previous, 0);
+}
+
+#[test]
+fn one_scan_never_cleans_both_an_old_retired_generation_and_a_newly_retired_generation() {
+    let root = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let relative = "sessions/2026/07/26/one-cleanup-budget.jsonl";
+    let mut generation_one = vec![meta(
+        "one-cleanup-budget",
+        serde_json::json!("2026-07-26T12:00:00Z"),
+    )];
+    for ordinal in 1..=600 {
+        generation_one.push(token("2026-07-26T12:00:01Z", ordinal, ordinal, 0));
+    }
+    write_session(root.path(), relative, &generation_one);
+    let mut codex_scanner = scanner(&root, &state);
+    let first = codex_scanner.scan(NOW, ScanControl::default()).unwrap();
+    let key = first.sources[0].source_key.clone();
+
+    let generation_two = [
+        meta(
+            "one-cleanup-budget",
+            serde_json::json!("2026-07-26T12:00:00Z"),
+        ),
+        token("2026-07-26T12:01:00Z", 2, 1, 0),
+    ];
+    write_session(root.path(), relative, &generation_two);
+    let promoted_two = codex_scanner
+        .scan("2026-07-26T12:01:01Z", ScanControl::default())
+        .unwrap();
+    assert_eq!(promoted_two.outcome, ScanOutcome::Interrupted);
+    let second_cleanup = codex_scanner
+        .scan("2026-07-26T12:01:02Z", ScanControl::default())
+        .unwrap();
+    assert_eq!(second_cleanup.outcome, ScanOutcome::Interrupted);
+    assert_eq!(
+        codex_scanner
+            .state()
+            .load_session_source(&key)
+            .unwrap()
+            .unwrap()
+            .retired_generation,
+        Some(1)
+    );
+
+    let generation_three = [
+        meta(
+            "one-cleanup-budget",
+            serde_json::json!("2026-07-26T12:00:00Z"),
+        ),
+        token("2026-07-26T12:02:00Z", 3, 1, 0),
+    ];
+    write_session(root.path(), relative, &generation_three);
+    let promoted_three = codex_scanner
+        .scan("2026-07-26T12:02:01Z", ScanControl::default())
+        .unwrap();
+    let source = codex_scanner
+        .state()
+        .load_session_source(&key)
+        .unwrap()
+        .unwrap();
+    assert_eq!(source.current_generation, Some(3));
+    assert_eq!(source.retired_generation, Some(2));
+    assert_eq!(promoted_three.outcome, ScanOutcome::Interrupted);
 }
 
 #[test]
@@ -2162,6 +2508,62 @@ fn replay_limit_is_an_end_to_end_stable_resource_outcome() {
 }
 
 #[test]
+fn replay_limit_on_a_current_generation_reports_the_persisted_error_while_stale() {
+    let root = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let relative = "sessions/2026/07/26/current-replay-limit.jsonl";
+    write_session(
+        root.path(),
+        relative,
+        &[
+            meta(
+                "current-replay-limit",
+                serde_json::json!("2026-07-26T12:00:00Z"),
+            ),
+            token("2026-07-26T12:00:01Z", 1, 1, 0),
+            token("2026-07-26T12:00:02Z", 2, 2, 0),
+        ],
+    );
+    let mut codex_scanner = scanner(&root, &state);
+    codex_scanner.set_test_replay_limit(3);
+    let first = codex_scanner.scan(NOW, ScanControl::default()).unwrap();
+    let key = first.sources[0].source_key.clone();
+    let mut writer = OpenOptions::new()
+        .append(true)
+        .open(root.path().join(relative))
+        .unwrap();
+    for ordinal in 3..=4 {
+        serde_json::to_writer(
+            &mut writer,
+            &token("2026-07-26T12:00:03Z", ordinal, ordinal, 0),
+        )
+        .unwrap();
+        writer.write_all(b"\n").unwrap();
+    }
+    writer.flush().unwrap();
+    drop(writer);
+
+    let limited = codex_scanner
+        .scan("2026-07-26T12:01:00Z", ScanControl::default())
+        .unwrap();
+    assert_eq!(limited.sources[0].status, SessionSourceStatus::Stale);
+    assert_eq!(
+        limited.sources[0].error_code,
+        Some(SessionSourceErrorCode::SourceReplayLimit)
+    );
+    let source = codex_scanner
+        .state()
+        .load_session_source(&key)
+        .unwrap()
+        .unwrap();
+    assert_eq!(source.status, SessionSourceStatus::Stale);
+    assert_eq!(
+        source.error_code,
+        Some(SessionSourceErrorCode::SourceReplayLimit)
+    );
+}
+
+#[test]
 fn replay_resolution_resource_failure_is_contained_to_one_child_source() {
     let root = TempDir::new().unwrap();
     let state = TempDir::new().unwrap();
@@ -2225,6 +2627,148 @@ fn replay_resolution_resource_failure_is_contained_to_one_child_source() {
             .load_current_generation(&sibling.source_key)
             .unwrap()
             .is_some()
+    );
+}
+
+#[test]
+fn child_defers_and_keeps_its_current_generation_stale_when_parent_is_nonterminal() {
+    let root = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let parent_path = "sessions/2026/07/26/nonterminal-parent.jsonl";
+    let parent = vec![
+        meta(
+            "nonterminal-parent",
+            serde_json::json!("2026-07-26T12:00:00Z"),
+        ),
+        token("2026-07-26T12:00:01Z", 10, 1, 0),
+    ];
+    write_session(root.path(), parent_path, &parent);
+    let mut child_meta = meta(
+        "nonterminal-child",
+        serde_json::json!("2026-07-26T12:00:02Z"),
+    );
+    child_meta["payload"]["parent_thread_id"] = serde_json::json!("nonterminal-parent");
+    write_session(
+        root.path(),
+        "sessions/2026/07/26/nonterminal-child.jsonl",
+        &[
+            child_meta,
+            parent[1].clone(),
+            token("2026-07-26T12:00:03Z", 15, 2, 0),
+        ],
+    );
+    let mut codex_scanner = scanner(&root, &state);
+    let first = codex_scanner.scan(NOW, ScanControl::default()).unwrap();
+    let child_key = first
+        .sources
+        .iter()
+        .find(|source| source.root_thread_id.as_deref() == Some("nonterminal-child"))
+        .unwrap()
+        .source_key
+        .clone();
+
+    let mut writer = OpenOptions::new()
+        .append(true)
+        .open(root.path().join(parent_path))
+        .unwrap();
+    serde_json::to_writer(
+        &mut writer,
+        &serde_json::json!({
+            "type":"event_msg",
+            "timestamp":"2026-07-26T12:00:04Z",
+            "payload":{"type":"token_count","info":{"total_token_usage":[]}}
+        }),
+    )
+    .unwrap();
+    writer.write_all(b"\n").unwrap();
+    writer.flush().unwrap();
+    drop(writer);
+
+    let failed = codex_scanner
+        .scan("2026-07-26T12:01:00Z", ScanControl::default())
+        .unwrap();
+    let parent_summary = failed
+        .sources
+        .iter()
+        .find(|source| source.root_thread_id.as_deref() == Some("nonterminal-parent"))
+        .unwrap();
+    assert_eq!(parent_summary.status, SessionSourceStatus::Stale);
+    let child_summary = failed
+        .sources
+        .iter()
+        .find(|source| source.root_thread_id.as_deref() == Some("nonterminal-child"))
+        .unwrap();
+    assert_eq!(child_summary.status, SessionSourceStatus::Stale);
+    assert_eq!(
+        child_summary.replay_resolution,
+        ReplayResolution::Deferred(SessionSourceErrorCode::SourceReplayInconsistent)
+    );
+    assert_eq!(
+        codex_scanner
+            .state()
+            .load_current_generation(&child_key)
+            .unwrap(),
+        Some(1)
+    );
+    let child_usage = codex_scanner
+        .state()
+        .load_current_session_usage_page(&child_key, None, 500)
+        .unwrap();
+    assert_eq!(child_usage.items.len(), 1);
+    assert_eq!(
+        codex_scanner
+            .state()
+            .load_session_source(&child_key)
+            .unwrap()
+            .unwrap()
+            .status,
+        SessionSourceStatus::Stale
+    );
+}
+
+#[test]
+fn child_with_a_current_generation_becomes_stale_when_parent_disappears() {
+    let root = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let parent_path = "sessions/2026/07/26/missing-parent-after-success.jsonl";
+    let parent = vec![
+        meta(
+            "missing-parent-after-success",
+            serde_json::json!("2026-07-26T12:00:00Z"),
+        ),
+        token("2026-07-26T12:00:01Z", 10, 1, 0),
+    ];
+    write_session(root.path(), parent_path, &parent);
+    let mut child_meta = meta(
+        "missing-parent-child",
+        serde_json::json!("2026-07-26T12:00:02Z"),
+    );
+    child_meta["payload"]["parent_thread_id"] = serde_json::json!("missing-parent-after-success");
+    write_session(
+        root.path(),
+        "sessions/2026/07/26/missing-parent-child.jsonl",
+        &[
+            child_meta,
+            parent[1].clone(),
+            token("2026-07-26T12:00:03Z", 15, 2, 0),
+        ],
+    );
+    let mut codex_scanner = scanner(&root, &state);
+    codex_scanner.scan(NOW, ScanControl::default()).unwrap();
+    fs::remove_file(root.path().join(parent_path)).unwrap();
+
+    let missing = codex_scanner
+        .scan("2026-07-26T12:01:00Z", ScanControl::default())
+        .unwrap();
+    let child = missing
+        .sources
+        .iter()
+        .find(|source| source.root_thread_id.as_deref() == Some("missing-parent-child"))
+        .unwrap();
+    assert_eq!(child.status, SessionSourceStatus::Stale);
+    assert_eq!(
+        child.replay_resolution,
+        ReplayResolution::Deferred(SessionSourceErrorCode::SourceReplayParentMissing)
     );
 }
 

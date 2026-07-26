@@ -265,7 +265,7 @@ fn staging_loaders_follow_only_the_staging_pointer_and_fail_closed() {
 }
 
 #[test]
-fn unavailable_transition_retains_current_generation_and_is_idempotent() {
+fn missing_transition_keeps_a_current_generation_stale_and_is_idempotent() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("state.sqlite3");
     let source_key = opaque(8_010);
@@ -283,7 +283,7 @@ fn unavailable_transition_retains_current_generation_and_is_idempotent() {
     );
     let source = store.load_session_source(&source_key).unwrap().unwrap();
     assert_eq!(source.current_generation, Some(1));
-    assert_eq!(source.status, SessionSourceStatus::Unavailable);
+    assert_eq!(source.status, SessionSourceStatus::Stale);
     assert_eq!(
         source.error_code,
         Some(SessionSourceErrorCode::SourceSessionsAbsent)
@@ -1634,6 +1634,99 @@ fn repeated_unchanged_success_and_identical_failure_are_zero_write() {
             .items,
         [retained]
     );
+}
+
+#[test]
+fn current_generation_failures_and_deletion_remain_stale_with_aggregates_visible() {
+    let directory = tempfile::tempdir().unwrap();
+    let source_key = opaque(8_100);
+    let mut store = StateStore::open(directory.path().join("state.db")).unwrap();
+    promote_one_record(&mut store, &source_key, 1, 9_100);
+
+    assert!(
+        store
+            .fail_candidate(
+                &source_key,
+                1,
+                SessionSourceErrorCode::SourceReplayLimit,
+                "2026-07-26T00:10:00Z",
+            )
+            .unwrap()
+    );
+    let limited = store.load_session_source(&source_key).unwrap().unwrap();
+    assert_eq!(limited.status, SessionSourceStatus::Stale);
+    assert_eq!(
+        limited.error_code,
+        Some(SessionSourceErrorCode::SourceReplayLimit)
+    );
+
+    assert!(
+        store
+            .mark_source_unavailable(
+                &source_key,
+                SessionSourceErrorCode::SourceSessionsAbsent,
+                "2026-07-26T00:11:00Z",
+            )
+            .unwrap()
+    );
+    let deleted = store.load_session_source(&source_key).unwrap().unwrap();
+    assert_eq!(deleted.status, SessionSourceStatus::Stale);
+    assert_eq!(
+        deleted.error_code,
+        Some(SessionSourceErrorCode::SourceSessionsAbsent)
+    );
+    let index = store
+        .load_current_session_index_page(&source_key, None, 1)
+        .unwrap();
+    assert_eq!(index.items.len(), 1);
+    assert_eq!(
+        index.items[0].availability,
+        SessionAvailability::Unavailable
+    );
+}
+
+#[test]
+fn noop_source_transitions_do_not_wait_for_an_unrelated_writer_lock() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.db");
+    let source_key = opaque(8_101);
+    let mut store = StateStore::open(&path).unwrap();
+    promote_one_record(&mut store, &source_key, 1, 9_101);
+
+    let writer = Connection::open(&path).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+    assert!(
+        !store
+            .record_source_success(&source_key, 1, "2026-07-26T00:10:00Z")
+            .unwrap()
+    );
+    assert!(matches!(
+        store
+            .record_source_success(&opaque(8_102), 1, "2026-07-26T00:10:00Z")
+            .unwrap_err(),
+        StorageError::CandidateStateConflict
+    ));
+
+    writer.execute_batch("ROLLBACK").unwrap();
+    store
+        .mark_source_unavailable(
+            &source_key,
+            SessionSourceErrorCode::SourceSessionsAbsent,
+            "2026-07-26T00:11:00Z",
+        )
+        .unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    assert!(
+        !store
+            .mark_source_unavailable(
+                &source_key,
+                SessionSourceErrorCode::SourceSessionsAbsent,
+                "2026-07-26T00:12:00Z",
+            )
+            .unwrap()
+    );
+    writer.execute_batch("ROLLBACK").unwrap();
 }
 
 #[test]

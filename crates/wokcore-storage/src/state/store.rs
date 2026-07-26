@@ -1798,6 +1798,17 @@ impl StateStore {
         validate_opaque_key("source key", source_key)?;
         validate_generation(generation)?;
         validate_timestamp("source transition timestamp", transition_at)?;
+        let source = query_session_source(&self.connection, source_key)?
+            .ok_or(StorageError::CandidateStateConflict)?;
+        if source.current_generation != Some(generation)
+            && source.staging_generation != Some(generation)
+        {
+            return Err(StorageError::CandidateStateConflict);
+        }
+        let status = failed_source_status(&source, error_code);
+        if source.status == status && source.error_code == Some(error_code) {
+            return Ok(false);
+        }
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1809,15 +1820,8 @@ impl StateStore {
         {
             return Err(StorageError::CandidateStateConflict);
         }
-        let status = if error_code.is_resource_limit() {
-            SessionSourceStatus::ResourceLimited
-        } else if source.current_generation.is_some() {
-            SessionSourceStatus::Stale
-        } else {
-            SessionSourceStatus::Unavailable
-        };
+        let status = failed_source_status(&source, error_code);
         if source.status == status && source.error_code == Some(error_code) {
-            transaction.commit().map_err(map_database_error)?;
             return Ok(false);
         }
         let changed = transaction
@@ -1863,6 +1867,14 @@ impl StateStore {
         validate_opaque_key("source key", source_key)?;
         validate_generation(generation)?;
         validate_timestamp("source transition timestamp", transition_at)?;
+        let source = query_session_source(&self.connection, source_key)?
+            .ok_or(StorageError::CandidateStateConflict)?;
+        if source.current_generation != Some(generation) {
+            return Err(StorageError::CandidateStateConflict);
+        }
+        if source.status == SessionSourceStatus::Available && source.error_code.is_none() {
+            return Ok(false);
+        }
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1873,7 +1885,6 @@ impl StateStore {
             return Err(StorageError::CandidateStateConflict);
         }
         if source.status == SessionSourceStatus::Available && source.error_code.is_none() {
-            transaction.commit().map_err(map_database_error)?;
             return Ok(false);
         }
         let changed = transaction
@@ -1913,29 +1924,44 @@ impl StateStore {
                 "an unavailable source cannot use a resource-limit error code",
             ));
         }
+        let source = query_session_source(&self.connection, source_key)?
+            .ok_or(StorageError::CandidateStateConflict)?;
+        let status = unavailable_source_status(&source);
+        if source.status == status && source.error_code == Some(error_code) {
+            return Ok(false);
+        }
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_database_error)?;
         let source = query_session_source(&transaction, source_key)?
             .ok_or(StorageError::CandidateStateConflict)?;
-        if source.status == SessionSourceStatus::Unavailable
-            && source.error_code == Some(error_code)
-        {
-            transaction.commit().map_err(map_database_error)?;
+        let status = unavailable_source_status(&source);
+        if source.status == status && source.error_code == Some(error_code) {
             return Ok(false);
         }
         let changed = transaction
             .execute(
                 "UPDATE session_sources
-                 SET status = 'unavailable', error_code = ?2, last_transition_at = ?3
+                 SET status = ?2, error_code = ?3, last_transition_at = ?4
                  WHERE source_key = ?1
-                   AND status = ?4
-                   AND error_code IS ?5",
+                   AND current_generation IS ?5
+                   AND staging_generation IS ?6
+                   AND status = ?7
+                   AND error_code IS ?8",
                 params![
                     source_key,
+                    status.as_str(),
                     error_code.as_str(),
                     transition_at,
+                    source
+                        .current_generation
+                        .map(|generation| to_i64(generation, "generation"))
+                        .transpose()?,
+                    source
+                        .staging_generation
+                        .map(|generation| to_i64(generation, "generation"))
+                        .transpose()?,
                     source.status.as_str(),
                     source.error_code.map(SessionSourceErrorCode::as_str),
                 ],
@@ -2766,6 +2792,43 @@ impl StateStore {
         Ok(CodexReplaySignaturePage {
             items,
             next_page_key,
+        })
+    }
+
+    pub fn codex_replay_index_is_complete(
+        &self,
+        parent_source_key: &str,
+        parent_generation: u64,
+        expected_events: u64,
+    ) -> Result<bool, StorageError> {
+        validate_opaque_key("parent source key", parent_source_key)?;
+        validate_generation(parent_generation)?;
+        let (count, minimum, maximum) = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*), MIN(token_event_ordinal), MAX(token_event_ordinal)
+                 FROM codex_replay_signatures
+                 WHERE parent_source_key = ?1 AND parent_generation = ?2",
+                params![
+                    parent_source_key,
+                    to_i64(parent_generation, "parent generation")?
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                    ))
+                },
+            )
+            .map_err(map_database_error)?;
+        let count = database_u64(count, "replay signature count")?;
+        let minimum = optional_u64(minimum, "minimum replay ordinal")?;
+        let maximum = optional_u64(maximum, "maximum replay ordinal")?;
+        Ok(if expected_events == 0 {
+            count == 0 && minimum.is_none() && maximum.is_none()
+        } else {
+            count == expected_events && minimum == Some(1) && maximum == Some(expected_events)
         })
     }
 
@@ -3655,6 +3718,27 @@ fn query_session_source(
         .optional()
         .map_err(map_database_error)?;
     raw.map(session_source_from_database).transpose()
+}
+
+fn failed_source_status(
+    source: &SessionSourceState,
+    error_code: SessionSourceErrorCode,
+) -> SessionSourceStatus {
+    if source.current_generation.is_some() {
+        SessionSourceStatus::Stale
+    } else if error_code.is_resource_limit() {
+        SessionSourceStatus::ResourceLimited
+    } else {
+        SessionSourceStatus::Unavailable
+    }
+}
+
+fn unavailable_source_status(source: &SessionSourceState) -> SessionSourceStatus {
+    if source.current_generation.is_some() {
+        SessionSourceStatus::Stale
+    } else {
+        SessionSourceStatus::Unavailable
+    }
 }
 
 fn session_source_from_database(

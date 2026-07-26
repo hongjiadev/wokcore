@@ -227,17 +227,7 @@ fn consistent_parent(payload: &Map<String, Value>) -> Result<Option<String>, Cod
     for name in ["forked_from_id", "parent_thread_id"] {
         push_optional_string(payload, name, &mut values)?;
     }
-    if let Some(legacy) = payload
-        .get("source")
-        .and_then(Value::as_object)
-        .and_then(|source| source.get("subagent"))
-        .and_then(Value::as_object)
-        .and_then(|subagent| subagent.get("thread_spawn"))
-        .and_then(Value::as_object)
-        .and_then(|spawn| spawn.get("parent_thread_id"))
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-    {
+    if let Some(legacy) = legacy_parent(payload)? {
         values.insert(legacy);
     }
     if values.len() > 1
@@ -248,6 +238,28 @@ fn consistent_parent(payload: &Map<String, Value>) -> Result<Option<String>, Cod
         return Err(CodexError::ParentInconsistent);
     }
     Ok(values.into_iter().next().map(ToOwned::to_owned))
+}
+
+fn legacy_parent(payload: &Map<String, Value>) -> Result<Option<&str>, CodexError> {
+    let Some(Value::Object(source)) = payload.get("source") else {
+        return Ok(None);
+    };
+    let Some(subagent) = source.get("subagent") else {
+        return Ok(None);
+    };
+    let subagent = subagent.as_object().ok_or(CodexError::ParentInconsistent)?;
+    let Some(spawn) = subagent.get("thread_spawn") else {
+        return Ok(None);
+    };
+    let spawn = spawn.as_object().ok_or(CodexError::ParentInconsistent)?;
+    let Some(parent) = spawn.get("parent_thread_id") else {
+        return Ok(None);
+    };
+    let parent = parent.as_str().ok_or(CodexError::ParentInconsistent)?;
+    if parent.is_empty() || parent.len() > THREAD_ID_LIMIT_BYTES {
+        return Err(CodexError::ParentInconsistent);
+    }
+    Ok(Some(parent))
 }
 
 fn push_optional_string<'a>(
@@ -510,6 +522,8 @@ pub enum CodexScannerError {
     RecordTooLarge,
     #[error("Codex replay history exceeds its resource bound")]
     ReplayLimit,
+    #[error("Codex Session generation cleanup is still pending")]
+    CleanupPending,
 }
 
 pub struct CodexScanner {
@@ -561,14 +575,66 @@ impl CodexScanner {
         #[cfg(test)]
         test_hooks::run_after_discovery();
         let persisted_identities = self.persisted_identity_sources()?;
+        let persisted_sources = self.persisted_codex_source_keys()?;
+        let identities = discovered
+            .iter()
+            .map(|source| opaque_file_identity(&self.domain_key, source.identity()))
+            .collect::<Vec<_>>();
+        let mut source_keys = vec![None; discovered.len()];
+        let mut reserved_keys: HashMap<String, String> = HashMap::new();
+        for (index, identity) in identities.iter().enumerate() {
+            let Some(source_key) = persisted_identities.get(identity) else {
+                continue;
+            };
+            if reserved_keys
+                .insert(source_key.clone(), identity.clone())
+                .is_some()
+            {
+                return Err(StorageError::StableRecordConflict {
+                    record_kind: "Session source key",
+                }
+                .into());
+            }
+            source_keys[index] = Some(source_key.clone());
+        }
+        for (index, source) in discovered.iter().enumerate() {
+            if source_keys[index].is_some() {
+                continue;
+            }
+            let identity = &identities[index];
+            let path_key = self.path_source_key(source);
+            let source_key = if !reserved_keys.contains_key(&path_key) {
+                path_key
+            } else {
+                let mut counter = 0u64;
+                loop {
+                    let candidate = self.collision_source_key(source, identity, counter);
+                    if !reserved_keys.contains_key(&candidate)
+                        && !persisted_sources.contains(&candidate)
+                    {
+                        break candidate;
+                    }
+                    counter = counter.checked_add(1).ok_or(CodexScannerError::Parse)?;
+                }
+            };
+            if reserved_keys
+                .insert(source_key.clone(), identity.clone())
+                .is_some()
+            {
+                return Err(StorageError::StableRecordConflict {
+                    record_kind: "Session source key",
+                }
+                .into());
+            }
+            source_keys[index] = Some(source_key);
+        }
         let titles = self.read_titles();
         let mut inspected = Vec::with_capacity(discovered.len());
         for (index, source) in discovered.iter().enumerate() {
-            let identity = opaque_file_identity(&self.domain_key, source.identity());
-            let source_key = persisted_identities
-                .get(&identity)
-                .cloned()
-                .unwrap_or_else(|| self.path_source_key(source));
+            let identity = identities[index].clone();
+            let source_key = source_keys[index]
+                .take()
+                .expect("every discovered source receives one source key");
             match self.inspect_source(source) {
                 Ok(metadata) => inspected.push(InspectedSource {
                     discovered_index: index,
@@ -613,7 +679,6 @@ impl CodexScanner {
             .copied()
             .collect::<HashSet<_>>();
 
-        let persisted_sources = self.persisted_codex_source_keys()?;
         let current_keys = inspected
             .iter()
             .map(|source| source.source_key.clone())
@@ -740,18 +805,28 @@ impl CodexScanner {
                     code,
                     transition_at,
                 )?;
+                let persisted = self.state.load_session_source(&source.source_key)?;
+                let status = persisted.as_ref().map_or_else(
+                    || {
+                        if code == SessionSourceErrorCode::SourceReplayLimit {
+                            SessionSourceStatus::ResourceLimited
+                        } else {
+                            SessionSourceStatus::Unavailable
+                        }
+                    },
+                    |source| source.status,
+                );
                 summaries.push(SourceScanSummary {
                     source_key: source.source_key.clone(),
                     root_thread_id: Some(metadata.root_thread_id.clone()),
                     title: title_for(&titles, &metadata.root_thread_id),
-                    status: if code == SessionSourceErrorCode::SourceReplayLimit {
-                        SessionSourceStatus::ResourceLimited
-                    } else {
-                        SessionSourceStatus::Unavailable
-                    },
+                    status,
                     error_code: Some(code),
                     replay_resolution: ReplayResolution::Deferred(code),
-                    complete_byte_offset: 0,
+                    complete_byte_offset: self
+                        .state
+                        .load_current_session_scan_cursor(&source.source_key)?
+                        .map_or(0, |cursor| cursor.complete_byte_offset),
                 });
                 continue;
             }
@@ -767,8 +842,20 @@ impl CodexScanner {
                 referenced_parent_indices.contains(&work_index),
             ) {
                 Ok(process) => {
-                    let code = (process.status == SessionSourceStatus::ResourceLimited)
-                        .then_some(SessionSourceErrorCode::SourceReplayLimit);
+                    let code = match process.outcome {
+                        SourceProcessOutcome::Interrupted
+                        | SourceProcessOutcome::CleanupPending => {
+                            Some(SessionSourceErrorCode::SourceCandidateInterrupted)
+                        }
+                        _ if process.status == SessionSourceStatus::ResourceLimited => {
+                            Some(SessionSourceErrorCode::SourceReplayLimit)
+                        }
+                        SourceProcessOutcome::Failed => self
+                            .state
+                            .load_session_source(&source.source_key)?
+                            .and_then(|source| source.error_code),
+                        _ => None,
+                    };
                     (process, code)
                 }
                 Err(CodexScannerError::Read) => {
@@ -821,13 +908,6 @@ impl CodexScanner {
                 }
                 Err(CodexScannerError::ReplayInconsistent) => {
                     let code = SessionSourceErrorCode::SourceReplayInconsistent;
-                    if let Some(generation) = self
-                        .state
-                        .load_session_source(&source.source_key)?
-                        .and_then(|source| source.staging_generation)
-                    {
-                        self.cleanup_generation(&source.source_key, generation)?;
-                    }
                     self.record_source_failure_if_possible(
                         source,
                         discovered_source,
@@ -895,6 +975,30 @@ impl CodexScanner {
                         Some(code),
                     )
                 }
+                Err(CodexScannerError::CleanupPending) => {
+                    let code = SessionSourceErrorCode::SourceCandidateInterrupted;
+                    self.record_source_failure_if_possible(
+                        source,
+                        discovered_source,
+                        code,
+                        transition_at,
+                    )?;
+                    let status = self
+                        .state
+                        .load_session_source(&source.source_key)?
+                        .map_or(SessionSourceStatus::Unavailable, |source| source.status);
+                    (
+                        SourceProcessResult {
+                            outcome: SourceProcessOutcome::CleanupPending,
+                            status,
+                            complete_byte_offset: self
+                                .state
+                                .load_current_session_scan_cursor(&source.source_key)?
+                                .map_or(0, |cursor| cursor.complete_byte_offset),
+                        },
+                        Some(code),
+                    )
+                }
                 Err(error) => return Err(error),
             };
             match process.outcome {
@@ -902,6 +1006,9 @@ impl CodexScanner {
                 SourceProcessOutcome::Unchanged => unchanged_sources += 1,
                 SourceProcessOutcome::Failed => {}
                 SourceProcessOutcome::Interrupted => {
+                    overall_outcome = ScanOutcome::Interrupted;
+                }
+                SourceProcessOutcome::CleanupPending => {
                     overall_outcome = ScanOutcome::Interrupted;
                 }
             }
@@ -920,7 +1027,7 @@ impl CodexScanner {
                 },
                 complete_byte_offset: process.complete_byte_offset,
             });
-            if overall_outcome == ScanOutcome::Interrupted {
+            if process.outcome == SourceProcessOutcome::Interrupted {
                 break;
             }
         }
@@ -1007,6 +1114,31 @@ impl CodexScanner {
         )
     }
 
+    fn collision_source_key(
+        &self,
+        source: &DiscoveredSession,
+        identity: &str,
+        counter: u64,
+    ) -> String {
+        let location = match source.location() {
+            SessionLocation::Live => b"live".as_slice(),
+            SessionLocation::Archive => b"archive".as_slice(),
+        };
+        let root_identity = platform_identity_bytes(self.root.identity());
+        let relative = path_bytes(source.relative_path());
+        opaque_hex(
+            &self.domain_key,
+            b"wokcore.codex.source-collision.v1",
+            &[
+                &root_identity,
+                location,
+                &relative,
+                identity.as_bytes(),
+                &counter.to_be_bytes(),
+            ],
+        )
+    }
+
     fn inspect_source(
         &mut self,
         source: &DiscoveredSession,
@@ -1080,8 +1212,17 @@ impl CodexScanner {
                 SessionSourceErrorCode::SourceReplayInconsistent,
             ));
         }
-        let Some(parent_generation) = self.state.load_current_generation(&parent.source_key)?
-        else {
+        let Some(parent_state) = self.state.load_session_source(&parent.source_key)? else {
+            return Ok(ReplayState::deferred(
+                SessionSourceErrorCode::SourceReplayParentMissing,
+            ));
+        };
+        if parent_state.status != SessionSourceStatus::Available {
+            return Ok(ReplayState::deferred(
+                SessionSourceErrorCode::SourceReplayInconsistent,
+            ));
+        }
+        let Some(parent_generation) = parent_state.current_generation else {
             return Ok(ReplayState::deferred(
                 SessionSourceErrorCode::SourceReplayParentMissing,
             ));
@@ -1089,6 +1230,14 @@ impl CodexScanner {
         let parent_cursor = self
             .state
             .load_current_session_scan_cursor(&parent.source_key)?;
+        if parent_cursor
+            .as_ref()
+            .is_none_or(|cursor| cursor.result_code != Some(SessionScanResultCode::Advanced))
+        {
+            return Ok(ReplayState::deferred(
+                SessionSourceErrorCode::SourceReplayInconsistent,
+            ));
+        }
         let (replayed, fingerprint, indexed_events) =
             self.parent_boundary_at(&parent.source_key, parent_generation, &metadata.created_at)?;
         if parent_cursor
@@ -1182,28 +1331,49 @@ impl CodexScanner {
             .state
             .load_current_session_scan_cursor(&source.source_key)?;
         let persisted_source = self.state.load_session_source(&source.source_key)?;
+        let mut cleanup_performed = false;
+        let cleanup_pending = match persisted_source
+            .as_ref()
+            .and_then(|source| source.retired_generation)
+        {
+            Some(retired_generation) => !self.cleanup_generation_once(
+                &source.source_key,
+                retired_generation,
+                &mut cleanup_performed,
+            )?,
+            None => false,
+        };
+        if cleanup_pending {
+            let current_generation = persisted_source
+                .as_ref()
+                .and_then(|source| source.current_generation)
+                .ok_or(CodexScannerError::CleanupPending)?;
+            self.state.fail_candidate(
+                &source.source_key,
+                current_generation,
+                SessionSourceErrorCode::SourceCandidateInterrupted,
+                transition_at,
+            )?;
+            let status = self
+                .state
+                .load_session_source(&source.source_key)?
+                .map_or(SessionSourceStatus::Unavailable, |source| source.status);
+            return Ok(SourceProcessResult {
+                outcome: SourceProcessOutcome::CleanupPending,
+                status,
+                complete_byte_offset: current
+                    .as_ref()
+                    .map_or(0, |cursor| cursor.complete_byte_offset),
+            });
+        }
         let force_replay_rebuild = if builds_parent_index {
             match &current {
                 Some(cursor) if cursor.parser_checkpoint.event_ordinal > 0 => {
-                    let expected = cursor.parser_checkpoint.event_ordinal;
-                    let after = if expected == 1 {
-                        None
-                    } else {
-                        Some(ReplaySignaturePageKey::new(
-                            &source.source_key,
-                            cursor.generation,
-                            expected.checked_sub(1).ok_or(CodexScannerError::Parse)?,
-                        )?)
-                    };
-                    let tail = self.state.load_codex_replay_signature_page(
+                    !self.state.codex_replay_index_is_complete(
                         &source.source_key,
                         cursor.generation,
-                        after.as_ref(),
-                        1,
-                    )?;
-                    tail.items
-                        .first()
-                        .is_none_or(|signature| signature.token_event_ordinal != expected)
+                        cursor.parser_checkpoint.event_ordinal,
+                    )?
                 }
                 _ => false,
             }
@@ -1230,16 +1400,23 @@ impl CodexScanner {
                 && cursor.boundary_fingerprint == current_boundary
                 && lineage_matches
                 && !force_replay_rebuild
+                && cursor.result_code == Some(SessionScanResultCode::Advanced)
                 && persisted_source.as_ref().is_none_or(|state| {
                     state.status == SessionSourceStatus::Available
                         || state.error_code == Some(SessionSourceErrorCode::SourceSessionsAbsent)
+                        || state.error_code
+                            == Some(SessionSourceErrorCode::SourceCandidateInterrupted)
                 })
             {
-                let _ = self.state.record_source_success(
-                    &source.source_key,
-                    cursor.generation,
-                    transition_at,
-                )?;
+                if persisted_source.as_ref().is_none_or(|state| {
+                    state.status != SessionSourceStatus::Available || state.error_code.is_some()
+                }) {
+                    let _ = self.state.record_source_success(
+                        &source.source_key,
+                        cursor.generation,
+                        transition_at,
+                    )?;
+                }
                 return Ok(SourceProcessResult {
                     outcome: SourceProcessOutcome::Unchanged,
                     status: SessionSourceStatus::Available,
@@ -1304,6 +1481,7 @@ impl CodexScanner {
                 current_boundary,
                 replay,
                 transition_at,
+                &mut cleanup_performed,
             )?
         } else {
             current.clone().expect("append has a current cursor")
@@ -1423,15 +1601,21 @@ impl CodexScanner {
                             .checked_add(1)
                             .ok_or(CodexScannerError::Parse)?;
                         if event_ordinal > self.replay_limit {
-                            let _ = self.state.fail_candidate(
+                            self.state.fail_candidate(
                                 &source.source_key,
                                 generation,
                                 SessionSourceErrorCode::SourceReplayLimit,
                                 transition_at,
-                            );
+                            )?;
+                            let status = self
+                                .state
+                                .load_session_source(&source.source_key)?
+                                .map_or(SessionSourceStatus::ResourceLimited, |source| {
+                                    source.status
+                                });
                             return Ok(SourceProcessResult {
                                 outcome: SourceProcessOutcome::Failed,
-                                status: SessionSourceStatus::ResourceLimited,
+                                status,
                                 complete_byte_offset: 0,
                             });
                         }
@@ -1535,6 +1719,7 @@ impl CodexScanner {
                         replay,
                         transition_at,
                         is_candidate,
+                        false,
                         std::mem::take(&mut pending_usage),
                         std::mem::take(&mut pending_replay),
                         Some(session_index(
@@ -1552,9 +1737,19 @@ impl CodexScanner {
                         .stop_after_committed_batches
                         .is_some_and(|maximum| *committed_batches >= maximum)
                     {
+                        self.state.fail_candidate(
+                            &source.source_key,
+                            generation,
+                            SessionSourceErrorCode::SourceCandidateInterrupted,
+                            transition_at,
+                        )?;
+                        let status = self
+                            .state
+                            .load_session_source(&source.source_key)?
+                            .map_or(SessionSourceStatus::Unavailable, |source| source.status);
                         return Ok(SourceProcessResult {
                             outcome: SourceProcessOutcome::Interrupted,
-                            status: SessionSourceStatus::Stale,
+                            status,
                             complete_byte_offset: offset,
                         });
                     }
@@ -1594,6 +1789,7 @@ impl CodexScanner {
             replay,
             transition_at,
             is_candidate,
+            true,
             pending_usage,
             pending_replay,
             Some(index),
@@ -1603,9 +1799,19 @@ impl CodexScanner {
             .stop_after_committed_batches
             .is_some_and(|maximum| *committed_batches >= maximum)
         {
+            self.state.fail_candidate(
+                &source.source_key,
+                generation,
+                SessionSourceErrorCode::SourceCandidateInterrupted,
+                transition_at,
+            )?;
+            let status = self
+                .state
+                .load_session_source(&source.source_key)?
+                .map_or(SessionSourceStatus::Unavailable, |source| source.status);
             return Ok(SourceProcessResult {
                 outcome: SourceProcessOutcome::Interrupted,
-                status: SessionSourceStatus::Stale,
+                status,
                 complete_byte_offset: cursor.complete_byte_offset,
             });
         }
@@ -1613,7 +1819,23 @@ impl CodexScanner {
         if is_candidate {
             self.state
                 .promote_candidate(&source.source_key, generation, transition_at)?;
-            self.cleanup_retired(&source.source_key)?;
+            if !self.cleanup_retired(&source.source_key, &mut cleanup_performed)? {
+                self.state.fail_candidate(
+                    &source.source_key,
+                    generation,
+                    SessionSourceErrorCode::SourceCandidateInterrupted,
+                    transition_at,
+                )?;
+                let status = self
+                    .state
+                    .load_session_source(&source.source_key)?
+                    .map_or(SessionSourceStatus::Unavailable, |source| source.status);
+                return Ok(SourceProcessResult {
+                    outcome: SourceProcessOutcome::CleanupPending,
+                    status,
+                    complete_byte_offset: cursor.complete_byte_offset,
+                });
+            }
         } else {
             let _ =
                 self.state
@@ -1638,6 +1860,7 @@ impl CodexScanner {
         boundary_fingerprint: [u8; 32],
         replay: &ReplayState,
         transition_at: &str,
+        cleanup_performed: &mut bool,
     ) -> Result<SessionScanCursor, CodexScannerError> {
         loop {
             if let Some(staging) = self
@@ -1664,14 +1887,26 @@ impl CodexScanner {
                         match self.state.begin_or_resume_candidate(&staging)? {
                             CandidateBeginOutcome::Resumed(cursor) => return Ok(*cursor),
                             CandidateBeginOutcome::CleanupRequired { generation } => {
-                                self.cleanup_generation(&source.source_key, generation)?;
+                                if !self.cleanup_generation_once(
+                                    &source.source_key,
+                                    generation,
+                                    cleanup_performed,
+                                )? {
+                                    return Err(CodexScannerError::CleanupPending);
+                                }
                                 continue;
                             }
                             CandidateBeginOutcome::Started => return Ok(staging),
                         }
                     }
                 }
-                self.cleanup_generation(&source.source_key, staging.generation)?;
+                if !self.cleanup_generation_once(
+                    &source.source_key,
+                    staging.generation,
+                    cleanup_performed,
+                )? {
+                    return Err(CodexScannerError::CleanupPending);
+                }
                 continue;
             }
             let cursor = SessionScanCursor {
@@ -1697,7 +1932,13 @@ impl CodexScanner {
                 CandidateBeginOutcome::Started => return Ok(cursor),
                 CandidateBeginOutcome::Resumed(cursor) => return Ok(*cursor),
                 CandidateBeginOutcome::CleanupRequired { generation } => {
-                    self.cleanup_generation(&source.source_key, generation)?;
+                    if !self.cleanup_generation_once(
+                        &source.source_key,
+                        generation,
+                        cleanup_performed,
+                    )? {
+                        return Err(CodexScannerError::CleanupPending);
+                    }
                 }
             }
         }
@@ -1720,6 +1961,7 @@ impl CodexScanner {
         replay: &ReplayState,
         transition_at: &str,
         candidate: bool,
+        terminal: bool,
         usage_records: Vec<SessionUsageRecord>,
         replay_signatures: Vec<CodexReplaySignature>,
         index: Option<SessionIndexRecord>,
@@ -1741,7 +1983,11 @@ impl CodexScanner {
         );
         cursor.head_fingerprint = head_fingerprint;
         cursor.boundary_fingerprint = boundary_fingerprint;
-        cursor.result_code = Some(SessionScanResultCode::Advanced);
+        cursor.result_code = Some(if terminal {
+            SessionScanResultCode::Advanced
+        } else {
+            SessionScanResultCode::Deferred
+        });
         cursor.result_changed_at = Some(transition_at.to_owned());
         cursor.parent_source_key = replay.parent_source_key.clone();
         cursor.parent_generation = replay.parent_generation;
@@ -1762,33 +2008,46 @@ impl CodexScanner {
         Ok(cursor)
     }
 
-    fn cleanup_retired(&mut self, source_key: &str) -> Result<(), CodexScannerError> {
+    fn cleanup_retired(
+        &mut self,
+        source_key: &str,
+        cleanup_performed: &mut bool,
+    ) -> Result<bool, CodexScannerError> {
         if let Some(generation) = self
             .state
             .load_session_source(source_key)?
             .and_then(|source| source.retired_generation)
         {
-            self.cleanup_generation(source_key, generation)?;
+            return self.cleanup_generation_once(source_key, generation, cleanup_performed);
         }
-        Ok(())
+        Ok(true)
+    }
+
+    fn cleanup_generation_once(
+        &mut self,
+        source_key: &str,
+        generation: u64,
+        cleanup_performed: &mut bool,
+    ) -> Result<bool, CodexScannerError> {
+        if *cleanup_performed {
+            return Ok(false);
+        }
+        *cleanup_performed = true;
+        self.cleanup_generation(source_key, generation)
     }
 
     fn cleanup_generation(
         &mut self,
         source_key: &str,
         generation: u64,
-    ) -> Result<(), CodexScannerError> {
-        loop {
-            let outcome = self.state.cleanup_generation_batch(
-                source_key,
-                generation,
-                MAX_SESSION_BATCH_ROWS,
-                MAX_SESSION_BATCH_BYTES,
-            )?;
-            if outcome.complete {
-                return Ok(());
-            }
-        }
+    ) -> Result<bool, CodexScannerError> {
+        let outcome = self.state.cleanup_generation_batch(
+            source_key,
+            generation,
+            MAX_SESSION_BATCH_ROWS,
+            MAX_SESSION_BATCH_BYTES,
+        )?;
+        Ok(outcome.complete)
     }
 
     fn record_source_failure(
@@ -1839,7 +2098,9 @@ impl CodexScanner {
         };
         match self.state.begin_or_resume_candidate(&cursor)? {
             CandidateBeginOutcome::CleanupRequired { generation } => {
-                self.cleanup_generation(&source.source_key, generation)?;
+                if !self.cleanup_generation(&source.source_key, generation)? {
+                    return Err(CodexScannerError::CleanupPending);
+                }
                 let _ = self.state.begin_or_resume_candidate(&cursor)?;
             }
             CandidateBeginOutcome::Started | CandidateBeginOutcome::Resumed(_) => {}
@@ -2087,6 +2348,7 @@ enum SourceProcessOutcome {
     Advanced,
     Unchanged,
     Interrupted,
+    CleanupPending,
     Failed,
 }
 
