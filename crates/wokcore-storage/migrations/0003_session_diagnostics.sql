@@ -58,8 +58,6 @@ CREATE TABLE session_index(
 );
 CREATE INDEX session_index_current_order
 ON session_index(source_key, generation, last_active_at DESC, session_key);
-CREATE INDEX session_index_global_current_order
-ON session_index(last_active_at DESC, session_key, source_key, generation);
 CREATE TABLE session_usage_records(
     usage_id TEXT NOT NULL,
     session_key TEXT NOT NULL,
@@ -79,8 +77,6 @@ CREATE TABLE session_usage_records(
 );
 CREATE INDEX session_usage_current_order
 ON session_usage_records(source_key, generation, occurred_at, usage_id);
-CREATE INDEX session_usage_global_current_order
-ON session_usage_records(occurred_at, usage_id, source_key, generation);
 CREATE TABLE codex_replay_signatures(
     parent_source_key TEXT NOT NULL,
     parent_generation INTEGER NOT NULL CHECK(parent_generation > 0),

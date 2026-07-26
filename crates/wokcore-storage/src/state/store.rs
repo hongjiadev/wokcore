@@ -975,7 +975,7 @@ impl ReadOnlyStateStore {
         if has_wal {
             return Self::from_connection(wal::open_replayed(&absolute, &wal_path)?);
         }
-        Self::open_uri(read_only_database_uri(&absolute, has_wal)?)
+        Self::open_uri(read_only_database_uri(&absolute)?)
     }
 
     fn open_uri(uri: String) -> Result<Self, StorageError> {
@@ -4275,7 +4275,7 @@ fn query_runtime_secret_binding(
     }))
 }
 
-fn read_only_database_uri(path: &Path, has_wal: bool) -> Result<String, StorageError> {
+fn read_only_database_uri(path: &Path) -> Result<String, StorageError> {
     let value = path
         .to_str()
         .ok_or_else(|| StorageError::Io {
@@ -4302,11 +4302,7 @@ fn read_only_database_uri(path: &Path, has_wal: bool) -> Result<String, StorageE
     if !encoded.starts_with('/') {
         encoded.insert(0, '/');
     }
-    let options = match has_wal {
-        false => "mode=ro&immutable=1",
-        true => "mode=ro&readonly_shm=1",
-    };
-    Ok(format!("file:{encoded}?{options}"))
+    Ok(format!("file:{encoded}?mode=ro&immutable=1"))
 }
 
 fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {

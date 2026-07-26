@@ -388,7 +388,7 @@ fn schema_three_has_only_compact_session_and_supplemental_columns() {
 }
 
 #[test]
-fn schema_three_has_current_generation_keyset_indexes() {
+fn schema_three_has_only_required_keyset_indexes() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("state.db");
     let _store = StateStore::open(&path).unwrap();
@@ -405,15 +405,15 @@ fn schema_three_has_current_generation_keyset_indexes() {
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
 
-    for expected in [
-        "codex_replay_current_order",
-        "session_index_current_order",
-        "session_index_global_current_order",
-        "session_usage_current_order",
-        "session_usage_global_current_order",
-    ] {
-        assert!(indexes.iter().any(|index| index == expected), "{expected}");
-    }
+    assert_eq!(
+        indexes,
+        [
+            "codex_replay_current_order",
+            "request_supplemental_retention",
+            "session_index_current_order",
+            "session_usage_current_order",
+        ]
+    );
 }
 
 #[test]
