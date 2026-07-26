@@ -89,7 +89,7 @@ fn temporary_is_exclusive_relative_to_the_pinned_parent_and_drop_removes_only_ow
         destination.write_all(b"partial export").unwrap();
         assert!(!target.exists());
         let during = directory_entries(&fixture.export_parent);
-        #[cfg(windows)]
+        #[cfg(any(windows, target_vendor = "apple"))]
         {
             assert_eq!(during.len(), before.len() + 1);
             assert!(during.iter().any(|name| {
@@ -97,7 +97,7 @@ fn temporary_is_exclusive_relative_to_the_pinned_parent_and_drop_removes_only_ow
                     && name != ".wokcore-export-decoy.tmp"
             }));
         }
-        #[cfg(unix)]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         assert_eq!(during, before);
     }
 
@@ -106,7 +106,7 @@ fn temporary_is_exclusive_relative_to_the_pinned_parent_and_drop_removes_only_ow
     assert!(!target.exists());
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[test]
 fn unix_commit_publishes_owned_anonymous_contents_without_a_source_name() {
     let fixture = ExportFixture::new();
