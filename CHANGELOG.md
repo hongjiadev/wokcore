@@ -32,6 +32,7 @@ All notable WokCore changes are documented in this file.
 - Codex Session scans isolate malformed or resource-limited sources, preserve the last promoted generation, detect same-identity rewrites at the committed cursor boundary, resume interrupted candidates across appends and live-to-archive moves, and perform unchanged scans without durable writes.
 - Live diagnostic queries and exports now tolerate the writer-owned empty active segment by using the complete in-memory ring copy while continuing to fail closed for any older unreadable segment.
 - Internal diagnostic-export temporary directories are excluded from event enumeration and cannot be created through the public diagnostic-file API.
+- Windows workspace tests now execute through one fixed `wokcore-test-host.exe` path, preventing loopback-listener tests from presenting a new hash-named program identity after each build.
 - Configuration loading now rejects every field outside top-level `revision`/`server` and nested `server.port`, while preserving invalid source files.
 - Protocol channels, SSE frame aggregation, and Azure/Gemini event aggregation now fail closed at configured memory and event bounds.
 - OpenAI Responses streaming and non-stream aggregation now bound retained output, identifiers, output items, and serialized context and usage values.

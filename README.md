@@ -39,8 +39,13 @@ Session, usage, log, and diagnostic-export endpoints accept either the managemen
 ```powershell
 cargo +1.97.1 fmt --all -- --check
 cargo +1.97.1 clippy --workspace --all-targets --all-features -- -D warnings
-cargo +1.97.1 test --workspace --all-features
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File tests/scripts/run-fixed-test-host.ps1 `
+  -TargetDirectory (Join-Path $PWD "target") `
+  -Offline
 ```
+
+On Windows, the test runner compiles Cargo test artifacts without executing their hash-named files, then runs every artifact sequentially as the fixed `target/wokcore-test-host.exe`. Tests that open loopback listeners therefore keep one stable executable identity. Linux and macOS can run `cargo +1.97.1 test --workspace --all-features` directly.
 
 ## License
 

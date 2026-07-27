@@ -57,8 +57,22 @@ jobs:
         with:
           toolchain: 1.97.1
           target: ${{ matrix.target }}
+      - name: Self-test fixed Windows test host
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/scripts/run-fixed-test-host.tests.ps1
       - name: Test native workspace
+        if: runner.os != 'Windows'
         run: cargo test --workspace --all-features --locked --target ${{ matrix.target }}
+      - name: Test native Windows workspace through fixed host
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: >-
+          powershell.exe -NoProfile -ExecutionPolicy Bypass
+          -File tests/scripts/run-fixed-test-host.ps1
+          -RepositoryRoot "${{ github.workspace }}"
+          -TargetDirectory "${{ github.workspace }}\target"
+          -Target "${{ matrix.target }}"
 
   target-check:
     name: target-check (${{ matrix.target }})
