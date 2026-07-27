@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv6Addr};
 
 use serde::{Deserialize, Serialize};
@@ -82,6 +82,10 @@ pub struct ProviderDefinition {
     pub key_optional: bool,
     #[serde(default)]
     pub allow_key_auth_override: bool,
+    #[serde(default)]
+    pub reasoning_efforts: Vec<String>,
+    #[serde(default)]
+    pub reasoning_effort_map: BTreeMap<String, String>,
     pub capabilities: ProviderCapabilities,
 }
 
@@ -205,6 +209,7 @@ fn validate_provider<'a>(
     if !provider.capabilities.text || !provider.capabilities.streaming {
         return Err(CatalogError::new("invalid_capabilities"));
     }
+    validate_reasoning_metadata(provider)?;
     Ok(())
 }
 
@@ -239,6 +244,38 @@ fn validate_models(provider: &ProviderDefinition) -> Result<(), CatalogError> {
         return Err(CatalogError::new("invalid_default_model"));
     }
     Ok(())
+}
+
+fn validate_reasoning_metadata(provider: &ProviderDefinition) -> Result<(), CatalogError> {
+    if !provider.capabilities.reasoning
+        && (!provider.reasoning_efforts.is_empty() || !provider.reasoning_effort_map.is_empty())
+    {
+        return Err(CatalogError::new("unexpected_reasoning_metadata"));
+    }
+    if provider.reasoning_efforts.len() > 16 || provider.reasoning_effort_map.len() > 32 {
+        return Err(CatalogError::new("too_much_reasoning_metadata"));
+    }
+
+    let mut efforts = BTreeSet::new();
+    for effort in &provider.reasoning_efforts {
+        if !is_safe_reasoning_value(effort) || !efforts.insert(effort) {
+            return Err(CatalogError::new("invalid_reasoning_effort"));
+        }
+    }
+    for (input, wire) in &provider.reasoning_effort_map {
+        if !is_safe_reasoning_value(input) || !is_safe_reasoning_value(wire) {
+            return Err(CatalogError::new("invalid_reasoning_effort_map"));
+        }
+    }
+    Ok(())
+}
+
+fn is_safe_reasoning_value(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
 fn validate_endpoint(endpoint: &str, policy: EndpointPolicy) -> Result<(), CatalogError> {

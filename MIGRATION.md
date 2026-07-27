@@ -297,3 +297,16 @@ Private pre-rewrite recovery material is excluded from this public repository.
   - fixed-host `wokcore-storage` legacy/round-trip/strict-schema/privacy tests;
   - complete Windows workspace suite through `E:/Projects/wokcore/target/wokcore-test-host.exe`;
   - Clippy with `-D warnings` for core, engine, storage, server, and application targets.
+
+## Runtime foundation 13: immutable routing snapshots
+
+- Original WokCore implementation; no external routing or synchronization code is imported.
+- A validated configuration is compiled into one immutable runtime snapshot. `ArcSwap` publishes a complete replacement atomically, readers acquire one `Arc` without a writer lock, and a failed rebuild leaves the last valid snapshot active.
+- Route precedence is explicit Provider/model, model alias, client/model rule, default route, then a typed no-route result. More-specific client-and-model rules precede general rules while equal-specificity rules retain configuration order.
+- Disabled Providers and accounts never enter runtime indices. Candidate iteration borrows the selected immutable Provider/account records without cloning secret references or allocating a per-request candidate collection.
+- Reasoning effort values and configured wire mappings preserve exact validated strings. The public model projection is deterministic, sorted, deduplicated, capability-aware, and excludes endpoints and secret references.
+- Snapshot construction performs no credential resolution, filesystem write, Provider discovery, DNS lookup, background work, or network request.
+- Verification:
+  - fixed-host `wokcore-engine` routing snapshot tests;
+  - complete Windows workspace suite through `E:/Projects/wokcore/target/wokcore-test-host.exe`;
+  - `cargo +1.97.1 clippy -p wokcore-engine --all-targets --offline -- -D warnings`.

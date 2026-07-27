@@ -2382,6 +2382,7 @@ dependencies = [
 name = "wokcore-engine"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "serde",
  "serde_json",
  "thiserror",

@@ -27,6 +27,7 @@ All notable WokCore changes are documented in this file.
 - Typed request diagnostics correlated by response request ID; ordinary request events stay memory-only while internal failures remain durable warning candidates.
 - Internal `wokcore-engine` with a strict, immutable 58-Provider frozen catalog, explicit adapter/auth/endpoint/model/capability metadata, and content-free fail-closed validation.
 - Revisioned Provider instance, account, secret-reference, model-alias, route-rule, and default-route configuration with server-only backward compatibility, strict nested schemas, safe endpoint policy, and redacted debug/error output.
+- Immutable lock-free runtime routing snapshots with deterministic explicit/alias/rule/default precedence, enabled-only zero-copy candidate views, exact reasoning-effort mapping, stable public model metadata, and atomic fail-safe reloads.
 
 ### Fixed
 

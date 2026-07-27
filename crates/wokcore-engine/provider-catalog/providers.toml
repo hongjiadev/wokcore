@@ -223,6 +223,7 @@ endpoint_policy = "https_template"
 model_source = "none"
 aliases = []
 models = []
+allow_endpoint_override = true
 capabilities = { text = true, streaming = true, tools = true, vision = true, images = true, reasoning = true }
 
 [[providers]]
@@ -689,6 +690,7 @@ endpoint_policy = "https_template"
 model_source = "none"
 aliases = []
 models = []
+allow_endpoint_override = true
 capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true }
 
 [[providers]]
@@ -702,6 +704,7 @@ model_source = "static"
 aliases = []
 models = ["@cf/meta/llama-3.3-70b-instruct-fp8-fast", "@cf/qwen/qwq-32b", "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b", "@cf/moonshotai/kimi-k2.7-code", "@cf/zai-org/glm-5.2", "@cf/mistralai/mistral-small-3.1-24b-instruct"]
 default_model = "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+allow_endpoint_override = true
 capabilities = { text = true, streaming = true, tools = true, vision = false, images = false, reasoning = true }
 
 [[providers]]
