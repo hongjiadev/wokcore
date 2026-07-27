@@ -1656,7 +1656,9 @@ fn map_source_read_error(error: SessionError) -> MessagePagerError {
         SessionError::SessionFileChanged | SessionError::SessionFileUnavailable => {
             MessagePagerError::StaleCursor
         }
-        SessionError::ReadLimitExceeded => MessagePagerError::ResourceLimit,
+        SessionError::ReadLimitExceeded | SessionError::CleanupLimitExceeded => {
+            MessagePagerError::ResourceLimit
+        }
         SessionError::MissingPlatformData { .. }
         | SessionError::UnsafePath
         | SessionError::EnumerationLimitExceeded
@@ -2401,8 +2403,9 @@ mod tests {
     use super::{
         LegacyMessageArrayScanner, MAX_JSONL_PAGE_SOURCE_WORK_BYTES,
         MAX_MESSAGE_PAGE_SEEK_WORK_BYTES, MessagePagerError, SourceWorkBudget,
-        gemini_checkpoint_element_spans,
+        gemini_checkpoint_element_spans, map_source_read_error,
     };
+    use wokcore_platform::sessions::SessionError;
 
     fn legacy_refs(bytes: &[u8]) -> Result<Vec<&[u8]>, MessagePagerError> {
         let mut scanner = LegacyMessageArrayScanner::default();
@@ -2450,6 +2453,14 @@ mod tests {
         assert!(matches!(
             seek_over.consume_seek((MAX_MESSAGE_PAGE_SEEK_WORK_BYTES + 1) as usize),
             Err(MessagePagerError::ResourceLimit)
+        ));
+    }
+
+    #[test]
+    fn cleanup_limit_maps_to_message_resource_limit() {
+        assert!(matches!(
+            map_source_read_error(SessionError::CleanupLimitExceeded),
+            MessagePagerError::ResourceLimit
         ));
     }
 

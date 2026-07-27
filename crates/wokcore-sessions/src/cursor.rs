@@ -105,6 +105,7 @@ impl From<SessionError> for JsonlError {
             SessionError::MissingPlatformData { .. }
             | SessionError::EnumerationLimitExceeded
             | SessionError::ReadLimitExceeded
+            | SessionError::CleanupLimitExceeded
             | SessionError::Io { .. } => Self::ReadFailed,
         }
     }
@@ -298,11 +299,18 @@ impl JsonlReader {
 
 #[cfg(test)]
 mod tests {
-    use super::{JsonlCursor, JsonlReader};
+    use super::{JsonlCursor, JsonlError, JsonlReader};
+    use wokcore_platform::sessions::SessionError;
 
     #[test]
     fn raw_fingerprinting_is_opt_in() {
         let mut reader = JsonlReader::new(JsonlCursor::new(0, 1));
         assert!(reader.finish_raw_fingerprint(0).is_none());
+    }
+
+    #[test]
+    fn cleanup_limit_maps_to_bounded_read_failure() {
+        let error = JsonlError::from(SessionError::CleanupLimitExceeded);
+        assert_eq!(error.stable_code(), "session_read_failed");
     }
 }

@@ -371,7 +371,7 @@ closed_code! {
         RequestFailed => "request_failed",
         RetryDecision => "retry_decision",
         FailoverDecision => "failover_decision",
-        DiagnosticDrop => "diagnostic_drop",
+        DiagnosticDrop => "diagnostics.events_dropped",
     }
 }
 
@@ -622,6 +622,62 @@ pub struct Measurements {
     tokens: TokenCounts,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiagnosticDropCounts {
+    ingress_full: u64,
+    ingress_closed: u64,
+    writer_failures: u64,
+    invalid_events: u64,
+    oversized_events: u64,
+}
+
+impl DiagnosticDropCounts {
+    pub const fn new(
+        ingress_full: u64,
+        ingress_closed: u64,
+        writer_failures: u64,
+        invalid_events: u64,
+        oversized_events: u64,
+    ) -> Self {
+        Self {
+            ingress_full,
+            ingress_closed,
+            writer_failures,
+            invalid_events,
+            oversized_events,
+        }
+    }
+
+    pub const fn ingress_full(self) -> u64 {
+        self.ingress_full
+    }
+
+    pub const fn ingress_closed(self) -> u64 {
+        self.ingress_closed
+    }
+
+    pub const fn writer_failures(self) -> u64 {
+        self.writer_failures
+    }
+
+    pub const fn invalid_events(self) -> u64 {
+        self.invalid_events
+    }
+
+    pub const fn oversized_events(self) -> u64 {
+        self.oversized_events
+    }
+
+    pub const fn total(self) -> u64 {
+        self.ingress_full
+            .saturating_add(self.ingress_closed)
+            .saturating_add(self.writer_failures)
+            .saturating_add(self.invalid_events)
+            .saturating_add(self.oversized_events)
+    }
+}
+
 impl Measurements {
     pub const fn new(
         stage: StageCode,
@@ -810,6 +866,7 @@ pub struct DiagnosticEvent {
     decision: Option<DiagnosticDecision>,
     measurements: Option<Measurements>,
     error: Option<DiagnosticError>,
+    diagnostic_drop: Option<DiagnosticDropCounts>,
     summaries: Box<[SafeSummary]>,
     redaction_counts: RedactionCounts,
 }
@@ -862,6 +919,11 @@ impl DiagnosticEventDraft {
         self
     }
 
+    pub fn with_diagnostic_drop_counts(mut self, counts: DiagnosticDropCounts) -> Self {
+        self.0.diagnostic_drop = Some(counts);
+        self
+    }
+
     pub fn with_redacted_summaries(
         mut self,
         summaries: crate::redaction::RedactedSummaries,
@@ -903,6 +965,7 @@ impl DiagnosticEvent {
             decision: None,
             measurements: None,
             error: None,
+            diagnostic_drop: None,
             summaries: Box::new([]),
             redaction_counts: RedactionCounts::new(0, 0, 0, 0, 0, 0),
         }
@@ -940,6 +1003,18 @@ impl DiagnosticEvent {
     pub const fn event_id(&self) -> EventId {
         self.event_id
     }
+
+    pub const fn code(&self) -> DiagnosticEventCode {
+        self.code
+    }
+
+    pub const fn level(&self) -> DiagnosticLevel {
+        self.level
+    }
+
+    pub const fn diagnostic_drop_counts(&self) -> Option<DiagnosticDropCounts> {
+        self.diagnostic_drop
+    }
 }
 
 impl fmt::Debug for DiagnosticEvent {
@@ -963,6 +1038,14 @@ pub(crate) struct DiagnosticEventTemplate {
 
 impl DiagnosticEventDraft {
     pub(crate) fn prepare_template(self) -> Result<DiagnosticEventTemplate, DiagnosticBuildError> {
+        if (self.0.code == DiagnosticEventCode::DiagnosticDrop)
+            != self
+                .0
+                .diagnostic_drop
+                .is_some_and(|counts| counts.total() != 0)
+        {
+            return Err(DiagnosticBuildError::InvalidValue);
+        }
         let event_id = self.0.event_id;
         let encoded =
             serde_json::to_vec(&self.0).map_err(|_| DiagnosticBuildError::Serialization)?;
@@ -1061,6 +1144,7 @@ impl Serialize for DiagnosticEvent {
             decision: &'a Option<DiagnosticDecision>,
             measurements: &'a Option<Measurements>,
             error: &'a Option<DiagnosticError>,
+            diagnostic_drop: &'a Option<DiagnosticDropCounts>,
             summaries: &'a [SafeSummary],
             redaction_counts: RedactionCounts,
         }
@@ -1078,6 +1162,7 @@ impl Serialize for DiagnosticEvent {
             decision: &self.decision,
             measurements: &self.measurements,
             error: &self.error,
+            diagnostic_drop: &self.diagnostic_drop,
             summaries: &self.summaries,
             redaction_counts: self.redaction_counts,
         }
@@ -1125,6 +1210,7 @@ struct DecodeEvent {
     decision: Option<DecodeDecision>,
     measurements: Option<DecodeMeasurements>,
     error: Option<DecodeError>,
+    diagnostic_drop: Option<DecodeDiagnosticDropCounts>,
     summaries: BoundedSequence<DecodeSummary, MAX_EVENT_SUMMARIES>,
     redaction_counts: DecodeRedactionCounts,
 }
@@ -1193,6 +1279,16 @@ struct DecodeError {
     platform: Box<str>,
 }
 
+#[derive(Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DecodeDiagnosticDropCounts {
+    ingress_full: u64,
+    ingress_closed: u64,
+    writer_failures: u64,
+    invalid_events: u64,
+    oversized_events: u64,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DecodeSummary {
@@ -1259,52 +1355,92 @@ where
 
 impl DiagnosticEvent {
     pub fn decode(encoded: &[u8]) -> Result<Self, DiagnosticDecodeError> {
-        if encoded.is_empty() || encoded.len() > MAX_PREPARED_EVENT_BYTES {
-            return Err(DiagnosticDecodeError::Invalid);
-        }
-        let wire: DecodeEvent =
-            serde_json::from_slice(encoded).map_err(|_| DiagnosticDecodeError::Invalid)?;
-        wire.try_into()
+        decode_event(encoded, false)
     }
+}
+
+pub(crate) fn decode_trusted_prepared_encoding(
+    encoded: &[u8],
+) -> Result<DiagnosticEvent, DiagnosticDecodeError> {
+    decode_event(encoded, true)
+}
+
+fn decode_event(
+    encoded: &[u8],
+    allow_truncated_summary: bool,
+) -> Result<DiagnosticEvent, DiagnosticDecodeError> {
+    if encoded.is_empty() || encoded.len() > MAX_PREPARED_EVENT_BYTES {
+        return Err(DiagnosticDecodeError::Invalid);
+    }
+    let wire: DecodeEvent =
+        serde_json::from_slice(encoded).map_err(|_| DiagnosticDecodeError::Invalid)?;
+    decode_event_wire(wire, allow_truncated_summary)
 }
 
 impl TryFrom<DecodeEvent> for DiagnosticEvent {
     type Error = DiagnosticDecodeError;
 
     fn try_from(wire: DecodeEvent) -> Result<Self, Self::Error> {
-        let sequence = decode_sequence(&wire.sequence)?;
-        if wire.schema_version != 1 {
-            return Err(DiagnosticDecodeError::Invalid);
-        }
-        let correlations = wire.correlations.map(TryInto::try_into).transpose()?;
-        let provider = wire.provider.map(TryInto::try_into).transpose()?;
-        let decision = wire.decision.map(TryInto::try_into).transpose()?;
-        let measurements = wire.measurements.map(TryInto::try_into).transpose()?;
-        let error = wire.error.map(TryInto::try_into).transpose()?;
-        let summaries = wire
-            .summaries
-            .0
-            .into_iter()
-            .map(TryInto::try_into)
-            .collect::<Result<Vec<_>, _>>()?
-            .into_boxed_slice();
-        Ok(Self {
-            schema_version: 1,
-            sequence,
-            event_id: EventId::parse(&wire.event_id).map_err(decode_invalid)?,
-            occurred_at: UtcTimestamp::parse(&wire.occurred_at).map_err(decode_invalid)?,
-            level: decode_level(&wire.level)?,
-            component: decode_component(&wire.component)?,
-            code: decode_event_code(&wire.code)?,
-            correlations,
-            build: wire.build.try_into()?,
-            provider,
-            decision,
-            measurements,
-            error,
-            summaries,
-            redaction_counts: wire.redaction_counts.into(),
-        })
+        decode_event_wire(wire, false)
+    }
+}
+
+fn decode_event_wire(
+    wire: DecodeEvent,
+    allow_truncated_summary: bool,
+) -> Result<DiagnosticEvent, DiagnosticDecodeError> {
+    let sequence = decode_sequence(&wire.sequence)?;
+    if wire.schema_version != 1 {
+        return Err(DiagnosticDecodeError::Invalid);
+    }
+    let correlations = wire.correlations.map(TryInto::try_into).transpose()?;
+    let provider = wire.provider.map(TryInto::try_into).transpose()?;
+    let decision = wire.decision.map(TryInto::try_into).transpose()?;
+    let measurements = wire.measurements.map(TryInto::try_into).transpose()?;
+    let error = wire.error.map(TryInto::try_into).transpose()?;
+    let code = decode_event_code(&wire.code)?;
+    let diagnostic_drop = wire.diagnostic_drop.map(Into::into);
+    if (code == DiagnosticEventCode::DiagnosticDrop)
+        != diagnostic_drop.is_some_and(|counts: DiagnosticDropCounts| counts.total() != 0)
+    {
+        return Err(DiagnosticDecodeError::Invalid);
+    }
+    let summaries = wire
+        .summaries
+        .0
+        .into_iter()
+        .map(|summary| decode_summary(summary, allow_truncated_summary))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_boxed_slice();
+    Ok(DiagnosticEvent {
+        schema_version: 1,
+        sequence,
+        event_id: EventId::parse(&wire.event_id).map_err(decode_invalid)?,
+        occurred_at: UtcTimestamp::parse(&wire.occurred_at).map_err(decode_invalid)?,
+        level: decode_level(&wire.level)?,
+        component: decode_component(&wire.component)?,
+        code,
+        correlations,
+        build: wire.build.try_into()?,
+        provider,
+        decision,
+        measurements,
+        error,
+        diagnostic_drop,
+        summaries,
+        redaction_counts: wire.redaction_counts.into(),
+    })
+}
+
+impl From<DecodeDiagnosticDropCounts> for DiagnosticDropCounts {
+    fn from(wire: DecodeDiagnosticDropCounts) -> Self {
+        Self::new(
+            wire.ingress_full,
+            wire.ingress_closed,
+            wire.writer_failures,
+            wire.invalid_events,
+            wire.oversized_events,
+        )
     }
 }
 
@@ -1443,18 +1579,90 @@ impl TryFrom<DecodeSummary> for SafeSummary {
     type Error = DiagnosticDecodeError;
 
     fn try_from(wire: DecodeSummary) -> Result<Self, Self::Error> {
-        if wire.truncated || !valid_structural_summary(&wire.text) {
-            return Err(DiagnosticDecodeError::Invalid);
-        }
-        let summary = Self::from_already_safe(&wire.text).map_err(decode_invalid)?;
-        let digest = decode_digest(&wire.full_safe_sha256)?;
-        if summary.original_safe_utf8_bytes != wire.original_safe_utf8_bytes
-            || summary.full_safe_sha256 != digest
+        decode_summary(wire, false)
+    }
+}
+
+fn decode_summary(
+    wire: DecodeSummary,
+    allow_truncated: bool,
+) -> Result<SafeSummary, DiagnosticDecodeError> {
+    let digest = decode_digest(&wire.full_safe_sha256)?;
+    if wire.truncated {
+        let original_safe_utf8_bytes = usize::try_from(wire.original_safe_utf8_bytes)
+            .map_err(|_| DiagnosticDecodeError::Invalid)?;
+        if !allow_truncated
+            || wire.text.len() > MAX_SAFE_SUMMARY_BYTES
+            || original_safe_utf8_bytes <= wire.text.len()
+            || !valid_structural_summary_prefix(&wire.text)
         {
             return Err(DiagnosticDecodeError::Invalid);
         }
-        Ok(summary)
+        return Ok(SafeSummary {
+            text: wire.text,
+            truncated: true,
+            original_safe_utf8_bytes: wire.original_safe_utf8_bytes,
+            full_safe_sha256: digest,
+        });
     }
+    if !valid_structural_summary(&wire.text) {
+        return Err(DiagnosticDecodeError::Invalid);
+    }
+    let summary = SafeSummary::from_already_safe(&wire.text).map_err(decode_invalid)?;
+    if summary.original_safe_utf8_bytes != wire.original_safe_utf8_bytes
+        || summary.full_safe_sha256 != digest
+    {
+        return Err(DiagnosticDecodeError::Invalid);
+    }
+    Ok(summary)
+}
+
+fn valid_structural_summary_prefix(value: &str) -> bool {
+    let Some((header, observations)) = value.split_once(";observations=") else {
+        return false;
+    };
+    let candidate = format!("{header};observations=none");
+    valid_structural_summary(&candidate) && valid_structural_observations_prefix(observations)
+}
+
+fn valid_structural_observations_prefix(value: &str) -> bool {
+    const OBSERVATIONS: [&str; 7] = [
+        "none",
+        "admission_accepted",
+        "route_selected",
+        "cache_hit",
+        "cache_miss",
+        r#"shape={"event":"provider_response","fields":["status","duration","tokens"],"escaped":"\\\""}"#,
+        "category=结构化诊断",
+    ];
+    const EMOJI: &str = "category=stream_🧪_👩‍💻";
+
+    let mut parts = value.split('|').peekable();
+    let mut count = 0usize;
+    while let Some(part) = parts.next() {
+        count = count.saturating_add(1);
+        if count > crate::redaction::MAX_STRUCTURAL_OBSERVATIONS {
+            return false;
+        }
+        let is_last = parts.peek().is_none();
+        if !is_last
+            && !OBSERVATIONS
+                .iter()
+                .copied()
+                .chain(std::iter::once(EMOJI))
+                .any(|candidate| candidate == part)
+        {
+            return false;
+        }
+        if is_last {
+            return OBSERVATIONS
+                .iter()
+                .copied()
+                .chain(std::iter::once(EMOJI))
+                .any(|candidate| candidate.starts_with(part));
+        }
+    }
+    false
 }
 
 fn valid_structural_summary(value: &str) -> bool {
@@ -1601,7 +1809,7 @@ decode_code!(decode_event_code, DiagnosticEventCode, {
     "request_failed" => RequestFailed,
     "retry_decision" => RetryDecision,
     "failover_decision" => FailoverDecision,
-    "diagnostic_drop" => DiagnosticDrop,
+    "diagnostics.events_dropped" => DiagnosticDrop,
 });
 decode_code!(decode_protocol, ProviderProtocol, {
     "open_ai_responses" => OpenAiResponses,

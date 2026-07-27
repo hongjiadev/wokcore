@@ -5,7 +5,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use wokcore_platform::sessions::{PinnedExportDestination, SessionError, SessionRootLease};
+use wokcore_platform::sessions::{
+    MAX_PINNED_EXPORT_READ_BYTES, PinnedExportDestination, SessionError, SessionRootLease,
+};
 
 #[test]
 fn destination_parent_must_exist_and_be_a_verifiable_directory() {
@@ -75,8 +77,9 @@ fn target_symlink_reparse_existing_file_and_hardlink_fail_before_temporary_creat
     }
 }
 
+#[cfg(any(windows, target_vendor = "apple"))]
 #[test]
-fn temporary_is_exclusive_relative_to_the_pinned_parent_and_drop_removes_only_owned_file() {
+fn named_temporary_is_exclusive_and_drop_removes_only_the_owned_entry() {
     let fixture = ExportFixture::new();
     let decoy = fixture.export_parent.join(".wokcore-export-decoy.tmp");
     fs::write(&decoy, b"decoy").unwrap();
@@ -89,16 +92,11 @@ fn temporary_is_exclusive_relative_to_the_pinned_parent_and_drop_removes_only_ow
         destination.write_all(b"partial export").unwrap();
         assert!(!target.exists());
         let during = directory_entries(&fixture.export_parent);
-        #[cfg(any(windows, target_vendor = "apple"))]
-        {
-            assert_eq!(during.len(), before.len() + 1);
-            assert!(during.iter().any(|name| {
-                name.to_string_lossy().starts_with(".wokcore-export-")
-                    && name != ".wokcore-export-decoy.tmp"
-            }));
-        }
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        assert_eq!(during, before);
+        assert_eq!(during.len(), before.len() + 1);
+        assert!(during.iter().any(|name| {
+            name.to_string_lossy().starts_with(".wokcore-export-")
+                && name != ".wokcore-export-decoy.tmp"
+        }));
     }
 
     assert_eq!(directory_entries(&fixture.export_parent), before);
@@ -108,7 +106,24 @@ fn temporary_is_exclusive_relative_to_the_pinned_parent_and_drop_removes_only_ow
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[test]
-fn unix_commit_publishes_owned_anonymous_contents_without_a_source_name() {
+fn anonymous_temporary_drop_preserves_foreign_decoy_without_publishing() {
+    let fixture = ExportFixture::new();
+    let decoy = fixture.export_parent.join(".wokcore-export-decoy.tmp");
+    fs::write(&decoy, b"decoy").unwrap();
+    let target = fixture.export_parent.join("drop.zip");
+    let mut destination = PinnedExportDestination::create(&target, &[&fixture.session]).unwrap();
+    destination.write_all(b"partial export").unwrap();
+    assert!(!target.exists());
+
+    drop(destination);
+
+    assert_eq!(fs::read(decoy).unwrap(), b"decoy");
+    assert!(!target.exists());
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[test]
+fn anonymous_commit_links_owned_contents_without_touching_a_foreign_decoy() {
     let fixture = ExportFixture::new();
     let target = fixture.export_parent.join("anonymous.zip");
     let mut destination = PinnedExportDestination::create(&target, &[&fixture.session]).unwrap();
@@ -116,21 +131,11 @@ fn unix_commit_publishes_owned_anonymous_contents_without_a_source_name() {
     let decoy = fixture.export_parent.join(".wokcore-export-forged.tmp");
     fs::write(&decoy, b"forged replacement").unwrap();
 
-    assert_eq!(
-        directory_entries(&fixture.export_parent),
-        vec![OsString::from(".wokcore-export-forged.tmp")]
-    );
+    assert!(!target.exists());
     destination.commit().unwrap();
 
     assert_eq!(fs::read(&target).unwrap(), b"owned anonymous contents");
     assert_eq!(fs::read(&decoy).unwrap(), b"forged replacement");
-    assert_eq!(
-        directory_entries(&fixture.export_parent),
-        vec![
-            OsString::from(".wokcore-export-forged.tmp"),
-            OsString::from("anonymous.zip"),
-        ]
-    );
 }
 
 #[test]
@@ -148,6 +153,68 @@ fn commit_is_same_directory_create_new_and_leaves_no_temporary_entry() {
         vec![OsString::from("diagnostics.zip")]
     );
     assert!(directory_entries(&fixture.session_path).is_empty());
+}
+
+#[test]
+fn owned_temporary_can_be_verified_with_bounded_reads_before_commit() {
+    let fixture = ExportFixture::new();
+    let target = fixture.export_parent.join("verified.zip");
+    let mut destination = PinnedExportDestination::create(&target, &[&fixture.session]).unwrap();
+    destination.write_all(b"0123456789").unwrap();
+
+    destination.sync_data().unwrap();
+    assert_eq!(destination.len().unwrap(), 10);
+    assert_eq!(destination.read_owned_range(3, 4).unwrap(), b"3456");
+    assert_eq!(destination.read_owned_range(10, 8).unwrap(), b"");
+    assert!(!target.exists());
+
+    destination.commit().unwrap();
+    assert_eq!(fs::read(target).unwrap(), b"0123456789");
+}
+
+#[cfg(windows)]
+#[test]
+fn verified_owned_temporary_blocks_external_length_changes() {
+    let fixture = ExportFixture::new();
+    let target = fixture.export_parent.join("changed-after-verify.zip");
+    let mut destination = PinnedExportDestination::create(&target, &[&fixture.session]).unwrap();
+    destination.write_all(b"verified").unwrap();
+    destination.sync_data().unwrap();
+    assert_eq!(destination.read_owned_range(0, 64).unwrap(), b"verified");
+    let temporary = fs::read_dir(&fixture.export_parent)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(".wokcore-export-"))
+        })
+        .unwrap();
+    assert!(fs::OpenOptions::new().append(true).open(temporary).is_err());
+    destination.commit().unwrap();
+    assert_eq!(fs::read(target).unwrap(), b"verified");
+}
+
+#[test]
+fn owned_temporary_reads_enforce_the_hard_chunk_limit_and_freeze_writes() {
+    let fixture = ExportFixture::new();
+    let target = fixture.export_parent.join("bounded-read.zip");
+    let mut destination = PinnedExportDestination::create(&target, &[&fixture.session]).unwrap();
+    destination
+        .write_all(&vec![b'x'; MAX_PINNED_EXPORT_READ_BYTES + 1])
+        .unwrap();
+
+    assert_eq!(
+        destination
+            .read_owned_range(0, MAX_PINNED_EXPORT_READ_BYTES)
+            .unwrap()
+            .len(),
+        MAX_PINNED_EXPORT_READ_BYTES
+    );
+    assert!(matches!(
+        destination.read_owned_range(0, MAX_PINNED_EXPORT_READ_BYTES + 1),
+        Err(SessionError::ReadLimitExceeded)
+    ));
+    assert!(destination.write_all(b"late").is_err());
 }
 
 #[test]

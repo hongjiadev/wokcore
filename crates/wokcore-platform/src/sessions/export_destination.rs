@@ -1,5 +1,6 @@
-#[cfg(not(target_vendor = "apple"))]
 use std::fs::File;
+#[cfg(not(target_vendor = "apple"))]
+use std::io::{Read, Seek, SeekFrom};
 use std::{
     ffi::{OsStr, OsString},
     io::{self, Write},
@@ -14,9 +15,13 @@ use super::file::SessionFileIdentity;
 #[cfg(windows)]
 use super::file::recheck_regular_child_identity;
 use super::file::{
-    DirectoryChain, SessionRootLease, child_exists, file_identity, validate_child_name,
-    validate_directory_chain,
+    DirectoryChain, SessionFileKind, SessionFileSnapshot, SessionRootLease, child_exists,
+    file_identity, snapshot_file, validate_child_name, validate_directory_chain,
 };
+#[cfg(target_vendor = "apple")]
+use super::file::{ensure_single_link, open_child_for_update};
+
+pub const MAX_PINNED_EXPORT_READ_BYTES: usize = 64 * 1024;
 
 pub struct PinnedExportDestination {
     parent: DirectoryChain,
@@ -26,7 +31,21 @@ pub struct PinnedExportDestination {
     temporary: Option<ExportTemporary>,
     #[cfg(not(target_vendor = "apple"))]
     temporary_identity: SessionFileIdentity,
+    verification: Option<ExportVerification>,
     committed: bool,
+}
+
+struct ExportVerification {
+    file: File,
+    snapshot: SessionFileSnapshot,
+}
+
+pub(crate) struct PinnedPublishedFile {
+    pub(crate) file: File,
+    pub(crate) parent: DirectoryChain,
+    pub(crate) name: OsString,
+    pub(crate) snapshot: SessionFileSnapshot,
+    pub(crate) snapshot_requires_adoption: bool,
 }
 
 #[cfg(not(target_vendor = "apple"))]
@@ -56,8 +75,9 @@ impl ApplePublishStability {
     fn capture(
         parent: &DirectoryChain,
         session_roots: &[DirectoryChain],
+        published_object: &File,
     ) -> Result<Self, SessionError> {
-        let watcher = apple::PublishWatcher::start(parent, session_roots)?;
+        let watcher = apple::PublishWatcher::start(parent, session_roots, published_object)?;
         let parent_ancestors = parent.capture_ancestor_stability()?;
         let root_stabilities = session_roots
             .iter()
@@ -126,13 +146,27 @@ impl PinnedExportDestination {
             .file_name()
             .ok_or(SessionError::UnsafePath)?
             .to_os_string();
-        validate_child_name(&target_name)?;
-
         let parent = SessionRootLease::open(parent_path)?.into_chain();
         let session_roots = session_roots
             .iter()
             .map(|root| root.clone_chain())
             .collect::<Result<Vec<_>, _>>()?;
+        Self::create_pinned(parent, session_roots, target_name)
+    }
+
+    pub(crate) fn create_in_directory(
+        parent: DirectoryChain,
+        target_name: &OsStr,
+    ) -> Result<Self, SessionError> {
+        Self::create_pinned(parent, Vec::new(), target_name.to_os_string())
+    }
+
+    fn create_pinned(
+        parent: DirectoryChain,
+        session_roots: Vec<DirectoryChain>,
+        target_name: OsString,
+    ) -> Result<Self, SessionError> {
+        validate_child_name(&target_name)?;
         validate_export_boundary(&parent, &session_roots)?;
         if child_exists(&parent, &target_name)? {
             return Err(SessionError::UnsafePath);
@@ -164,20 +198,192 @@ impl PinnedExportDestination {
             temporary: Some(temporary.file),
             #[cfg(not(target_vendor = "apple"))]
             temporary_identity,
+            verification: None,
             committed: false,
         })
     }
 
-    pub fn commit(mut self) -> Result<(), SessionError> {
+    /// Returns the heap capacity retained by this pinned destination.
+    ///
+    /// The value is stable across verification because open file handles, verification
+    /// snapshots, and the Apple temporary object are stored inline. Buffers returned by
+    /// bounded reads are caller-owned and are not retained by the destination.
+    pub fn resident_allocation_bytes(&self) -> Result<usize, SessionError> {
+        let parent = self
+            .parent
+            .resident_allocation_bytes()
+            .ok_or(SessionError::ReadLimitExceeded)?;
+        let session_root_slots = self
+            .session_roots
+            .capacity()
+            .checked_mul(std::mem::size_of::<DirectoryChain>())
+            .ok_or(SessionError::ReadLimitExceeded)?;
+        let mut total = checked_resident_allocation_sum([
+            parent,
+            session_root_slots,
+            self.target_name.capacity(),
+            self.temporary_name.as_ref().map_or(0, OsString::capacity),
+        ])?;
+        for root in &self.session_roots {
+            total = checked_resident_allocation_sum([
+                total,
+                root.resident_allocation_bytes()
+                    .ok_or(SessionError::ReadLimitExceeded)?,
+            ])?;
+        }
+        Ok(total)
+    }
+
+    pub fn len(&mut self) -> Result<u64, SessionError> {
+        self.freeze_for_verification().map(|snapshot| snapshot.size)
+    }
+
+    pub fn sync_data(&mut self) -> Result<(), SessionError> {
+        self.freeze_for_verification().map(drop)
+    }
+
+    pub fn is_empty(&mut self) -> Result<bool, SessionError> {
+        self.len().map(|length| length == 0)
+    }
+
+    pub(crate) fn validate_frozen_regular_file(
+        &mut self,
+        maximum_size: u64,
+    ) -> Result<(), SessionError> {
+        let snapshot = self.freeze_for_verification()?;
+        if snapshot.kind != SessionFileKind::RegularFile || snapshot.size > maximum_size {
+            return Err(SessionError::UnsafePath);
+        }
+        Ok(())
+    }
+
+    pub fn read_owned_range(
+        &mut self,
+        offset: u64,
+        maximum_bytes: usize,
+    ) -> Result<Vec<u8>, SessionError> {
+        if maximum_bytes > MAX_PINNED_EXPORT_READ_BYTES {
+            return Err(SessionError::ReadLimitExceeded);
+        }
+        let snapshot = self.freeze_for_verification()?;
+        self.revalidate_verification()?;
+        let temporary = self
+            .temporary
+            .as_mut()
+            .expect("an uncommitted export owns its temporary file");
+        let bytes = read_temporary_range(temporary, offset, maximum_bytes)?;
+        let expected = if offset >= snapshot.size {
+            0
+        } else {
+            usize::try_from(
+                u64::try_from(maximum_bytes)
+                    .unwrap_or(u64::MAX)
+                    .min(snapshot.size - offset),
+            )
+            .map_err(|_| SessionError::ReadLimitExceeded)?
+        };
+        if bytes.len() != expected {
+            return Err(SessionError::UnsafePath);
+        }
+        self.revalidate_verification()?;
+        Ok(bytes)
+    }
+
+    fn freeze_for_verification(&mut self) -> Result<SessionFileSnapshot, SessionError> {
+        if let Some(verification) = &self.verification {
+            self.revalidate_verification()?;
+            return Ok(verification.snapshot.clone());
+        }
+        self.revalidate_owned_temporary()?;
         let temporary = self
             .temporary
             .as_mut()
             .expect("an uncommitted export owns its temporary file");
         sync_temporary(temporary)?;
+        let file = open_temporary_verification_file(
+            &self.parent,
+            self.temporary_name.as_deref(),
+            temporary,
+            #[cfg(not(target_vendor = "apple"))]
+            self.temporary_identity,
+        )?;
+        let snapshot = snapshot_file(&file)?;
+        self.revalidate_owned_temporary()?;
+        self.verification = Some(ExportVerification {
+            file,
+            snapshot: snapshot.clone(),
+        });
+        self.revalidate_verification()?;
+        Ok(snapshot)
+    }
+
+    fn revalidate_verification(&self) -> Result<(), SessionError> {
+        self.revalidate_owned_temporary()?;
+        let verification = self.verification.as_ref().ok_or(SessionError::UnsafePath)?;
+        if snapshot_file(&verification.file)? != verification.snapshot {
+            return Err(SessionError::UnsafePath);
+        }
+        self.revalidate_owned_temporary()
+    }
+
+    fn revalidate_owned_temporary(&self) -> Result<(), SessionError> {
+        validate_export_boundary(&self.parent, &self.session_roots)?;
+        let temporary = self
+            .temporary
+            .as_ref()
+            .expect("an uncommitted export owns its temporary file");
+        ensure_unpublished_temporary(&self.parent, temporary)?;
+        #[cfg(not(target_vendor = "apple"))]
+        if file_identity(temporary)? != self.temporary_identity {
+            return Err(SessionError::UnsafePath);
+        }
+        #[cfg(windows)]
+        recheck_regular_child_identity(
+            &self.parent,
+            self.temporary_name
+                .as_deref()
+                .expect("a Windows temporary has a source name"),
+            self.temporary_identity,
+        )?;
+        validate_export_boundary(&self.parent, &self.session_roots)
+    }
+
+    pub fn commit(self) -> Result<(), SessionError> {
+        self.commit_pinned().map(drop)
+    }
+
+    pub(crate) fn commit_pinned(mut self) -> Result<PinnedPublishedFile, SessionError> {
+        let frozen = self.freeze_for_verification()?;
+        let published_parent = clone_published_parent(&self.parent)?;
+        let published_name = self.target_name.clone();
+        #[cfg(target_vendor = "apple")]
+        prepare_temporary_for_publish(
+            self.temporary
+                .as_mut()
+                .expect("an uncommitted export owns its temporary file"),
+        )?;
+        #[cfg(target_vendor = "apple")]
+        let publish_stability = ApplePublishStability::capture(
+            &self.parent,
+            &self.session_roots,
+            &self
+                .verification
+                .as_ref()
+                .expect("a frozen export owns its verification handle")
+                .file,
+        )?;
+        self.revalidate_verification()?;
+        #[cfg(target_vendor = "apple")]
+        publish_stability.verify(&self.parent, &self.session_roots)?;
         #[cfg(all(test, windows))]
         commit_synchronization_tests::hit(CommitSynchronizationPoint::BeforeBoundaryValidation);
         validate_export_boundary(&self.parent, &self.session_roots)?;
-        ensure_unpublished_temporary(&self.parent, temporary)?;
+        ensure_unpublished_temporary(
+            &self.parent,
+            self.temporary
+                .as_ref()
+                .expect("an uncommitted export owns its temporary file"),
+        )?;
         #[cfg(windows)]
         recheck_regular_child_identity(
             &self.parent,
@@ -189,30 +395,191 @@ impl PinnedExportDestination {
         if child_exists(&self.parent, &self.target_name)? {
             return Err(SessionError::UnsafePath);
         }
-        prepare_temporary_for_publish(temporary)?;
-        #[cfg(target_vendor = "apple")]
-        let publish_stability = ApplePublishStability::capture(&self.parent, &self.session_roots)?;
-        publish_relative_noreplace(
-            &self.parent,
-            temporary,
-            self.temporary_name.as_deref(),
-            &self.target_name,
+        #[cfg(not(target_vendor = "apple"))]
+        prepare_temporary_for_publish(
+            self.temporary
+                .as_mut()
+                .expect("an uncommitted export owns its temporary file"),
         )?;
         #[cfg(target_vendor = "apple")]
         {
+            self.revalidate_verification()?;
+            publish_stability.verify(&self.parent, &self.session_roots)?;
+        }
+        #[cfg(all(test, target_vendor = "apple"))]
+        apple_synchronization_tests::hit(
+            AppleSynchronizationPoint::AfterFinalVerificationBeforePublish,
+        );
+        publish_relative_noreplace(
+            &self.parent,
+            self.temporary
+                .as_mut()
+                .expect("an uncommitted export owns its temporary file"),
+            self.temporary_name.as_deref(),
+            &self.target_name,
+        )?;
+        #[cfg(all(test, windows))]
+        commit_synchronization_tests::hit(CommitSynchronizationPoint::AfterPublishLinearized);
+        #[cfg(all(test, windows))]
+        if let Some(identity) = POST_PUBLISH_PARENT_IDENTITY.with(|injected| injected.take()) {
+            self.parent
+                .directories
+                .last_mut()
+                .expect("an export parent chain is never empty")
+                .identity = identity;
+        }
+        #[cfg(target_vendor = "apple")]
+        let published_snapshot = {
             publish_stability.verify(&self.parent, &self.session_roots)?;
             validate_export_boundary(&self.parent, &self.session_roots)?;
+            let verification = &self
+                .verification
+                .as_ref()
+                .expect("a frozen export owns its verification handle")
+                .file;
+            ensure_single_link(verification)?;
+            let snapshot = snapshot_file(verification)?;
+            let current = open_child_for_update(&self.parent, &self.target_name)?;
+            ensure_single_link(&current)?;
+            if !same_published_object(&snapshot, &frozen) || snapshot_file(&current)? != snapshot {
+                return Err(SessionError::UnsafePath);
+            }
             publish_stability.verify(&self.parent, &self.session_roots)?;
-            temporary.disarm_published()?;
-        }
+            self.temporary
+                .as_mut()
+                .expect("a published export still owns its exact object")
+                .disarm_published();
+            snapshot
+        };
+        let verification = self
+            .verification
+            .take()
+            .expect("a committed frozen export owns its verification handle");
+        #[cfg(not(target_vendor = "apple"))]
+        let (published_snapshot, snapshot_requires_adoption) =
+            match snapshot_file_after_publish(&verification.file) {
+                Ok(snapshot) if same_published_object(&snapshot, &frozen) => (snapshot, false),
+                Ok(_) | Err(_) => (frozen, true),
+            };
+        #[cfg(target_vendor = "apple")]
+        let snapshot_requires_adoption = false;
         self.committed = true;
         self.temporary = None;
-        Ok(())
+        Ok(PinnedPublishedFile {
+            file: verification.file,
+            parent: published_parent,
+            name: published_name,
+            snapshot: published_snapshot,
+            snapshot_requires_adoption,
+        })
     }
+}
+
+fn checked_resident_allocation_sum(
+    parts: impl IntoIterator<Item = usize>,
+) -> Result<usize, SessionError> {
+    parts.into_iter().try_fold(0_usize, |total, part| {
+        total
+            .checked_add(part)
+            .ok_or(SessionError::ReadLimitExceeded)
+    })
+}
+
+fn same_published_object(candidate: &SessionFileSnapshot, expected: &SessionFileSnapshot) -> bool {
+    candidate.identity == expected.identity
+        && candidate.size == expected.size
+        && candidate.kind == expected.kind
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn snapshot_file_after_publish(file: &File) -> Result<SessionFileSnapshot, SessionError> {
+    #[cfg(test)]
+    if FAIL_POST_PUBLISH_SNAPSHOT.with(|injected| injected.replace(false)) {
+        return Err(SessionError::Io {
+            source: io::Error::other("injected post-publish snapshot failure"),
+        });
+    }
+    snapshot_file(file)
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn read_temporary_range(
+    temporary: &mut ExportTemporary,
+    offset: u64,
+    maximum_bytes: usize,
+) -> Result<Vec<u8>, SessionError> {
+    let original = temporary.stream_position()?;
+    let result = (|| {
+        let length = temporary.metadata()?.len();
+        if offset >= length || maximum_bytes == 0 {
+            return Ok(Vec::new());
+        }
+        temporary.seek(SeekFrom::Start(offset))?;
+        let maximum = u64::try_from(maximum_bytes)
+            .unwrap_or(u64::MAX)
+            .min(length - offset);
+        let mut bytes = Vec::with_capacity(usize::try_from(maximum).unwrap_or(maximum_bytes));
+        Read::by_ref(temporary)
+            .take(maximum)
+            .read_to_end(&mut bytes)?;
+        Ok(bytes)
+    })();
+    let restored = temporary.seek(SeekFrom::Start(original));
+    match (result, restored) {
+        (Ok(bytes), Ok(_)) => Ok(bytes),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(SessionError::Io { source: error }),
+    }
+}
+
+#[cfg(target_vendor = "apple")]
+fn read_temporary_range(
+    temporary: &mut ExportTemporary,
+    offset: u64,
+    maximum_bytes: usize,
+) -> Result<Vec<u8>, SessionError> {
+    temporary.read_range(offset, maximum_bytes)
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn open_temporary_verification_file(
+    _parent: &DirectoryChain,
+    _temporary_name: Option<&OsStr>,
+    temporary: &ExportTemporary,
+    expected: SessionFileIdentity,
+) -> Result<File, SessionError> {
+    if file_identity(temporary)? != expected {
+        return Err(SessionError::UnsafePath);
+    }
+    let verification = temporary.try_clone()?;
+    if file_identity(&verification)? != expected {
+        return Err(SessionError::UnsafePath);
+    }
+    Ok(verification)
+}
+
+#[cfg(target_vendor = "apple")]
+fn open_temporary_verification_file(
+    parent: &DirectoryChain,
+    temporary_name: Option<&OsStr>,
+    temporary: &ExportTemporary,
+) -> Result<File, SessionError> {
+    let temporary_name = temporary_name.ok_or(SessionError::UnsafePath)?;
+    let published = open_child_for_update(parent, temporary_name)?;
+    let identity = file_identity(&published)?;
+    temporary.verify_published_identity(identity)?;
+    validate_directory_chain(parent)?;
+    Ok(published)
 }
 
 impl Write for PinnedExportDestination {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if self.verification.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "pinned export is frozen for verification",
+            ));
+        }
         write_temporary(
             self.temporary
                 .as_mut()
@@ -286,6 +653,8 @@ fn flush_temporary(temporary: &mut ExportTemporary) -> io::Result<()> {
 }
 
 fn sync_temporary(temporary: &mut ExportTemporary) -> Result<(), SessionError> {
+    #[cfg(test)]
+    SYNC_TEMPORARY_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
     temporary.sync_all()?;
     Ok(())
 }
@@ -361,8 +730,7 @@ fn create_relative_temporary(
             INVALID_HANDLE_VALUE,
         },
         Storage::FileSystem::{
-            DELETE, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-            SYNCHRONIZE,
+            DELETE, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ, SYNCHRONIZE,
         },
     };
 
@@ -443,7 +811,7 @@ fn create_relative_temporary(
                     &mut io_status,
                     ptr::null(),
                     FILE_ATTRIBUTE_NORMAL,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    FILE_SHARE_READ | FILE_SHARE_DELETE,
                     2,
                     0x40 | 0x20 | 0x0020_0000,
                     ptr::null(),
@@ -788,6 +1156,7 @@ mod apple {
     const CATALOG_PERMISSIONS: CatalogInfoBitmap = 0x0000_0400;
     const READ_WRITE_PERMISSION: i8 = 3;
     const AT_MARK: u16 = 0;
+    const FROM_START: u16 = 1;
     const DO_NOT_MOVE_ACROSS_VOLUMES: OptionBits = 4;
 
     #[repr(C)]
@@ -894,6 +1263,15 @@ mod apple {
             buffer: *const c_void,
             actual_count: *mut ByteCount,
         ) -> OsErr;
+        fn FSReadFork(
+            fork: FsIoRefNum,
+            position_mode: u16,
+            position_offset: i64,
+            request_count: ByteCount,
+            buffer: *mut c_void,
+            actual_count: *mut ByteCount,
+        ) -> OsErr;
+        fn FSGetForkSize(fork: FsIoRefNum, size: *mut i64) -> OsErr;
         fn FSFlushFork(fork: FsIoRefNum) -> OsErr;
         fn FSCloseFork(fork: FsIoRefNum) -> OsErr;
         fn FSGetCatalogInfo(
@@ -934,6 +1312,7 @@ mod apple {
         pub(super) fn start(
             parent: &DirectoryChain,
             session_roots: &[DirectoryChain],
+            published_object: &File,
         ) -> Result<Self, SessionError> {
             let queue = unsafe { libc::kqueue() };
             if queue < 0 {
@@ -942,7 +1321,7 @@ mod apple {
                 });
             }
             let queue = unsafe { OwnedFd::from_raw_fd(queue) };
-            let watched_events = libc::NOTE_DELETE | libc::NOTE_RENAME | libc::NOTE_REVOKE;
+            let directory_events = libc::NOTE_DELETE | libc::NOTE_RENAME | libc::NOTE_REVOKE;
             let mut changes = Vec::new();
             for directory in parent.directories.iter().chain(
                 session_roots
@@ -953,11 +1332,22 @@ mod apple {
                     ident: directory.file.as_raw_fd() as libc::uintptr_t,
                     filter: libc::EVFILT_VNODE,
                     flags: libc::EV_ADD | libc::EV_CLEAR,
-                    fflags: watched_events,
+                    fflags: directory_events,
                     data: 0,
                     udata: ptr::null_mut(),
                 });
             }
+            changes.push(libc::kevent {
+                ident: published_object.as_raw_fd() as libc::uintptr_t,
+                filter: libc::EVFILT_VNODE,
+                flags: libc::EV_ADD | libc::EV_CLEAR,
+                fflags: libc::NOTE_WRITE
+                    | libc::NOTE_EXTEND
+                    | libc::NOTE_DELETE
+                    | libc::NOTE_REVOKE,
+                data: 0,
+                udata: ptr::null_mut(),
+            });
             let change_count =
                 libc::c_int::try_from(changes.len()).map_err(|_| SessionError::UnsafePath)?;
             let status = unsafe {
@@ -1208,6 +1598,61 @@ mod apple {
             self.flush_fork()
         }
 
+        pub(super) fn len(&self) -> Result<u64, SessionError> {
+            let fork = self
+                .fork
+                .as_ref()
+                .and_then(|fork| fork.raw)
+                .ok_or(SessionError::UnsafePath)?;
+            let mut size = 0_i64;
+            let status = unsafe { FSGetForkSize(fork, &mut size) };
+            if status != NO_ERR {
+                return Err(carbon_error("FSGetForkSize", i32::from(status)));
+            }
+            u64::try_from(size).map_err(|_| SessionError::UnsafePath)
+        }
+
+        pub(super) fn read_range(
+            &mut self,
+            offset: u64,
+            maximum_bytes: usize,
+        ) -> Result<Vec<u8>, SessionError> {
+            let length = self.len()?;
+            if offset >= length || maximum_bytes == 0 {
+                return Ok(Vec::new());
+            }
+            let fork = self
+                .fork
+                .as_ref()
+                .and_then(|fork| fork.raw)
+                .ok_or(SessionError::UnsafePath)?;
+            let maximum = u64::try_from(maximum_bytes)
+                .unwrap_or(u64::MAX)
+                .min(length - offset);
+            let capacity = usize::try_from(maximum).map_err(|_| SessionError::ReadLimitExceeded)?;
+            let position = i64::try_from(offset).map_err(|_| SessionError::ReadLimitExceeded)?;
+            let mut bytes = vec![0_u8; capacity];
+            let mut actual_count = 0;
+            let status = unsafe {
+                FSReadFork(
+                    fork,
+                    FROM_START,
+                    position,
+                    capacity,
+                    bytes.as_mut_ptr().cast(),
+                    &mut actual_count,
+                )
+            };
+            if status != NO_ERR {
+                return Err(carbon_error("FSReadFork", i32::from(status)));
+            }
+            if actual_count > capacity {
+                return Err(SessionError::UnsafePath);
+            }
+            bytes.truncate(actual_count);
+            Ok(bytes)
+        }
+
         fn flush_fork(&self) -> Result<(), SessionError> {
             let fork = self
                 .fork
@@ -1292,12 +1737,17 @@ mod apple {
             Ok(())
         }
 
-        pub(super) fn disarm_published(&mut self) -> Result<(), SessionError> {
-            if self.fork.is_some() || !self.object.owned {
-                return Err(SessionError::UnsafePath);
-            }
+        pub(super) fn disarm_published(&mut self) {
+            debug_assert!(self.fork.is_none());
+            debug_assert!(self.object.owned);
             self.object.owned = false;
-            Ok(())
+        }
+
+        pub(super) fn verify_published_identity(
+            &self,
+            identity: SessionFileIdentity,
+        ) -> Result<(), SessionError> {
+            verify_catalog_node_identity(&self.object.reference, identity)
         }
 
         pub(super) fn remove_owned(&mut self) -> Result<(), SessionError> {
@@ -1451,6 +1901,14 @@ mod apple {
 #[cfg(test)]
 std::thread_local! {
     static FAIL_TEMPORARY_IDENTITY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_PUBLISHED_PARENT_CLONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    #[cfg(not(target_vendor = "apple"))]
+    static FAIL_POST_PUBLISH_SNAPSHOT: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    static SYNC_TEMPORARY_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    #[cfg(windows)]
+    static POST_PUBLISH_PARENT_IDENTITY: std::cell::Cell<Option<SessionFileIdentity>> =
+        const { std::cell::Cell::new(None) };
     #[cfg(target_vendor = "apple")]
     static FAIL_APPLE_UNLINK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     #[cfg(target_vendor = "apple")]
@@ -1466,6 +1924,16 @@ std::thread_local! {
 #[cfg(test)]
 fn temporary_identity_failure_injected() -> bool {
     FAIL_TEMPORARY_IDENTITY.with(|injected| injected.replace(false))
+}
+
+fn clone_published_parent(parent: &DirectoryChain) -> Result<DirectoryChain, SessionError> {
+    #[cfg(test)]
+    if FAIL_PUBLISHED_PARENT_CLONE.with(|injected| injected.replace(false)) {
+        return Err(SessionError::Io {
+            source: io::Error::other("injected published parent clone failure"),
+        });
+    }
+    super::file::clone_directory_chain(parent)
 }
 
 #[cfg(all(test, target_vendor = "apple"))]
@@ -1500,6 +1968,7 @@ enum AppleSynchronizationPoint {
     AfterPathMakeRef,
     BeforeIdentityOpen,
     AfterIdentityOpen,
+    AfterFinalVerificationBeforePublish,
     BeforeObjectBoundPublish,
     AfterObjectBoundPublish,
 }
@@ -1595,6 +2064,7 @@ mod apple_synchronization_tests {
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum CommitSynchronizationPoint {
     BeforeBoundaryValidation,
+    AfterPublishLinearized,
 }
 
 #[cfg(all(test, windows))]
@@ -1676,10 +2146,16 @@ mod commit_synchronization_tests {
 
 #[cfg(test)]
 mod tests {
-    use std::{ffi::OsString, fs};
+    use std::{ffi::OsString, fs, mem::size_of};
 
+    #[cfg(windows)]
+    use std::io::Read;
     #[cfg(any(windows, target_vendor = "apple"))]
     use std::io::Write;
+    #[cfg(all(not(windows), not(target_vendor = "apple")))]
+    use std::io::Write;
+    #[cfg(not(target_vendor = "apple"))]
+    use std::io::{Seek, SeekFrom};
     #[cfg(windows)]
     use std::{
         sync::{Arc, mpsc},
@@ -1689,6 +2165,169 @@ mod tests {
     use crate::sessions::{SessionError, SessionRootLease};
 
     use super::PinnedExportDestination;
+
+    #[test]
+    fn resident_allocation_counts_deep_parent_many_roots_and_owned_names_exactly() {
+        let root = tempfile::tempdir().unwrap();
+        let export_parent = root.path().join("exports").join("deep").join("parent");
+        fs::create_dir_all(&export_parent).unwrap();
+        let mut session_paths = Vec::new();
+        for index in 0..9 {
+            let session = root
+                .path()
+                .join("sessions")
+                .join(format!("group-{index}"))
+                .join("deep")
+                .join("root");
+            fs::create_dir_all(&session).unwrap();
+            session_paths.push(session);
+        }
+        let session_roots = session_paths
+            .iter()
+            .map(SessionRootLease::open)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let session_refs = session_roots.iter().collect::<Vec<_>>();
+        let target = export_parent.join("diagnostics-export.zip");
+        let destination = PinnedExportDestination::create(&target, &session_refs).unwrap();
+        let expected = destination
+            .parent
+            .resident_allocation_bytes()
+            .unwrap()
+            .checked_add(
+                destination
+                    .session_roots
+                    .capacity()
+                    .checked_mul(size_of::<super::DirectoryChain>())
+                    .unwrap(),
+            )
+            .and_then(|total| {
+                destination
+                    .session_roots
+                    .iter()
+                    .try_fold(total, |total, root| {
+                        total.checked_add(root.resident_allocation_bytes().unwrap())
+                    })
+            })
+            .and_then(|total| total.checked_add(destination.target_name.capacity()))
+            .and_then(|total| {
+                total.checked_add(
+                    destination
+                        .temporary_name
+                        .as_ref()
+                        .map_or(0, OsString::capacity),
+                )
+            })
+            .unwrap();
+
+        assert_eq!(destination.resident_allocation_bytes().unwrap(), expected);
+    }
+
+    #[test]
+    fn resident_allocation_overflow_is_reported_as_a_bounded_read_error() {
+        assert!(matches!(
+            super::checked_resident_allocation_sum([usize::MAX, 1]),
+            Err(SessionError::ReadLimitExceeded)
+        ));
+    }
+
+    #[cfg(not(target_vendor = "apple"))]
+    #[test]
+    fn frozen_destination_rejects_same_length_mutation_of_the_owned_object() {
+        let root = tempfile::tempdir().unwrap();
+        let export_parent = root.path().join("exports");
+        fs::create_dir(&export_parent).unwrap();
+        let parent = SessionRootLease::open(&export_parent).unwrap();
+        let mut destination = PinnedExportDestination::create_in_directory(
+            parent.clone_chain().unwrap(),
+            OsString::from("diagnostics.zip").as_os_str(),
+        )
+        .unwrap();
+        destination.write_all(b"original").unwrap();
+        destination.sync_data().unwrap();
+        let mut external = destination
+            .temporary
+            .as_ref()
+            .expect("an uncommitted export owns its temporary file")
+            .try_clone()
+            .unwrap();
+        external.seek(SeekFrom::Start(0)).unwrap();
+        external.write_all(b"mutated!").unwrap();
+        external.sync_all().unwrap();
+
+        assert!(matches!(
+            destination.commit_pinned(),
+            Err(SessionError::UnsafePath)
+        ));
+        assert!(!export_parent.join("diagnostics.zip").exists());
+    }
+
+    #[cfg(not(target_vendor = "apple"))]
+    #[test]
+    fn frozen_destination_syncs_once_across_bounded_reads_and_commit() {
+        super::SYNC_TEMPORARY_CALLS.with(|calls| calls.set(0));
+        let root = tempfile::tempdir().unwrap();
+        let export_parent = root.path().join("exports");
+        fs::create_dir(&export_parent).unwrap();
+        let parent = SessionRootLease::open(&export_parent).unwrap();
+        let mut destination = PinnedExportDestination::create_in_directory(
+            parent.clone_chain().unwrap(),
+            OsString::from("diagnostics.zip").as_os_str(),
+        )
+        .unwrap();
+        destination.write_all(b"original").unwrap();
+        destination.sync_data().unwrap();
+        assert_eq!(destination.read_owned_range(0, 4).unwrap(), b"orig");
+        assert_eq!(destination.read_owned_range(4, 4).unwrap(), b"inal");
+        assert_eq!(destination.len().unwrap(), 8);
+        destination.commit_pinned().unwrap();
+
+        assert_eq!(super::SYNC_TEMPORARY_CALLS.with(std::cell::Cell::get), 1);
+    }
+
+    #[test]
+    fn published_parent_clone_failure_happens_before_target_linearization() {
+        let root = tempfile::tempdir().unwrap();
+        let export_parent = root.path().join("exports");
+        fs::create_dir(&export_parent).unwrap();
+        let parent = SessionRootLease::open(&export_parent).unwrap();
+        let target = export_parent.join("diagnostics.zip");
+        let mut destination = PinnedExportDestination::create_in_directory(
+            parent.clone_chain().unwrap(),
+            OsString::from("diagnostics.zip").as_os_str(),
+        )
+        .unwrap();
+        destination.write_all(b"original").unwrap();
+        super::FAIL_PUBLISHED_PARENT_CLONE.with(|injected| injected.set(true));
+
+        assert!(destination.commit_pinned().is_err());
+        assert!(!target.exists());
+        assert!(fs::read_dir(export_parent).unwrap().next().is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_owned_temporary_never_allows_a_second_writer() {
+        use std::fs::OpenOptions;
+
+        let root = tempfile::tempdir().unwrap();
+        let export_parent = root.path().join("exports");
+        fs::create_dir(&export_parent).unwrap();
+        let parent = SessionRootLease::open(&export_parent).unwrap();
+        let destination = PinnedExportDestination::create_in_directory(
+            parent.clone_chain().unwrap(),
+            OsString::from("diagnostics.zip").as_os_str(),
+        )
+        .unwrap();
+        let temporary = export_parent.join(
+            destination
+                .temporary_name
+                .as_ref()
+                .expect("a Windows temporary has a source name"),
+        );
+
+        assert!(OpenOptions::new().write(true).open(temporary).is_err());
+    }
 
     #[cfg(windows)]
     #[test]
@@ -1756,6 +2395,149 @@ mod tests {
         assert!(directory_entries(&holding_parent).is_empty());
         assert!(!moved_temporary.exists());
         assert!(directory_entries(&session_path).is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pinned_commit_returns_the_exact_object_after_target_replacement_following_linearization() {
+        let root = tempfile::tempdir().unwrap();
+        let export_parent = root.path().join("exports");
+        fs::create_dir(&export_parent).unwrap();
+        let parent = SessionRootLease::open(&export_parent).unwrap();
+        let target = export_parent.join("diagnostics.zip");
+        let mut destination = PinnedExportDestination::create_in_directory(
+            parent.clone_chain().unwrap(),
+            OsString::from("diagnostics.zip").as_os_str(),
+        )
+        .unwrap();
+        destination.write_all(b"published").unwrap();
+
+        let (thread_tx, thread_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            thread_tx.send(thread::current().id()).unwrap();
+            destination.commit_pinned()
+        });
+        let worker_id = thread_rx.recv().unwrap();
+        let window = Arc::new(super::commit_synchronization_tests::HookWindow::new());
+        super::commit_synchronization_tests::install(
+            worker_id,
+            super::CommitSynchronizationPoint::AfterPublishLinearized,
+            Arc::clone(&window),
+        );
+        window.wait_until_reached();
+        let relocated = export_parent.join("published-relocated");
+        fs::rename(&target, &relocated).unwrap();
+        fs::write(&target, b"foreign").unwrap();
+        window.resume_operation();
+
+        let mut published = worker.join().unwrap().unwrap();
+        super::commit_synchronization_tests::uninstall(worker_id);
+        let mut bytes = Vec::new();
+        published.file.seek(SeekFrom::Start(0)).unwrap();
+        published.file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"published");
+        assert_eq!(fs::read(target).unwrap(), b"foreign");
+        assert_eq!(fs::read(relocated).unwrap(), b"published");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pinned_commit_has_no_fallible_boundary_check_after_target_linearization() {
+        let root = tempfile::tempdir().unwrap();
+        let export_parent = root.path().join("exports");
+        fs::create_dir(&export_parent).unwrap();
+        let parent = SessionRootLease::open(&export_parent).unwrap();
+        let mut destination = PinnedExportDestination::create_in_directory(
+            parent.clone_chain().unwrap(),
+            OsString::from("diagnostics.zip").as_os_str(),
+        )
+        .unwrap();
+        destination.write_all(b"published").unwrap();
+        let replacement_parent = root.path().join("replacement");
+        fs::create_dir(&replacement_parent).unwrap();
+        let replacement_identity = SessionRootLease::open(&replacement_parent)
+            .unwrap()
+            .identity();
+        super::POST_PUBLISH_PARENT_IDENTITY
+            .with(|injected| injected.set(Some(replacement_identity)));
+
+        let mut published = destination.commit_pinned().unwrap();
+        let mut bytes = Vec::new();
+        published.file.seek(SeekFrom::Start(0)).unwrap();
+        published.file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"published");
+        assert_eq!(
+            fs::read(export_parent.join("diagnostics.zip")).unwrap(),
+            b"published"
+        );
+        assert!(fs::read_dir(replacement_parent).unwrap().next().is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn postpublish_snapshot_failure_returns_the_exact_file_with_safe_lazy_adoption() {
+        use crate::diagnostics::DiagnosticDirectory;
+
+        let root = tempfile::tempdir().unwrap();
+        let diagnostics_path = root.path().join("diagnostics");
+        fs::create_dir(&diagnostics_path).unwrap();
+        let directory = DiagnosticDirectory::open(&diagnostics_path).unwrap();
+        let mut staged = directory
+            .create_staged(OsString::from("snapshot.bin").as_os_str(), 64)
+            .unwrap();
+        staged.write_chunk(b"published").unwrap();
+        super::FAIL_POST_PUBLISH_SNAPSHOT.with(|injected| injected.set(true));
+
+        let mut published = staged.commit().unwrap();
+
+        assert_eq!(published.read_range(0, 64).unwrap(), b"published");
+        assert_eq!(
+            fs::read(diagnostics_path.join("snapshot.bin")).unwrap(),
+            b"published"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn diagnostic_staged_commit_has_no_fallible_finalization_after_publish() {
+        use crate::diagnostics::{DiagnosticDirectory, DiagnosticStoreError};
+
+        let root = tempfile::tempdir().unwrap();
+        let diagnostics_path = root.path().join("diagnostics");
+        fs::create_dir(&diagnostics_path).unwrap();
+        let directory = DiagnosticDirectory::open(&diagnostics_path).unwrap();
+        let mut staged = directory
+            .create_staged(OsString::from("snapshot.bin").as_os_str(), 64)
+            .unwrap();
+        staged.write_chunk(b"published").unwrap();
+
+        let (thread_tx, thread_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            thread_tx.send(thread::current().id()).unwrap();
+            staged.commit()
+        });
+        let worker_id = thread_rx.recv().unwrap();
+        let window = Arc::new(super::commit_synchronization_tests::HookWindow::new());
+        super::commit_synchronization_tests::install(
+            worker_id,
+            super::CommitSynchronizationPoint::AfterPublishLinearized,
+            Arc::clone(&window),
+        );
+        window.wait_until_reached();
+        let target = diagnostics_path.join("snapshot.bin");
+        let relocated = diagnostics_path.join("published-relocated");
+        fs::rename(&target, &relocated).unwrap();
+        fs::write(&target, b"foreign").unwrap();
+        window.resume_operation();
+
+        let mut published = worker.join().unwrap().unwrap();
+        super::commit_synchronization_tests::uninstall(worker_id);
+        assert_eq!(
+            published.read_range(0, 64).unwrap_err(),
+            DiagnosticStoreError::Changed
+        );
+        assert_eq!(fs::read(target).unwrap(), b"foreign");
+        assert_eq!(fs::read(relocated).unwrap(), b"published");
     }
 
     #[cfg(windows)]
@@ -1890,7 +2672,9 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
-    fn unix_destination_never_exposes_a_temporary_source_name() {
+    fn linux_destination_owns_an_unlinked_temporary_until_publish_or_drop() {
+        use std::os::unix::fs::MetadataExt;
+
         let root = tempfile::tempdir().unwrap();
         let session_path = root.path().join("sessions");
         fs::create_dir(&session_path).unwrap();
@@ -1901,9 +2685,19 @@ mod tests {
         let destination = PinnedExportDestination::create(&target, &[&session]).unwrap();
 
         assert!(destination.temporary_name.is_none());
-        assert!(directory_entries(&export_parent).is_empty());
+        assert_eq!(
+            destination
+                .temporary
+                .as_ref()
+                .expect("a Linux export owns its anonymous temporary")
+                .metadata()
+                .unwrap()
+                .nlink(),
+            0
+        );
+        assert!(!target.exists());
         drop(destination);
-        assert!(directory_entries(&export_parent).is_empty());
+        assert!(!target.exists());
     }
 
     fn directory_entries(path: &std::path::Path) -> Vec<OsString> {
@@ -2073,6 +2867,67 @@ mod apple_regression_tests {
 
         assert!(matches!(result, Err(SessionError::UnsafePath)));
         assert_eq!(fs::read(&target).unwrap(), b"raced target");
+        assert_eq!(
+            directory_entries(&fixture.export_parent),
+            vec![OsString::from("diagnostics.zip")]
+        );
+        assert!(directory_entries(&fixture.session_path).is_empty());
+    }
+
+    #[test]
+    fn continuous_publish_watcher_rejects_same_length_rewrite_after_final_revalidation() {
+        let fixture = AppleFixture::new();
+        let target = fixture.export_parent.join("diagnostics.zip");
+        let mut destination =
+            PinnedExportDestination::create(&target, &[&fixture.session]).unwrap();
+        destination.write_all(b"owned temporary").unwrap();
+        let temporary = fixture
+            .export_parent
+            .join(destination.temporary_name.as_ref().unwrap());
+
+        let result = run_commit_at_hook(
+            destination,
+            AppleSynchronizationPoint::AfterFinalVerificationBeforePublish,
+            || {
+                let mut rewrite = fs::OpenOptions::new().write(true).open(&temporary).unwrap();
+                rewrite.write_all(b"foreign rewrite").unwrap();
+                rewrite.sync_all().unwrap();
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(SessionError::UnsafePath | SessionError::Io { .. })
+        ));
+        assert!(!target.exists());
+        assert!(directory_entries(&fixture.export_parent).is_empty());
+        assert!(directory_entries(&fixture.session_path).is_empty());
+    }
+
+    #[test]
+    fn postpublish_rollback_deletes_exact_owned_object_and_preserves_raced_foreign_target() {
+        let fixture = AppleFixture::new();
+        let target = fixture.export_parent.join("diagnostics.zip");
+        let relocated = fixture.export_parent.join("owned-relocated.zip");
+        let mut destination =
+            PinnedExportDestination::create(&target, &[&fixture.session]).unwrap();
+        destination.write_all(b"owned temporary").unwrap();
+
+        let result = run_commit_at_hook(
+            destination,
+            AppleSynchronizationPoint::AfterObjectBoundPublish,
+            || {
+                fs::rename(&target, &relocated).unwrap();
+                fs::write(&target, b"foreign target").unwrap();
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(SessionError::UnsafePath | SessionError::Io { .. })
+        ));
+        assert_eq!(fs::read(&target).unwrap(), b"foreign target");
+        assert!(!relocated.exists());
         assert_eq!(
             directory_entries(&fixture.export_parent),
             vec![OsString::from("diagnostics.zip")]

@@ -103,7 +103,9 @@ impl DiscoveryError {
 impl From<SessionError> for DiscoveryError {
     fn from(error: SessionError) -> Self {
         match error {
-            SessionError::EnumerationLimitExceeded | SessionError::ReadLimitExceeded => Self::Limit,
+            SessionError::EnumerationLimitExceeded
+            | SessionError::ReadLimitExceeded
+            | SessionError::CleanupLimitExceeded => Self::Limit,
             SessionError::UnsafePath | SessionError::SessionFileChanged => Self::Unsafe,
             SessionError::MissingPlatformData { .. }
             | SessionError::SessionFileUnavailable
@@ -293,4 +295,16 @@ fn is_jsonl(name: &OsStr) -> bool {
     Path::new(name)
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("jsonl"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DiscoveryError;
+    use wokcore_platform::sessions::SessionError;
+
+    #[test]
+    fn cleanup_limit_maps_to_discovery_resource_limit() {
+        let error = DiscoveryError::from(SessionError::CleanupLimitExceeded);
+        assert_eq!(error.stable_code(), "session_discovery_limit");
+    }
 }

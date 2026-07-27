@@ -1,9 +1,10 @@
 mod environment;
 mod export_destination;
-mod file;
+pub(crate) mod file;
 
 pub use environment::{SessionEnvironment, SessionRootOverrides, SessionRoots, SessionSourceKind};
-pub use export_destination::PinnedExportDestination;
+pub(crate) use export_destination::PinnedPublishedFile;
+pub use export_destination::{MAX_PINNED_EXPORT_READ_BYTES, PinnedExportDestination};
 pub use file::{
     SessionDirectoryEntry, SessionDirectoryLease, SessionFile, SessionFileIdentity,
     SessionFileKind, SessionFileSnapshot, SessionRootLease,
@@ -17,6 +18,8 @@ pub enum SessionError {
     UnsafePath,
     #[error("session directory enumeration exceeds the caller limit")]
     EnumerationLimitExceeded,
+    #[error("diagnostic cleanup tombstone budget is exhausted")]
+    CleanupLimitExceeded,
     #[error("session read exceeds the caller limit")]
     ReadLimitExceeded,
     #[error("session file changed during a bounded operation")]

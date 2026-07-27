@@ -193,6 +193,7 @@ async fn schema_v1_full_event_serializes_to_the_exact_allow_list() {
             "source_chain": ["router", "provider"],
             "platform": "network"
         },
+        "diagnostic_drop": null,
         "summaries": [{
             "text": summary_text,
             "truncated": false,

@@ -455,7 +455,10 @@ async fn owner_drains_admitted_queries_after_all_senders_close() {
 #[test]
 fn owner_is_single_writer_and_never_waits_with_ring_ownership() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let recorder = std::fs::read_to_string(root.join("recorder.rs")).unwrap();
+    let recorder_source = std::fs::read_to_string(root.join("recorder.rs")).unwrap();
+    let recorder = recorder_source
+        .split_once("\n#[cfg(test)]")
+        .map_or(recorder_source.as_str(), |(production, _)| production);
     let event = std::fs::read_to_string(root.join("event.rs")).unwrap();
     let ring = std::fs::read_to_string(root.join("ring.rs")).unwrap();
     for forbidden in [

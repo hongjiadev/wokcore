@@ -658,7 +658,7 @@ pub(super) fn open_or_create_secure_file(
         Some(handle) => {
             let file = unsafe { File::from_raw_handle(handle) };
             verify_windows_file(&file, WindowsFileKind::Regular)?;
-            verify_windows_permissions(&file)?;
+            verify_windows_permissions(&file, WindowsFileKind::Regular)?;
             Ok(file)
         }
         None => open_windows_existing_file(path, WindowsExistingFileMode::Read),
@@ -727,7 +727,7 @@ fn open_windows_file(path: &Path, kind: WindowsFileKind) -> Result<File, Platfor
     }
     let file = unsafe { File::from_raw_handle(handle) };
     verify_windows_file(&file, kind)?;
-    verify_windows_permissions(&file)?;
+    verify_windows_permissions(&file, kind)?;
     Ok(file)
 }
 
@@ -797,7 +797,7 @@ fn open_windows_existing_file(
     }
     let file = unsafe { File::from_raw_handle(handle) };
     verify_windows_file(&file, WindowsFileKind::Regular)?;
-    verify_windows_permissions(&file)?;
+    verify_windows_permissions(&file, WindowsFileKind::Regular)?;
     Ok(file)
 }
 
@@ -1002,7 +1002,131 @@ pub(super) fn harden_secure_file(file: &File, path: &Path) -> Result<(), Platfor
         Ok(())
     })?;
     verify_windows_file(file, WindowsFileKind::Regular)?;
-    verify_windows_permissions(file)
+    verify_windows_permissions(file, WindowsFileKind::Regular)
+}
+
+#[cfg(unix)]
+pub(crate) fn harden_current_user_handle(
+    file: &File,
+    directory: bool,
+) -> Result<(), PlatformError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let mode = if directory { 0o700 } else { 0o600 };
+    file.set_permissions(fs::Permissions::from_mode(mode))?;
+    let metadata = file.metadata()?;
+    if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o7777 != mode {
+        return Err(PlatformError::UnsafeRuntimePath);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+pub(crate) fn harden_current_user_directory(
+    file: &File,
+    _path: &Path,
+) -> Result<(), PlatformError> {
+    harden_current_user_handle(file, true)
+}
+
+#[cfg(windows)]
+pub(crate) fn harden_current_user_directory(file: &File, path: &Path) -> Result<(), PlatformError> {
+    use std::{
+        os::windows::io::{AsRawHandle, FromRawHandle},
+        ptr,
+    };
+
+    use windows_sys::Win32::{
+        Foundation::{ERROR_SUCCESS, INVALID_HANDLE_VALUE},
+        Security::{
+            Authorization::{SE_FILE_OBJECT, SetSecurityInfo},
+            DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+            PROTECTED_DACL_SECURITY_INFORMATION, SECURITY_DESCRIPTOR,
+        },
+        Storage::FileSystem::{
+            CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, READ_CONTROL,
+            WRITE_DAC, WRITE_OWNER,
+        },
+    };
+
+    let wide_path = wide_path(path);
+    let handle = unsafe {
+        CreateFileW(
+            wide_path.as_ptr(),
+            READ_CONTROL | WRITE_DAC | WRITE_OWNER,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(PlatformError::Io {
+            source: std::io::Error::last_os_error(),
+        });
+    }
+    let secured = unsafe { File::from_raw_handle(handle) };
+    verify_windows_file(&secured, WindowsFileKind::Directory)?;
+    if windows_file_identity(&secured)? != windows_file_identity(file)? {
+        return Err(PlatformError::UnsafeRuntimePath);
+    }
+    with_current_user_security_attributes(true, |attributes| {
+        let descriptor = unsafe {
+            &*(attributes
+                .as_ref()
+                .unwrap()
+                .lpSecurityDescriptor
+                .cast::<SECURITY_DESCRIPTOR>())
+        };
+        let status = unsafe {
+            SetSecurityInfo(
+                secured.as_raw_handle(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION
+                    | DACL_SECURITY_INFORMATION
+                    | PROTECTED_DACL_SECURITY_INFORMATION,
+                descriptor.Owner,
+                std::ptr::null_mut(),
+                descriptor.Dacl,
+                std::ptr::null(),
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return Err(PlatformError::Io {
+                source: std::io::Error::from_raw_os_error(status as i32),
+            });
+        }
+        Ok(())
+    })?;
+    if windows_file_identity(&secured)? != windows_file_identity(file)? {
+        return Err(PlatformError::UnsafeRuntimePath);
+    }
+    verify_windows_file(&secured, WindowsFileKind::Directory)?;
+    verify_windows_permissions(&secured, WindowsFileKind::Directory)?;
+    verify_windows_file(file, WindowsFileKind::Directory)?;
+    verify_windows_permissions(file, WindowsFileKind::Directory)
+}
+
+#[cfg(unix)]
+pub(crate) fn verify_current_user_directory(file: &File) -> Result<(), PlatformError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file.metadata()?;
+    if !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o7777 != 0o700
+    {
+        return Err(PlatformError::UnsafeRuntimePath);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+pub(crate) fn verify_current_user_directory(file: &File) -> Result<(), PlatformError> {
+    verify_windows_file(file, WindowsFileKind::Directory)?;
+    verify_windows_permissions(file, WindowsFileKind::Directory)
 }
 
 #[cfg(windows)]
@@ -1251,7 +1375,7 @@ pub(super) fn sync_parent_directory(directory: &File) -> Result<(), PlatformErro
 }
 
 #[cfg(windows)]
-fn verify_windows_permissions(file: &File) -> Result<(), PlatformError> {
+fn verify_windows_permissions(file: &File, kind: WindowsFileKind) -> Result<(), PlatformError> {
     use std::{ffi::c_void, mem::size_of, os::windows::io::AsRawHandle, ptr};
 
     use windows_sys::Win32::{
@@ -1377,24 +1501,30 @@ fn verify_windows_permissions(file: &File) -> Result<(), PlatformError> {
             source: std::io::Error::last_os_error(),
         });
     }
-    if acl_info.AceCount != 1 {
+    let maximum_ace_count = match kind {
+        WindowsFileKind::Directory => 2,
+        WindowsFileKind::Regular => 1,
+    };
+    if acl_info.AceCount == 0 || acl_info.AceCount > maximum_ace_count {
         return Err(PlatformError::UnsafeRuntimePath);
     }
 
-    let mut ace: *mut c_void = ptr::null_mut();
-    if unsafe { GetAce(dacl, 0, &mut ace) } == 0 {
-        return Err(PlatformError::Io {
-            source: std::io::Error::last_os_error(),
-        });
-    }
-    let header = unsafe { &*ace.cast::<ACE_HEADER>() };
-    if header.AceType as u32 != ACCESS_ALLOWED_ACE_TYPE {
-        return Err(PlatformError::UnsafeRuntimePath);
-    }
-    let allowed = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
-    let allowed_sid = (&raw const allowed.SidStart).cast_mut().cast::<c_void>();
-    if unsafe { EqualSid(allowed_sid, token_user.User.Sid) } == 0 {
-        return Err(PlatformError::UnsafeRuntimePath);
+    for index in 0..acl_info.AceCount {
+        let mut ace: *mut c_void = ptr::null_mut();
+        if unsafe { GetAce(dacl, index, &mut ace) } == 0 {
+            return Err(PlatformError::Io {
+                source: std::io::Error::last_os_error(),
+            });
+        }
+        let header = unsafe { &*ace.cast::<ACE_HEADER>() };
+        if header.AceType as u32 != ACCESS_ALLOWED_ACE_TYPE {
+            return Err(PlatformError::UnsafeRuntimePath);
+        }
+        let allowed = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
+        let allowed_sid = (&raw const allowed.SidStart).cast_mut().cast::<c_void>();
+        if unsafe { EqualSid(allowed_sid, token_user.User.Sid) } == 0 {
+            return Err(PlatformError::UnsafeRuntimePath);
+        }
     }
     Ok(())
 }

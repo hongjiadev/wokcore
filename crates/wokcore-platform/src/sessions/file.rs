@@ -80,7 +80,7 @@ impl SessionRootLease {
         directory.open_file_name(&name, maximum_size)
     }
 
-    pub(super) fn clone_chain(&self) -> Result<DirectoryChain, SessionError> {
+    pub(crate) fn clone_chain(&self) -> Result<DirectoryChain, SessionError> {
         clone_directory_chain(&self.chain)
     }
 
@@ -116,6 +116,33 @@ impl SessionDirectoryLease {
         }
         validate_directory_chain_generation(&self.chain, &generation)?;
         Ok(entries)
+    }
+
+    pub(crate) fn entries_page(
+        &self,
+        after: Option<&OsStr>,
+        maximum_entries: usize,
+    ) -> Result<(Vec<SessionDirectoryEntry>, bool), SessionError> {
+        if maximum_entries == 0 {
+            return Err(SessionError::EnumerationLimitExceeded);
+        }
+        let generation = directory_chain_generation(&self.chain)?;
+        validate_directory_chain_generation(&self.chain, &generation)?;
+        let candidate_limit = maximum_entries
+            .checked_add(1)
+            .ok_or(SessionError::EnumerationLimitExceeded)?;
+        let mut names = enumerate_child_names_page(&self.chain, after, candidate_limit)?;
+        validate_directory_chain_generation(&self.chain, &generation)?;
+        let has_more = names.len() > maximum_entries;
+        names.truncate(maximum_entries);
+        let mut entries = Vec::with_capacity(names.len());
+        for name in names {
+            validate_child_name(&name)?;
+            let snapshot = snapshot_child(&self.chain, &name)?;
+            entries.push(SessionDirectoryEntry { name, snapshot });
+        }
+        validate_directory_chain_generation(&self.chain, &generation)?;
+        Ok((entries, has_more))
     }
 
     pub fn open_file(
@@ -269,13 +296,13 @@ fn map_revalidation_error(error: SessionError) -> SessionError {
     }
 }
 
-pub(super) struct DirectoryChain {
+pub(crate) struct DirectoryChain {
     pub(super) directories: Vec<PinnedDirectory>,
     root_index: usize,
 }
 
 impl DirectoryChain {
-    pub(super) fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self
             .directories
             .last()
@@ -283,12 +310,23 @@ impl DirectoryChain {
             .path
     }
 
-    pub(super) fn file(&self) -> &File {
+    pub(crate) fn file(&self) -> &File {
         &self
             .directories
             .last()
             .expect("a directory chain is never empty")
             .file
+    }
+
+    pub(crate) fn resident_allocation_bytes(&self) -> Option<usize> {
+        self.directories
+            .capacity()
+            .checked_mul(std::mem::size_of::<PinnedDirectory>())
+            .and_then(|total| {
+                self.directories.iter().try_fold(total, |total, directory| {
+                    total.checked_add(directory.path.capacity())
+                })
+            })
     }
 
     #[cfg(target_vendor = "apple")]
@@ -378,7 +416,7 @@ fn validate_relative_path(path: &Path, allow_empty: bool) -> Result<(), SessionE
     Ok(())
 }
 
-pub(super) fn validate_child_name(name: &OsStr) -> Result<(), SessionError> {
+pub(crate) fn validate_child_name(name: &OsStr) -> Result<(), SessionError> {
     let path = Path::new(name);
     let mut components = path.components();
     if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
@@ -423,7 +461,9 @@ fn extend_directory_chain(
     Ok(chain)
 }
 
-fn clone_directory_chain(chain: &DirectoryChain) -> Result<DirectoryChain, SessionError> {
+pub(crate) fn clone_directory_chain(
+    chain: &DirectoryChain,
+) -> Result<DirectoryChain, SessionError> {
     let directories = chain
         .directories
         .iter()
@@ -441,7 +481,7 @@ fn clone_directory_chain(chain: &DirectoryChain) -> Result<DirectoryChain, Sessi
     })
 }
 
-pub(super) fn validate_directory_chain(chain: &DirectoryChain) -> Result<(), SessionError> {
+pub(crate) fn validate_directory_chain(chain: &DirectoryChain) -> Result<(), SessionError> {
     for directory in &chain.directories {
         if file_identity(&directory.file)? != directory.identity {
             return Err(SessionError::UnsafePath);
@@ -570,7 +610,7 @@ fn directory_generation(file: &File) -> Result<DirectoryGeneration, SessionError
     })
 }
 
-pub(super) fn child_exists(chain: &DirectoryChain, name: &OsStr) -> Result<bool, SessionError> {
+pub(crate) fn child_exists(chain: &DirectoryChain, name: &OsStr) -> Result<bool, SessionError> {
     validate_child_name(name)?;
     validate_directory_chain(chain)?;
     match open_child(chain, name, true) {
@@ -620,6 +660,22 @@ fn snapshot_child(
 fn enumerate_child_names(
     chain: &DirectoryChain,
     maximum_entries: usize,
+) -> Result<Vec<OsString>, SessionError> {
+    let candidate_limit = maximum_entries
+        .checked_add(1)
+        .ok_or(SessionError::EnumerationLimitExceeded)?;
+    let names = enumerate_child_names_page(chain, None, candidate_limit)?;
+    if names.len() > maximum_entries {
+        return Err(SessionError::EnumerationLimitExceeded);
+    }
+    Ok(names)
+}
+
+#[cfg(unix)]
+fn enumerate_child_names_page(
+    chain: &DirectoryChain,
+    after: Option<&OsStr>,
+    candidate_limit: usize,
 ) -> Result<Vec<OsString>, SessionError> {
     use std::os::{fd::AsRawFd, unix::ffi::OsStringExt};
 
@@ -672,10 +728,12 @@ fn enumerate_child_names(
         if bytes == b"." || bytes == b".." {
             continue;
         }
-        if names.len() == maximum_entries {
-            return Err(SessionError::EnumerationLimitExceeded);
-        }
-        names.push(OsString::from_vec(bytes));
+        insert_page_candidate(
+            &mut names,
+            OsString::from_vec(bytes),
+            after,
+            candidate_limit,
+        );
     }
     Ok(names)
 }
@@ -698,6 +756,22 @@ fn clear_unix_errno() {
 fn enumerate_child_names(
     chain: &DirectoryChain,
     maximum_entries: usize,
+) -> Result<Vec<OsString>, SessionError> {
+    let candidate_limit = maximum_entries
+        .checked_add(1)
+        .ok_or(SessionError::EnumerationLimitExceeded)?;
+    let names = enumerate_child_names_page(chain, None, candidate_limit)?;
+    if names.len() > maximum_entries {
+        return Err(SessionError::EnumerationLimitExceeded);
+    }
+    Ok(names)
+}
+
+#[cfg(windows)]
+fn enumerate_child_names_page(
+    chain: &DirectoryChain,
+    after: Option<&OsStr>,
+    candidate_limit: usize,
 ) -> Result<Vec<OsString>, SessionError> {
     use std::os::windows::{ffi::OsStringExt, io::AsRawHandle};
 
@@ -767,10 +841,7 @@ fn enumerate_child_names(
                 OsString::from_wide(words)
             };
             if name != "." && name != ".." {
-                if names.len() == maximum_entries {
-                    return Err(SessionError::EnumerationLimitExceeded);
-                }
-                names.push(name);
+                insert_page_candidate(&mut names, name, after, candidate_limit);
             }
 
             let next = information.NextEntryOffset as usize;
@@ -790,7 +861,25 @@ fn enumerate_child_names(
     Ok(names)
 }
 
-fn snapshot_file(file: &File) -> Result<SessionFileSnapshot, SessionError> {
+fn insert_page_candidate(
+    names: &mut Vec<OsString>,
+    name: OsString,
+    after: Option<&OsStr>,
+    candidate_limit: usize,
+) {
+    if candidate_limit == 0 || after.is_some_and(|after| name.as_os_str() <= after) {
+        return;
+    }
+    let index = names
+        .binary_search_by(|candidate| candidate.as_os_str().cmp(name.as_os_str()))
+        .unwrap_or_else(|index| index);
+    names.insert(index, name);
+    if names.len() > candidate_limit {
+        names.pop();
+    }
+}
+
+pub(crate) fn snapshot_file(file: &File) -> Result<SessionFileSnapshot, SessionError> {
     let metadata = file.metadata()?;
     let kind = if metadata.is_file() {
         SessionFileKind::RegularFile
@@ -953,7 +1042,7 @@ fn open_directory_child(chain: &DirectoryChain, name: &OsStr) -> Result<File, Se
 }
 
 #[cfg(unix)]
-fn open_child(
+pub(crate) fn open_child(
     chain: &DirectoryChain,
     name: &OsStr,
     allow_directory: bool,
@@ -967,8 +1056,103 @@ fn open_child(
     Ok(file)
 }
 
+#[cfg(unix)]
+pub(crate) fn open_child_for_update(
+    chain: &DirectoryChain,
+    name: &OsStr,
+) -> Result<File, SessionError> {
+    let file = open_unix_child(
+        chain,
+        name,
+        libc::O_RDWR | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+    )?;
+    if snapshot_file(&file)?.kind != SessionFileKind::RegularFile {
+        return Err(SessionError::UnsafePath);
+    }
+    ensure_single_link(&file)?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+pub(crate) fn open_child_for_stable_read(
+    chain: &DirectoryChain,
+    name: &OsStr,
+) -> Result<File, SessionError> {
+    use std::os::fd::AsRawFd;
+
+    let file = open_child(chain, name, false)?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0 {
+        return Err(map_session_io(std::io::Error::last_os_error()));
+    }
+    ensure_single_link(&file)?;
+    Ok(file)
+}
+
 #[cfg(windows)]
-fn open_child(
+pub(crate) fn open_child_for_update(
+    chain: &DirectoryChain,
+    name: &OsStr,
+) -> Result<File, SessionError> {
+    use windows_sys::Win32::{
+        Foundation::{GENERIC_READ, GENERIC_WRITE},
+        Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, SYNCHRONIZE},
+    };
+
+    let file = open_windows_relative_access(
+        chain.file(),
+        name,
+        WindowsExpectedKind::RegularFile,
+        GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+    )?;
+    ensure_single_link(&file)?;
+    Ok(file)
+}
+
+#[cfg(windows)]
+pub(crate) fn open_child_for_delete(
+    chain: &DirectoryChain,
+    name: &OsStr,
+) -> Result<File, SessionError> {
+    use windows_sys::Win32::{
+        Foundation::GENERIC_READ,
+        Storage::FileSystem::{DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, SYNCHRONIZE},
+    };
+
+    let file = open_windows_relative_access(
+        chain.file(),
+        name,
+        WindowsExpectedKind::RegularFile,
+        GENERIC_READ | DELETE | SYNCHRONIZE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+    )?;
+    ensure_single_link(&file)?;
+    Ok(file)
+}
+
+#[cfg(windows)]
+pub(crate) fn open_child_for_stable_read(
+    chain: &DirectoryChain,
+    name: &OsStr,
+) -> Result<File, SessionError> {
+    use windows_sys::Win32::{
+        Foundation::GENERIC_READ,
+        Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE, SYNCHRONIZE},
+    };
+
+    let file = open_windows_relative_access(
+        chain.file(),
+        name,
+        WindowsExpectedKind::RegularFile,
+        GENERIC_READ | SYNCHRONIZE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+    )?;
+    ensure_single_link(&file)?;
+    Ok(file)
+}
+
+#[cfg(windows)]
+pub(crate) fn open_child(
     chain: &DirectoryChain,
     name: &OsStr,
     allow_directory: bool,
@@ -1067,6 +1251,28 @@ fn open_windows_relative(
     name: &OsStr,
     expected: WindowsExpectedKind,
 ) -> Result<File, SessionError> {
+    use windows_sys::Win32::{
+        Foundation::GENERIC_READ,
+        Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, SYNCHRONIZE},
+    };
+
+    open_windows_relative_access(
+        parent,
+        name,
+        expected,
+        GENERIC_READ | SYNCHRONIZE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+    )
+}
+
+#[cfg(windows)]
+fn open_windows_relative_access(
+    parent: &File,
+    name: &OsStr,
+    expected: WindowsExpectedKind,
+    desired_access: u32,
+    share_access: u32,
+) -> Result<File, SessionError> {
     use std::{
         ffi::c_void,
         mem::size_of,
@@ -1077,10 +1283,7 @@ fn open_windows_relative(
         ptr,
     };
 
-    use windows_sys::Win32::{
-        Foundation::{GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE},
-        Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, SYNCHRONIZE},
-    };
+    use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
 
     #[repr(C)]
     struct UnicodeString {
@@ -1156,12 +1359,12 @@ fn open_windows_relative(
     let status = unsafe {
         NtCreateFile(
             &mut handle,
-            GENERIC_READ | SYNCHRONIZE,
+            desired_access,
             &mut attributes,
             &mut io_status,
             ptr::null(),
             0,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            share_access,
             1,
             type_options | 0x20 | 0x0020_0000,
             ptr::null(),
@@ -1180,6 +1383,36 @@ fn open_windows_relative(
     let file = unsafe { File::from_raw_handle(handle) };
     verify_windows_file(&file, expected)?;
     Ok(file)
+}
+
+#[cfg(unix)]
+pub(crate) fn ensure_single_link(file: &File) -> Result<(), SessionError> {
+    use std::os::unix::fs::MetadataExt;
+
+    if file.metadata()?.nlink() != 1 {
+        return Err(SessionError::UnsafePath);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+pub(crate) fn ensure_single_link(file: &File) -> Result<(), SessionError> {
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) } == 0 {
+        return Err(SessionError::Io {
+            source: std::io::Error::last_os_error(),
+        });
+    }
+    if information.nNumberOfLinks != 1 {
+        return Err(SessionError::UnsafePath);
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -1213,7 +1446,7 @@ fn verify_windows_file(file: &File, expected: WindowsExpectedKind) -> Result<(),
 }
 
 #[cfg(unix)]
-pub(super) fn file_identity(file: &File) -> Result<SessionFileIdentity, SessionError> {
+pub(crate) fn file_identity(file: &File) -> Result<SessionFileIdentity, SessionError> {
     use std::os::unix::fs::MetadataExt;
 
     let metadata = file.metadata()?;
@@ -1224,7 +1457,7 @@ pub(super) fn file_identity(file: &File) -> Result<SessionFileIdentity, SessionE
 }
 
 #[cfg(windows)]
-pub(super) fn file_identity(file: &File) -> Result<SessionFileIdentity, SessionError> {
+pub(crate) fn file_identity(file: &File) -> Result<SessionFileIdentity, SessionError> {
     use std::os::windows::io::AsRawHandle;
 
     use windows_sys::Win32::Storage::FileSystem::{
@@ -1279,12 +1512,16 @@ mod synchronization_tests {
         ffi::{OsStr, OsString},
         fs::{self, FileTimes, OpenOptions},
         io::Write,
+        mem::size_of,
         path::PathBuf,
         sync::{Arc, Barrier, Mutex, mpsc},
         thread::{self, ThreadId},
     };
 
-    use super::{SessionError, SessionRootLease, SynchronizationPoint, enumerate_child_names};
+    use super::{
+        PinnedDirectory, SessionError, SessionRootLease, SynchronizationPoint,
+        enumerate_child_names,
+    };
     #[cfg(windows)]
     use super::{file_identity, open_child, open_directory_child};
     #[cfg(windows)]
@@ -1298,6 +1535,31 @@ mod synchronization_tests {
     struct HookWindow {
         reached: Barrier,
         resume: Barrier,
+    }
+
+    #[test]
+    fn directory_chain_resident_allocation_counts_vector_and_every_nested_path_buffer() {
+        let fixture = tempfile::tempdir().unwrap();
+        let nested = fixture.path().join("one").join("two");
+        fs::create_dir_all(&nested).unwrap();
+        let lease = SessionRootLease::open(&nested).unwrap();
+        let expected = lease
+            .chain
+            .directories
+            .capacity()
+            .checked_mul(size_of::<PinnedDirectory>())
+            .and_then(|total| {
+                lease
+                    .chain
+                    .directories
+                    .iter()
+                    .try_fold(total, |total, directory| {
+                        total.checked_add(directory.path.capacity())
+                    })
+            })
+            .unwrap();
+
+        assert_eq!(lease.chain.resident_allocation_bytes().unwrap(), expected);
     }
 
     impl HookWindow {
