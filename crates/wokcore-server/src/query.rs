@@ -137,8 +137,10 @@ pub struct PendingQuery {
 
 impl PendingQuery {
     pub async fn wait(mut self) -> Result<Vec<u8>, QueryServiceError> {
-        let result = self.result.take().ok_or(QueryServiceError::Closed)?;
-        match tokio::time::timeout(QUERY_DEADLINE, result).await {
+        let result = self.result.as_mut().ok_or(QueryServiceError::Closed)?;
+        let outcome = tokio::time::timeout(QUERY_DEADLINE, result).await;
+        self.result.take();
+        match outcome {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(QueryServiceError::Worker),
             Err(_) => {

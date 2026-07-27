@@ -171,6 +171,11 @@ async fn message_fixture(content: &str) -> (Fixture, String) {
         source,
     )
     .unwrap();
+    fs::write(
+        roots.codex.join("session_index.jsonl"),
+        "{\"id\":\"api-messages\",\"thread_name\":\"Session 标题 🌏\"}\n",
+    )
+    .unwrap();
     let mut scanner = CodexScanner::open(&roots.codex, &state_path, domain_key).unwrap();
     let scanned = scanner
         .scan("2026-07-26T12:30:00Z", ScanControl::default())
@@ -269,6 +274,24 @@ async fn session_list_rejects_invalid_filters_limits_and_cursor_tampering() {
         assert_eq!(response.0, StatusCode::BAD_REQUEST, "{query}");
         assert_eq!(response.1["error"]["code"], code, "{query}");
     }
+    fixture.query.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn session_list_reads_optional_titles_without_persisting_them() {
+    let (fixture, session_key) = message_fixture("visible").await;
+    let response = send(
+        &fixture.app,
+        "/wokcore/v1/sessions?source=codex&limit=1",
+        &fixture.management,
+    )
+    .await;
+
+    assert_eq!(response.0, StatusCode::OK);
+    assert_eq!(response.1["items"][0]["session_key"], session_key);
+    assert_eq!(response.1["items"][0]["title"], "Session 标题 🌏");
+    let state_bytes = fs::read(fixture._directory.path().join("state.db")).unwrap();
+    assert!(!contains_bytes(&state_bytes, "Session 标题 🌏".as_bytes()));
     fixture.query.shutdown().await.unwrap();
 }
 

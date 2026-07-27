@@ -27,6 +27,13 @@ impl SessionState {
         Ok(Self { reader, writer })
     }
 
+    pub(crate) fn open_read_only(state_path: impl AsRef<Path>) -> Result<Self, StorageError> {
+        Ok(Self {
+            reader: StateStore::open_live_reader(state_path)?,
+            writer: None,
+        })
+    }
+
     pub(crate) fn reader(&self) -> &StateStore {
         &self.reader
     }

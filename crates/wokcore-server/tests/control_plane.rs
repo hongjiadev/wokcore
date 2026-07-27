@@ -682,6 +682,17 @@ async fn head_is_rejected_for_every_get_only_operation() {
             "/wokcore/v1/service/status",
             Some(fixture.management.as_str()),
         ),
+        ("/wokcore/v1/sessions", Some(fixture.management.as_str())),
+        (
+            "/wokcore/v1/sessions/example/messages",
+            Some(fixture.management.as_str()),
+        ),
+        ("/wokcore/v1/usage", Some(fixture.management.as_str())),
+        ("/wokcore/v1/logs", Some(fixture.management.as_str())),
+        (
+            "/wokcore/v1/diagnostics/export",
+            Some(fixture.management.as_str()),
+        ),
     ] {
         let response = fixture
             .app

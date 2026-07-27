@@ -1,5 +1,5 @@
 use std::{
-    sync::{Arc, Barrier},
+    sync::{Arc, Barrier, mpsc},
     time::Duration,
 };
 
@@ -62,6 +62,37 @@ async fn queue_admission_is_non_blocking_and_two_workers_execute_concurrently() 
     for pending in queued {
         pending.wait().await.unwrap();
     }
+    service.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropping_an_inflight_wait_cooperatively_cancels_the_worker() {
+    let service = QueryService::start(DEFAULT_QUERY_WORKERS).unwrap();
+    let entered = Arc::new(Barrier::new(2));
+    let worker_entered = Arc::clone(&entered);
+    let (cancelled, observed) = mpsc::channel();
+    let pending = service
+        .handle()
+        .try_submit(move |cancellation| {
+            worker_entered.wait();
+            while !cancellation.is_cancelled() {
+                std::thread::yield_now();
+            }
+            cancelled.send(()).unwrap();
+            Err(QueryServiceError::Cancelled)
+        })
+        .unwrap();
+    let waiter = tokio::spawn(pending.wait());
+    tokio::task::spawn_blocking(move || entered.wait())
+        .await
+        .unwrap();
+
+    waiter.abort();
+    let _ = waiter.await;
+    tokio::task::spawn_blocking(move || observed.recv_timeout(Duration::from_secs(2)))
+        .await
+        .unwrap()
+        .unwrap();
     service.shutdown().await.unwrap();
 }
 

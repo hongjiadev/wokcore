@@ -12,7 +12,7 @@ use axum::{
     Router,
     extract::DefaultBodyLimit,
     middleware,
-    routing::{MethodFilter, delete, get, on, post},
+    routing::{MethodFilter, delete, on, post},
 };
 
 use crate::ServerState;
@@ -45,14 +45,26 @@ pub fn build_router(state: ServerState) -> Router {
         .route("/wokcore/v1/service/drain/cancel", post(cancel_drain))
         .route("/wokcore/v1/service/stop", post(stop))
         .route("/wokcore/v1/clients/authorize", post(authorize))
-        .route("/wokcore/v1/sessions", get(list_sessions))
+        .route(
+            "/wokcore/v1/sessions",
+            on(MethodFilter::GET, list_sessions).on(MethodFilter::HEAD, method_not_allowed),
+        )
         .route(
             "/wokcore/v1/sessions/{session_key}/messages",
-            get(session_messages),
+            on(MethodFilter::GET, session_messages).on(MethodFilter::HEAD, method_not_allowed),
         )
-        .route("/wokcore/v1/usage", get(usage))
-        .route("/wokcore/v1/logs", get(logs))
-        .route("/wokcore/v1/diagnostics/export", get(diagnostics_export))
+        .route(
+            "/wokcore/v1/usage",
+            on(MethodFilter::GET, usage).on(MethodFilter::HEAD, method_not_allowed),
+        )
+        .route(
+            "/wokcore/v1/logs",
+            on(MethodFilter::GET, logs).on(MethodFilter::HEAD, method_not_allowed),
+        )
+        .route(
+            "/wokcore/v1/diagnostics/export",
+            on(MethodFilter::GET, diagnostics_export).on(MethodFilter::HEAD, method_not_allowed),
+        )
         .route(
             "/wokcore/v1/clients/{client_id}/tokens/{token_id}",
             delete(revoke),

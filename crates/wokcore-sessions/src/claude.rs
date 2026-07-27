@@ -276,6 +276,23 @@ impl ClaudeScanner {
         Self::open_internal(root_path, state_path, domain_key, Some(writer))
     }
 
+    pub fn open_read_only(
+        root_path: impl AsRef<Path>,
+        state_path: impl AsRef<Path>,
+        domain_key: [u8; 32],
+    ) -> Result<Self, ClaudeScannerError> {
+        let root = SessionRootLease::open(root_path).map_err(|_| ClaudeScannerError::Root)?;
+        let state = SessionState::open_read_only(state_path)?;
+        Ok(Self {
+            root,
+            state,
+            domain_key,
+            discovery_limits: DiscoveryLimits::default(),
+            metrics: SessionScannerMetrics::default(),
+            slice_cycle: None,
+        })
+    }
+
     fn open_internal(
         root_path: impl AsRef<Path>,
         state_path: impl AsRef<Path>,

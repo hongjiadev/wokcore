@@ -12,9 +12,14 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use wokcore_diagnostics::event::UtcTimestamp;
-use wokcore_sessions::messages::{
-    MAX_MESSAGE_PAGE_UTF8_BYTES, Message, MessagePageCursor, MessagePageRequest, MessagePager,
-    MessagePagerError, MessageRole,
+use wokcore_sessions::{
+    claude::ClaudeScanner,
+    codex::CodexScanner,
+    gemini::GeminiScanner,
+    messages::{
+        MAX_MESSAGE_PAGE_UTF8_BYTES, Message, MessagePageCursor, MessagePageRequest, MessagePager,
+        MessagePagerError, MessageRole,
+    },
 };
 use wokcore_storage::{
     GlobalSessionIndexPageKey, SessionAvailability, SessionIndexRecord, SessionSourceErrorCode,
@@ -74,6 +79,7 @@ pub(super) async fn list_sessions(
         .clone()
         .ok_or_else(|| ApiError::query_busy(request_id))?;
     let state_path = runtime.state_path().to_path_buf();
+    let roots = runtime.session_roots().cloned();
     let domain_key = *runtime.session_domain_key();
     let index_status = index_status_response(
         state
@@ -88,6 +94,7 @@ pub(super) async fn list_sessions(
         .try_submit(move |cancellation| {
             build_session_list(
                 state_path,
+                roots,
                 domain_key,
                 source,
                 availability,
@@ -685,6 +692,7 @@ fn map_pager_page_error(error: MessagePagerError) -> QueryServiceError {
 #[allow(clippy::too_many_arguments)]
 fn build_session_list(
     state_path: PathBuf,
+    roots: Option<crate::observability::SessionRootPaths>,
     domain_key: [u8; 32],
     source: Option<SessionSourceKind>,
     availability: Option<SessionAvailability>,
@@ -710,7 +718,7 @@ fn build_session_list(
         })
         .transpose()?;
     let store =
-        StateStore::open_live_reader(state_path).map_err(|_| QueryServiceError::Execution)?;
+        StateStore::open_live_reader(&state_path).map_err(|_| QueryServiceError::Execution)?;
     let mut items = Vec::with_capacity(limit.saturating_add(1));
     loop {
         cancellation.check()?;
@@ -736,6 +744,14 @@ fn build_session_list(
 
     let mut has_more = items.len() > limit;
     items.truncate(limit);
+    let mut title_readers = TitleReaders::open(roots.as_ref(), &state_path, domain_key);
+    for item in &mut items {
+        cancellation.check()?;
+        if item.availability == SessionAvailability::Available.as_str() {
+            item.title = title_readers.title(item.source_kind, &item.source_key);
+        }
+    }
+    let mut omitted_titles = false;
     loop {
         cancellation.check()?;
         let next_cursor = if has_more {
@@ -768,6 +784,13 @@ fn build_session_list(
         if encoded.len() <= SESSION_LIST_MAX_RESPONSE_BYTES {
             return Ok(encoded);
         }
+        if !omitted_titles && items.iter().any(|item| item.title.is_some()) {
+            for item in &mut items {
+                item.title = None;
+            }
+            omitted_titles = true;
+            continue;
+        }
         if items.pop().is_none() {
             return Err(QueryServiceError::ResponseLimit);
         }
@@ -788,12 +811,64 @@ fn session_item(record: SessionIndexRecord) -> SessionListItem {
     SessionListItem {
         session_key: record.session_key,
         source_key: record.source_key,
+        source_kind: record.source_kind,
         source: record.source_kind.as_str(),
         created_at: record.created_at,
         last_active_at: record.last_active_at,
         availability: record.availability.as_str(),
         message_count: record.message_count,
         usage_event_count: record.usage_event_count,
+        title: None,
+    }
+}
+
+struct TitleReaders {
+    codex: Option<CodexScanner>,
+    claude: Option<ClaudeScanner>,
+    gemini: Option<GeminiScanner>,
+}
+
+impl TitleReaders {
+    fn open(
+        roots: Option<&crate::observability::SessionRootPaths>,
+        state_path: &std::path::Path,
+        domain_key: [u8; 32],
+    ) -> Self {
+        let Some(roots) = roots else {
+            return Self {
+                codex: None,
+                claude: None,
+                gemini: None,
+            };
+        };
+        Self {
+            codex: CodexScanner::open_read_only(&roots.codex, state_path, domain_key).ok(),
+            claude: ClaudeScanner::open_read_only(&roots.claude, state_path, domain_key).ok(),
+            gemini: GeminiScanner::open_read_only(&roots.gemini, state_path, domain_key).ok(),
+        }
+    }
+
+    fn title(&mut self, source: SessionSourceKind, source_key: &str) -> Option<String> {
+        match source {
+            SessionSourceKind::Codex => self
+                .codex
+                .as_mut()?
+                .title_for_source(source_key)
+                .ok()?
+                .map(|title| title.as_str().to_owned()),
+            SessionSourceKind::Claude => self
+                .claude
+                .as_mut()?
+                .title_for_source(source_key)
+                .ok()?
+                .map(|title| title.as_str().to_owned()),
+            SessionSourceKind::Gemini => self
+                .gemini
+                .as_mut()?
+                .title_for_source(source_key)
+                .ok()?
+                .map(|title| title.as_str().to_owned()),
+        }
     }
 }
 
@@ -982,12 +1057,16 @@ struct SessionListItem {
     session_key: String,
     #[serde(skip)]
     source_key: String,
+    #[serde(skip)]
+    source_kind: SessionSourceKind,
     source: &'static str,
     created_at: String,
     last_active_at: String,
     availability: &'static str,
     message_count: u64,
     usage_event_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
 }
 
 #[derive(Serialize)]

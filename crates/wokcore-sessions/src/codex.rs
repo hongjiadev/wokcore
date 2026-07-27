@@ -600,6 +600,27 @@ impl CodexScanner {
         Self::open_internal(root_path, state_path, domain_key, Some(writer))
     }
 
+    pub fn open_read_only(
+        root_path: impl AsRef<Path>,
+        state_path: impl AsRef<Path>,
+        domain_key: [u8; 32],
+    ) -> Result<Self, CodexScannerError> {
+        let root_path = root_path.as_ref().to_path_buf();
+        let root = SessionRootLease::open(&root_path).map_err(|_| CodexScannerError::Root)?;
+        let state = SessionState::open_read_only(state_path)?;
+        Ok(Self {
+            root,
+            root_path,
+            state,
+            domain_key,
+            discovery_limits: DiscoveryLimits::default(),
+            replay_limit: MAX_CODEX_REPLAY_SIGNATURES,
+            title_database_identities: HashMap::new(),
+            metrics: ScannerMetrics::default(),
+            slice_cycle: None,
+        })
+    }
+
     fn open_internal(
         root_path: impl AsRef<Path>,
         state_path: impl AsRef<Path>,
