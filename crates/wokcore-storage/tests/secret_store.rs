@@ -354,8 +354,8 @@ fn set_protected_secret_file_dacl(path: &Path, include_world: bool) -> std::io::
             ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, AddAccessAllowedAce,
             Authorization::{SE_FILE_OBJECT, SetNamedSecurityInfoW},
             CreateWellKnownSid, DACL_SECURITY_INFORMATION, GetLengthSid, GetTokenInformation,
-            InitializeAcl, PROTECTED_DACL_SECURITY_INFORMATION, PSID, SECURITY_MAX_SID_SIZE,
-            TOKEN_QUERY, TOKEN_USER, TokenUser, WinWorldSid,
+            InitializeAcl, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSID,
+            SECURITY_MAX_SID_SIZE, TOKEN_QUERY, TOKEN_USER, TokenUser, WinWorldSid,
         },
         System::Threading::{GetCurrentProcess, OpenProcessToken},
     };
@@ -454,8 +454,10 @@ fn set_protected_secret_file_dacl(path: &Path, include_world: bool) -> std::io::
         SetNamedSecurityInfoW(
             wide_path.as_ptr(),
             SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            ptr::null_mut(),
+            OWNER_SECURITY_INFORMATION
+                | DACL_SECURITY_INFORMATION
+                | PROTECTED_DACL_SECURITY_INFORMATION,
+            user_sid,
             ptr::null_mut(),
             acl,
             ptr::null(),

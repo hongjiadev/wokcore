@@ -522,6 +522,35 @@ raise SystemExit(1)
 PY
 }
 
+wait_for_wokcore_ready() {
+    local owner_pid="$1"
+    local stdout_path="$ARTIFACT_DIRECTORY/readiness.stdout"
+    local stderr_path="$ARTIFACT_DIRECTORY/readiness.stderr"
+    local attempt
+    for ((attempt = 0; attempt < 200; attempt++)); do
+        kill -0 "$owner_pid" 2>/dev/null || return 1
+        if "${RUNTIME_ENVIRONMENT[@]}" "$WOKCORE_EXECUTABLE" "status" "--json" \
+            >"$stdout_path" 2>"$stderr_path" &&
+            python3 - "$stdout_path" <<'PY'
+import json
+import os
+import sys
+
+path = sys.argv[1]
+if os.path.getsize(path) >= 4096:
+    raise SystemExit(1)
+with open(path, "r", encoding="utf-8") as handle:
+    value = json.load(handle)
+raise SystemExit(0 if value.get("code") == "running" else 1)
+PY
+        then
+            return 0
+        fi
+        sleep 0.1
+    done
+    return 1
+}
+
 assert_exact_process_path() {
     local pid="$1"
     local expected="$2"
@@ -713,6 +742,8 @@ start_runtime() {
     assert_exact_process_path "$WOKCORE_PID" "$WOKCORE_EXECUTABLE"
     wait_for_loopback_port "$CORE_PORT" "$WOKCORE_PID" ||
         fail "WokCore did not become ready"
+    wait_for_wokcore_ready "$WOKCORE_PID" ||
+        fail "WokCore management plane did not become ready"
 
     monitor_runtime &
     MONITOR_PID=$!

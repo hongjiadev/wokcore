@@ -255,6 +255,9 @@ foreach ($required in @(
     'kind = "local"',
     'warmup-primary-500',
     'warmup-stabilize-500',
+    '[int] $LoadDurationMilliseconds = 30000',
+    '-TimeoutSeconds 45',
+    'Wait-WokCoreServiceReady',
     '-SampleDurationSeconds 5',
     'Provider gate evidence must remain outside the public repository.',
     'Remove-WokCoreNewSyntheticCredential'

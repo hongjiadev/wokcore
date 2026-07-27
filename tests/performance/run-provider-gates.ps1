@@ -389,6 +389,37 @@ function Wait-WokCoreLoopbackPort {
     throw "A provider gate loopback listener did not become ready."
 }
 
+function Wait-WokCoreServiceReady {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Executable,
+        [Parameter(Mandatory = $true)]
+        [Diagnostics.Process] $Owner,
+        [int] $TimeoutSeconds = 20
+    )
+
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        $Owner.Refresh()
+        if ($Owner.HasExited) {
+            throw "WokCore exited before its management plane became ready."
+        }
+        $statusOutput = & $Executable status --json 2>$null
+        if ($LASTEXITCODE -eq 0) {
+            try {
+                $status = ($statusOutput -join [Environment]::NewLine) |
+                    ConvertFrom-Json
+                if ([string] $status.code -eq "running") {
+                    return
+                }
+            } catch {
+            }
+        }
+        Start-Sleep -Milliseconds 100
+    }
+    throw "WokCore management plane did not become ready within its bounded timeout."
+}
+
 function Wait-WokCoreProcessExit {
     param(
         [Parameter(Mandatory = $true)]
@@ -643,7 +674,9 @@ function Invoke-WokCoreLoadPhase {
         [ValidateRange(3, 30)]
         [int] $SampleDurationSeconds = 3,
         [ValidateRange(0, 10000)]
-        [int] $RampMilliseconds = 0
+        [int] $RampMilliseconds = 0,
+        [ValidateRange(10000, 120000)]
+        [int] $LoadDurationMilliseconds = 30000
     )
 
     $tokenPath = Join-Path $ArtifactDirectory "$PhaseName.token"
@@ -660,7 +693,7 @@ function Invoke-WokCoreLoadPhase {
                 "--concurrency",
                 $Concurrency,
                 "--duration-ms",
-                10000,
+                $LoadDurationMilliseconds,
                 "--ramp-ms",
                 $RampMilliseconds,
                 "--protocol",
@@ -693,7 +726,7 @@ function Invoke-WokCoreLoadPhase {
         )
         $loadExitCode = Wait-WokCoreProcessExit `
             -Process $load `
-            -TimeoutSeconds 20
+            -TimeoutSeconds 45
         $serialized = [IO.File]::ReadAllText($stdoutPath, [Text.Encoding]::UTF8)
         if ($serialized.Length -eq 0 -or $serialized.Length -ge 65536) {
             throw "Load generator report was missing or exceeded its bound."
@@ -923,6 +956,9 @@ model = "synthetic"
             -PassThru
         $credentialsCreated = $true
         Wait-WokCoreLoopbackPort -Port $corePort -Owner $wokcore
+        Wait-WokCoreServiceReady `
+            -Executable $wokcoreExecutable `
+            -Owner $wokcore
 
         $authorizeOutput = & $wokcoreExecutable `
             authorize `
@@ -976,7 +1012,21 @@ model = "synthetic"
                 [uint64] $warmupResult.Load.cancelled -ne 0 -or
                 [uint64] $warmupResult.Load.errors -ne 0
             ) {
-                throw "Synthetic WokCore $warmupPass did not complete exactly."
+                $warmupFailure = (
+                    "Synthetic WokCore {0} did not complete exactly " +
+                    "(started={1}, active={2}, peak={3}, completed={4}, " +
+                    "cancelled={5}, errors={6}, exit={7})."
+                ) -f @(
+                    $warmupPass,
+                    $warmupResult.Load.started,
+                    $warmupResult.Load.active,
+                    $warmupResult.Load.peak_active,
+                    $warmupResult.Load.completed,
+                    $warmupResult.Load.cancelled,
+                    $warmupResult.Load.errors,
+                    $warmupResult.Load.exit_code
+                )
+                throw $warmupFailure
             }
         }
         Stop-WokCoreGateProcess -Process $simulator

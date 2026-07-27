@@ -6,6 +6,9 @@ SCRIPT_DIRECTORY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 source "$SCRIPT_DIRECTORY/run-provider-gates.sh"
 trap - EXIT INT TERM HUP
 
+grep -q 'wait_for_wokcore_ready' "$SCRIPT_DIRECTORY/run-provider-gates.sh"
+grep -q '"status" "--json"' "$SCRIPT_DIRECTORY/run-provider-gates.sh"
+
 (
     PROFILE=""
     OUTPUT_DIRECTORY=""

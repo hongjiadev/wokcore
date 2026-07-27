@@ -36,6 +36,8 @@ const DIAGNOSTIC_DELETE_TOMBSTONE_MARKER_SUFFIX: &str = ".owner";
 const DIAGNOSTIC_DELETE_TOMBSTONE_MARKER_MAGIC: &[u8; 8] = b"WOKDTM01";
 #[cfg(unix)]
 const DIAGNOSTIC_DELETE_TOMBSTONE_MARKER_BYTES: usize = 24;
+#[cfg(target_os = "macos")]
+const DIAGNOSTIC_PARENT_LOCK_NAME: &str = ".wokcore-diagnostic-parent.lock";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum DiagnosticStoreError {
@@ -338,11 +340,7 @@ impl DiagnosticDirectory {
             cursor = raw.last().map(|entry| entry.name().to_os_string());
             let raw_count = raw.len();
             for (index, entry) in raw.into_iter().enumerate() {
-                if entry
-                    .name()
-                    .to_str()
-                    .is_some_and(|name| name.starts_with(DIAGNOSTIC_EXPORT_TEMPORARY_PREFIX))
-                {
+                if is_export_temporary(entry.name()) || is_parent_lock(entry.name()) {
                     continue;
                 }
                 if is_delete_tombstone(entry.name()) {
@@ -384,7 +382,7 @@ impl DiagnosticDirectory {
 
 fn validate_diagnostic_name(name: &OsStr) -> Result<(), DiagnosticStoreError> {
     validate_child_name(name).map_err(map_session_error)?;
-    if is_delete_tombstone(name) || is_export_temporary(name) {
+    if is_delete_tombstone(name) || is_export_temporary(name) || is_parent_lock(name) {
         return Err(DiagnosticStoreError::UnsafePath);
     }
     Ok(())
@@ -398,6 +396,16 @@ fn is_export_temporary(name: &OsStr) -> bool {
 fn is_delete_tombstone(name: &OsStr) -> bool {
     name.to_str()
         .is_some_and(|name| name.starts_with(DIAGNOSTIC_DELETE_TOMBSTONE_PREFIX))
+}
+
+#[cfg(target_os = "macos")]
+fn is_parent_lock(name: &OsStr) -> bool {
+    name == OsStr::new(DIAGNOSTIC_PARENT_LOCK_NAME)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_parent_lock(_name: &OsStr) -> bool {
+    false
 }
 
 fn validated_diagnostic_entry(
@@ -1090,7 +1098,7 @@ enum InternalFileSize {
 
 #[cfg(unix)]
 struct DiagnosticParentLock {
-    directory: File,
+    file: File,
 }
 
 #[cfg(unix)]
@@ -1099,12 +1107,12 @@ impl Drop for DiagnosticParentLock {
         use std::os::fd::AsRawFd;
 
         unsafe {
-            libc::flock(self.directory.as_raw_fd(), libc::LOCK_UN);
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
         }
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn try_lock_diagnostic_parent(
     parent: &DirectoryChain,
 ) -> Result<Option<DiagnosticParentLock>, SessionError> {
@@ -1143,7 +1151,61 @@ fn try_lock_diagnostic_parent(
         };
     }
     validate_directory_chain(parent)?;
-    Ok(Some(DiagnosticParentLock { directory }))
+    Ok(Some(DiagnosticParentLock { file: directory }))
+}
+
+#[cfg(target_os = "macos")]
+fn try_lock_diagnostic_parent(
+    parent: &DirectoryChain,
+) -> Result<Option<DiagnosticParentLock>, SessionError> {
+    use std::os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::fs::PermissionsExt,
+    };
+
+    validate_directory_chain(parent)?;
+    let descriptor = unsafe {
+        libc::openat(
+            parent.file().as_raw_fd(),
+            c".wokcore-diagnostic-parent.lock".as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if descriptor < 0 {
+        return Err(SessionError::Io {
+            source: std::io::Error::last_os_error(),
+        });
+    }
+    let file = unsafe { File::from_raw_fd(descriptor) };
+    if !safe_internal_file(&file, InternalFileSize::Exact(0), false)? {
+        return Err(SessionError::UnsafePath);
+    }
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    if !strict_internal_file(&file, InternalFileSize::Exact(0))? {
+        return Err(SessionError::UnsafePath);
+    }
+    let expected = file_identity(&file)?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let source = std::io::Error::last_os_error();
+        return if source
+            .raw_os_error()
+            .is_some_and(|code| code == libc::EWOULDBLOCK || code == libc::EAGAIN)
+        {
+            Ok(None)
+        } else {
+            Err(SessionError::Io { source })
+        };
+    }
+    validate_directory_chain(parent)?;
+    let current = open_child_for_update(parent, OsStr::new(DIAGNOSTIC_PARENT_LOCK_NAME))?;
+    if !strict_internal_file(&current, InternalFileSize::Exact(0))?
+        || file_identity(&current)? != expected
+    {
+        return Err(SessionError::UnsafePath);
+    }
+    validate_directory_chain(parent)?;
+    Ok(Some(DiagnosticParentLock { file }))
 }
 
 #[cfg(unix)]
@@ -1919,6 +1981,36 @@ mod tests {
         file.set_permissions(fs::Permissions::from_mode(mode))
             .unwrap();
         file
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_parent_lock_is_private_exclusive_and_hidden_from_diagnostic_entries() {
+        use std::os::unix::fs::MetadataExt;
+
+        let fixture = tempdir().unwrap();
+        let root = fixture.path().join("diagnostics");
+        fs::create_dir(&root).unwrap();
+        let directory = DiagnosticDirectory::open(&root).unwrap();
+        let parent = directory.root.clone_chain().unwrap();
+        let first = super::try_lock_diagnostic_parent(&parent).unwrap().unwrap();
+
+        assert!(
+            super::try_lock_diagnostic_parent(&parent)
+                .unwrap()
+                .is_none()
+        );
+        assert!(directory.entries(0).unwrap().is_empty());
+        let metadata = fs::metadata(root.join(super::DIAGNOSTIC_PARENT_LOCK_NAME)).unwrap();
+        assert_eq!(metadata.mode() & 0o7777, 0o600);
+        assert_eq!(metadata.nlink(), 1);
+
+        drop(first);
+        assert!(
+            super::try_lock_diagnostic_parent(&parent)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
