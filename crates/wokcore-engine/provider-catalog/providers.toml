@@ -39,6 +39,7 @@ model_source = "hybrid"
 aliases = []
 models = ["grok-4.5", "grok-4.3", "grok-4.20-0309-reasoning", "grok-4.20-0309-non-reasoning", "grok-build-0.1", "grok-composer-2.5-fast"]
 default_model = "grok-4.5"
+allow_key_auth_override = true
 capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true }
 
 [[providers]]
@@ -234,6 +235,7 @@ endpoint_policy = "loopback_http"
 model_source = "live"
 aliases = []
 models = []
+allow_endpoint_override = true
 capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true }
 
 [[providers]]
@@ -246,6 +248,7 @@ endpoint_policy = "loopback_http"
 model_source = "live"
 aliases = []
 models = []
+allow_endpoint_override = true
 capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true }
 
 [[providers]]
@@ -258,6 +261,7 @@ endpoint_policy = "loopback_http"
 model_source = "live"
 aliases = []
 models = []
+allow_endpoint_override = true
 capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true }
 
 [[providers]]
@@ -429,6 +433,7 @@ endpoint_policy = "public_https"
 model_source = "none"
 aliases = []
 models = []
+allow_endpoint_override = true
 capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true }
 
 [[providers]]
@@ -492,6 +497,7 @@ model_source = "static"
 aliases = []
 models = ["qwen3.8-max-preview", "qwen3.7-max", "qwen3.7-plus", "qwen3.6-plus", "qwen3.6-flash", "deepseek-v4-pro", "deepseek-v4-flash", "deepseek-v3.2", "kimi-k2.7-code", "kimi-k2.6", "kimi-k2.5", "glm-5.2", "glm-5.1", "glm-5", "MiniMax-M2.5"]
 default_model = "qwen3.7-max"
+allow_endpoint_override = true
 capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true }
 
 [[providers]]
@@ -528,6 +534,8 @@ endpoint_policy = "loopback_http"
 model_source = "live"
 aliases = []
 models = []
+allow_endpoint_override = true
+key_optional = true
 capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true }
 
 [[providers]]
@@ -629,6 +637,7 @@ endpoint_policy = "public_https"
 model_source = "live"
 aliases = []
 models = []
+key_optional = true
 capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true }
 
 [[providers]]
@@ -667,6 +676,7 @@ model_source = "hybrid"
 aliases = []
 models = ["mimo-auto"]
 default_model = "mimo-auto"
+key_optional = true
 capabilities = { text = true, streaming = true, tools = true, vision = false, images = false, reasoning = true }
 
 [[providers]]
@@ -705,6 +715,7 @@ model_source = "hybrid"
 aliases = []
 models = ["gpt-4o", "gpt-4.1", "gpt-4.1-mini", "claude-sonnet-4", "gemini-2.5-pro"]
 default_model = "gpt-4o"
+allow_key_auth_override = true
 capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true }
 
 [[providers]]

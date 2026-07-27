@@ -282,3 +282,18 @@ Private pre-rewrite recovery material is excluded from this public repository.
 - Verification:
   - `cargo +1.97.1 test -p wokcore-engine --test provider_catalog --locked --offline`
   - `cargo +1.97.1 clippy -p wokcore-engine --all-targets --all-features --locked --offline -- -D warnings`
+
+## Runtime foundation 12: revisioned Provider and routing configuration
+
+- Original WokCore implementation; no external configuration code is imported.
+- `wokcore-core` defines bounded Provider instances, accounts, tagged authentication references, model aliases, exact client/model rules, and default route targets. Authentication fields accept only validated opaque `SecretRef` values.
+- Existing server-only TOML documents load with empty Provider/routing defaults. New commits preserve the existing optimistic revision and atomic replacement contract while serializing strict nested Provider/routing tables.
+- Shape validation runs before the configuration lock or file is created. It rejects excessive collections, duplicate identifiers/aliases, dangling account/routes, invalid model IDs, and endpoint URLs containing credentials, queries, fragments, templates, unsupported schemes, or missing hosts.
+- `wokcore-engine` adds catalog-aware validation for known Provider IDs, endpoint-override permission, public HTTPS, explicit private-network opt-in, IPv4-mapped IPv6 private addresses, and exact authentication-kind compatibility.
+- Provider endpoint debug output exposes only whether an override is present. `SecretRef` remains redacted, and parse/serialization errors use content-free messages rather than echoing rejected values.
+- This layer performs no Provider discovery, OAuth, credential resolution, DNS lookup, or network request.
+- Verification:
+  - fixed-host `wokcore-engine` Provider configuration tests;
+  - fixed-host `wokcore-storage` legacy/round-trip/strict-schema/privacy tests;
+  - complete Windows workspace suite through `E:/Projects/wokcore/target/wokcore-test-host.exe`;
+  - Clippy with `-D warnings` for core, engine, storage, server, and application targets.

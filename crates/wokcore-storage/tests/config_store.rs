@@ -7,6 +7,11 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
+use wokcore_core::{
+    config::{AccountAuthConfig, AccountConfig, ProviderInstanceConfig},
+    id::{AccountId, ProviderId},
+    secret::SecretRef,
+};
 use wokcore_storage::{AppConfig, ConfigStore, StorageError};
 
 #[test]
@@ -37,6 +42,78 @@ fn commit_creates_revision_one_and_survives_reload() {
     assert_eq!(committed.revision, 1);
     assert_eq!(committed.config, candidate);
     assert_eq!(store.load().unwrap(), committed);
+}
+
+#[test]
+fn legacy_server_only_config_loads_empty_provider_defaults() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    fs::write(&path, "revision = 7\n\n[server]\nport = 12001\n").unwrap();
+
+    let loaded = ConfigStore::new(path).load().unwrap();
+
+    assert_eq!(loaded.revision, 7);
+    assert_eq!(loaded.config.server.port, 12001);
+    assert!(loaded.config.providers.instances.is_empty());
+    assert!(loaded.config.providers.accounts.is_empty());
+    assert!(loaded.config.routing.aliases.is_empty());
+    assert!(loaded.config.routing.rules.is_empty());
+    assert!(loaded.config.routing.default.is_none());
+}
+
+#[test]
+fn provider_configuration_round_trips_with_opaque_secret_references() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    let store = ConfigStore::new(&path);
+    let mut candidate = AppConfig::default();
+    candidate.providers.instances.push(ProviderInstanceConfig {
+        id: ProviderId::new("primary").unwrap(),
+        catalog_id: ProviderId::new("openai-apikey").unwrap(),
+        enabled: true,
+        endpoint: None,
+        allow_private_network: false,
+    });
+    candidate.providers.accounts.push(AccountConfig {
+        id: AccountId::new("work").unwrap(),
+        provider: ProviderId::new("primary").unwrap(),
+        enabled: true,
+        auth: AccountAuthConfig::ApiKey {
+            secret: SecretRef::parse("secret:00000000-0000-4000-8000-000000000001").unwrap(),
+        },
+    });
+
+    let committed = store.commit(0, &candidate).unwrap();
+    let document = fs::read_to_string(&path).unwrap();
+
+    assert_eq!(store.load().unwrap(), committed);
+    assert!(document.contains("secret:00000000-0000-4000-8000-000000000001"));
+    for forbidden in ["api_key =", "password =", "authorization =", "bearer ="] {
+        assert!(
+            !document.to_ascii_lowercase().contains(forbidden),
+            "serialized config contains raw credential field {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn unsafe_endpoint_credentials_are_rejected_before_config_file_creation() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    let mut candidate = AppConfig::default();
+    candidate.providers.instances.push(ProviderInstanceConfig {
+        id: ProviderId::new("primary").unwrap(),
+        catalog_id: ProviderId::new("qwen-cloud").unwrap(),
+        enabled: true,
+        endpoint: Some("https://compatible.example/v1?api_key=raw-secret".to_owned()),
+        allow_private_network: false,
+    });
+
+    let error = ConfigStore::new(&path).commit(0, &candidate).unwrap_err();
+
+    assert!(matches!(error, StorageError::InvalidConfig { .. }));
+    assert!(!path.exists());
+    assert!(!directory.path().join("config.toml.lock").exists());
 }
 
 #[test]
@@ -101,7 +178,7 @@ fn zero_port_is_rejected_before_creating_file_or_lock() {
 }
 
 #[test]
-fn serialized_config_has_only_revision_and_server_port() {
+fn serialized_config_has_only_safe_revision_server_provider_and_routing_fields() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("config.toml");
     ConfigStore::new(&path)
@@ -113,6 +190,12 @@ fn serialized_config_has_only_revision_and_server_port() {
     assert!(document.contains("revision = 1"));
     assert!(document.contains("[server]"));
     assert!(document.contains("port = 10101"));
+    assert!(document.contains("[providers]"));
+    assert!(document.contains("instances = []"));
+    assert!(document.contains("accounts = []"));
+    assert!(document.contains("[routing]"));
+    assert!(document.contains("aliases = []"));
+    assert!(document.contains("rules = []"));
     for forbidden in [
         "host",
         "allow_insecure_private_lan",
@@ -137,9 +220,28 @@ fn unknown_fields_are_rejected_without_mutating_the_source() {
         "revision = 1\nlocale = \"en\"\n\n[server]\nport = 10101\n",
         "revision = 1\ntimezone = \"UTC\"\n\n[server]\nport = 10101\n",
         "revision = 1\n\n[server]\nport = 10101\n\n[ui]\nlocale = \"en\"\ntimezone = \"UTC\"\n",
+        "revision = 1\n\n[server]\nport = 10101\n\n[providers]\ninstances = []\naccounts = []\nraw_token = \"forbidden\"\n",
+        "revision = 1\n\n[server]\nport = 10101\n\n[providers]\naccounts = []\n\n[[providers.instances]]\nid = \"primary\"\ncatalog_id = \"qwen-cloud\"\nenabled = true\nallow_private_network = false\nunknown = true\n",
+        "revision = 1\n\n[server]\nport = 10101\n\n[providers]\ninstances = []\n\n[[providers.accounts]]\nid = \"work\"\nprovider = \"primary\"\nenabled = true\n\n[providers.accounts.auth]\nkind = \"api_key\"\nsecret = \"secret:00000000-0000-4000-8000-000000000001\"\napi_key = \"forbidden\"\n",
+        "revision = 1\n\n[server]\nport = 10101\n\n[providers]\ninstances = []\naccounts = []\n\n[routing]\naliases = []\nrules = []\nunknown = true\n",
     ] {
         assert_invalid_document_is_preserved(document);
     }
+}
+
+#[test]
+fn invalid_config_errors_do_not_echo_rejected_values() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    fs::write(
+        &path,
+        "revision = 1\n\n[server]\nport = \"raw-credential-must-not-escape\"\n",
+    )
+    .unwrap();
+
+    let error = ConfigStore::new(path).load().unwrap_err().to_string();
+
+    assert!(!error.contains("raw-credential-must-not-escape"));
 }
 
 #[test]

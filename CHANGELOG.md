@@ -26,6 +26,7 @@ All notable WokCore changes are documented in this file.
 - Terminal-safe Session/log CLI output, JSON/JSONL modes, repeatable authorization scopes, and create-new diagnostic ZIP export protected from Session-root aliasing.
 - Typed request diagnostics correlated by response request ID; ordinary request events stay memory-only while internal failures remain durable warning candidates.
 - Internal `wokcore-engine` with a strict, immutable 58-Provider frozen catalog, explicit adapter/auth/endpoint/model/capability metadata, and content-free fail-closed validation.
+- Revisioned Provider instance, account, secret-reference, model-alias, route-rule, and default-route configuration with server-only backward compatibility, strict nested schemas, safe endpoint policy, and redacted debug/error output.
 
 ### Fixed
 

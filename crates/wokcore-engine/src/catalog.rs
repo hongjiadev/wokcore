@@ -76,6 +76,12 @@ pub struct ProviderDefinition {
     pub aliases: Vec<String>,
     pub models: Vec<String>,
     pub default_model: Option<String>,
+    #[serde(default)]
+    pub allow_endpoint_override: bool,
+    #[serde(default)]
+    pub key_optional: bool,
+    #[serde(default)]
+    pub allow_key_auth_override: bool,
     pub capabilities: ProviderCapabilities,
 }
 
@@ -111,6 +117,10 @@ impl ProviderCatalog {
 
     pub fn providers(&self) -> &[ProviderDefinition] {
         &self.providers
+    }
+
+    pub fn provider(&self, id: &str) -> Option<&ProviderDefinition> {
+        self.providers.iter().find(|provider| provider.id == id)
     }
 
     pub fn canonical_json(&self) -> Result<Vec<u8>, CatalogError> {
@@ -319,7 +329,7 @@ fn expand_endpoint_template(endpoint: &str) -> Result<String, CatalogError> {
     Ok(expanded)
 }
 
-fn is_private_host(host: Host<&str>) -> bool {
+pub(crate) fn is_private_host(host: Host<&str>) -> bool {
     match host {
         Host::Domain(domain) => {
             let domain = domain.to_ascii_lowercase();
@@ -346,7 +356,10 @@ fn is_private_ip(address: IpAddr) -> bool {
                 || address.octets()[0] == 0
         }
         IpAddr::V6(address) => {
-            address.is_loopback()
+            address
+                .to_ipv4_mapped()
+                .is_some_and(|mapped| is_private_ip(IpAddr::V4(mapped)))
+                || address.is_loopback()
                 || address.is_unspecified()
                 || address.is_multicast()
                 || is_ipv6_unique_local(address)

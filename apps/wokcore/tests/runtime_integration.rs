@@ -482,6 +482,7 @@ fn persist_port(paths: &AppPaths, port: u16) {
             0,
             &AppConfig {
                 server: ServerConfig { port },
+                ..AppConfig::default()
             },
         )
         .unwrap();

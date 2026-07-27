@@ -38,13 +38,15 @@ impl ConfigStore {
         };
 
         let persisted: PersistedConfig =
-            toml_edit::de::from_str(&document).map_err(|error| StorageError::InvalidConfig {
-                message: error.to_string(),
+            toml_edit::de::from_str(&document).map_err(|_| StorageError::InvalidConfig {
+                message: "configuration document does not match the supported schema".to_owned(),
             })?;
         let loaded = VersionedConfig {
             revision: persisted.revision,
             config: AppConfig {
                 server: persisted.server,
+                providers: persisted.providers,
+                routing: persisted.routing,
             },
         };
         validate(&loaded.config)?;
@@ -101,10 +103,12 @@ impl ConfigStore {
         let persisted = PersistedConfig {
             revision: committed.revision,
             server: committed.config.server.clone(),
+            providers: committed.config.providers.clone(),
+            routing: committed.config.routing.clone(),
         };
-        let document = toml_edit::ser::to_string_pretty(&persisted).map_err(|error| {
+        let document = toml_edit::ser::to_string_pretty(&persisted).map_err(|_| {
             StorageError::SerializeConfig {
-                message: error.to_string(),
+                message: "configuration could not be encoded".to_owned(),
             }
         })?;
 
@@ -145,6 +149,10 @@ fn validate(config: &AppConfig) -> Result<(), StorageError> {
             message: "server port must be non-zero".to_owned(),
         });
     }
+    wokcore_core::config::validate_provider_configuration_shape(&config.providers, &config.routing)
+        .map_err(|_| StorageError::InvalidConfig {
+            message: "Provider or routing configuration has an invalid shape".to_owned(),
+        })?;
     Ok(())
 }
 
