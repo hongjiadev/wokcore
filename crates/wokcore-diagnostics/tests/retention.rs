@@ -35,11 +35,23 @@ fn canonical_event(sequence: u64) -> Vec<u8> {
     encoded
 }
 
+fn write_owned_file(path: &std::path::Path, bytes: &[u8]) -> File {
+    let mut file = File::create(path).unwrap();
+    file.write_all(bytes).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .unwrap();
+    }
+    file
+}
+
 fn create_segment(root: &std::path::Path, index: u64, modified: SystemTime) -> usize {
     let path = root.join(format!("segment-{index:020}.jsonl"));
     let encoded = canonical_event(index);
-    let mut file = File::create(path).unwrap();
-    file.write_all(&encoded).unwrap();
+    let file = write_owned_file(&path, &encoded);
     file.set_times(FileTimes::new().set_modified(modified))
         .unwrap();
     encoded.len()
@@ -135,12 +147,11 @@ fn retention_never_owns_or_deletes_canonical_segment_index_zero() {
     fs::create_dir(&root).unwrap();
     let zero = root.join("segment-00000000000000000000.jsonl");
     let zero_bytes = canonical_event(1);
-    fs::write(&zero, &zero_bytes).unwrap();
-    fs::write(
-        root.join("segment-00000000000000000001.jsonl"),
-        canonical_event(2),
-    )
-    .unwrap();
+    write_owned_file(&zero, &zero_bytes);
+    write_owned_file(
+        &root.join("segment-00000000000000000001.jsonl"),
+        &canonical_event(2),
+    );
     let manager = RetentionManager::with_policy(
         &root,
         RetentionPolicy::with_limits(Duration::ZERO, 0).unwrap(),
@@ -159,9 +170,9 @@ fn retention_rejects_hardlinked_owned_names_without_deleting_either_link() {
     fs::create_dir(&root).unwrap();
     let segment = root.join("segment-00000000000000000001.jsonl");
     let foreign = root.join("foreign-hardlink.bin");
-    fs::write(&segment, b"safe").unwrap();
+    write_owned_file(&segment, b"safe");
     fs::hard_link(&segment, &foreign).unwrap();
-    fs::write(root.join("segment-00000000000000000002.jsonl"), b"active").unwrap();
+    write_owned_file(&root.join("segment-00000000000000000002.jsonl"), b"active");
     let manager = RetentionManager::with_policy(
         &root,
         RetentionPolicy::with_limits(Duration::ZERO, 0).unwrap(),
@@ -209,11 +220,10 @@ fn retention_pages_through_more_than_4096_owned_segments_with_bounded_state() {
     let root = directory.path().join("paged");
     fs::create_dir(&root).unwrap();
     for index in 1..=4_101 {
-        fs::write(
-            root.join(format!("segment-{index:020}.jsonl")),
-            canonical_event(index),
-        )
-        .unwrap();
+        write_owned_file(
+            &root.join(format!("segment-{index:020}.jsonl")),
+            &canonical_event(index),
+        );
     }
     let manager = RetentionManager::with_policy(
         &root,
@@ -279,9 +289,9 @@ fn corrupt_canonical_segment_aborts_zero_retention_without_deleting_valid_segmen
     let first_bytes = canonical_event(1);
     let corrupt_bytes = b"{\"invalid\":true}\n".to_vec();
     let active_bytes = canonical_event(3);
-    fs::write(&first, &first_bytes).unwrap();
-    fs::write(&corrupt, &corrupt_bytes).unwrap();
-    fs::write(&active, &active_bytes).unwrap();
+    write_owned_file(&first, &first_bytes);
+    write_owned_file(&corrupt, &corrupt_bytes);
+    write_owned_file(&active, &active_bytes);
     let manager = RetentionManager::with_policy(
         &root,
         RetentionPolicy::with_limits(Duration::ZERO, 0).unwrap(),
@@ -307,9 +317,9 @@ fn nonmonotonic_canonical_sequence_aborts_zero_retention_without_deleting_anythi
     let first_bytes = canonical_event(2);
     let regressed_bytes = canonical_event(1);
     let active_bytes = canonical_event(3);
-    fs::write(&first, &first_bytes).unwrap();
-    fs::write(&regressed, &regressed_bytes).unwrap();
-    fs::write(&active, &active_bytes).unwrap();
+    write_owned_file(&first, &first_bytes);
+    write_owned_file(&regressed, &regressed_bytes);
+    write_owned_file(&active, &active_bytes);
     let manager = RetentionManager::with_policy(
         &root,
         RetentionPolicy::with_limits(Duration::ZERO, 0).unwrap(),
@@ -333,7 +343,7 @@ fn explicit_active_index_must_be_the_highest_canonical_segment() {
     for index in 1..=3 {
         let path = root.join(format!("segment-{index:020}.jsonl"));
         let bytes = canonical_event(index);
-        fs::write(&path, &bytes).unwrap();
+        write_owned_file(&path, &bytes);
         originals.push((path, bytes));
     }
     let manager = RetentionManager::with_policy(
