@@ -1152,7 +1152,6 @@ mod apple {
 
     const NO_ERR: OsErr = 0;
     const DUPLICATE_FILE_NAME_ERROR: OsErr = -48;
-    const CATALOG_NODE_ID: CatalogInfoBitmap = 0x0000_0010;
     const CATALOG_PERMISSIONS: CatalogInfoBitmap = 0x0000_0400;
     const READ_WRITE_PERMISSION: i8 = 3;
     const AT_MARK: u16 = 0;
@@ -1747,7 +1746,7 @@ mod apple {
             &self,
             identity: SessionFileIdentity,
         ) -> Result<(), SessionError> {
-            verify_catalog_node_identity(&self.object.reference, identity)
+            verify_reference_identity(&self.object.reference, identity)
         }
 
         pub(super) fn remove_owned(&mut self) -> Result<(), SessionError> {
@@ -1833,39 +1832,45 @@ mod apple {
         if file_identity(&verified)? != pinned_identity {
             return Err(SessionError::UnsafePath);
         }
-        verify_catalog_node_identity(&reference, pinned_identity)?;
+        verify_reference_identity(&reference, pinned_identity)?;
         parent.verify_stability(&stability)?;
         Ok(reference)
     }
 
-    fn verify_catalog_node_identity(
+    fn verify_reference_identity(
         reference: &FsRef,
         pinned_identity: SessionFileIdentity,
     ) -> Result<(), SessionError> {
         #[cfg(test)]
-        if super::apple_catalog_node_id_check_skipped() {
+        if super::apple_reference_identity_check_skipped() {
             return Ok(());
         }
-        let SessionFileIdentity::Unix { inode, .. } = pinned_identity;
-        let Ok(inode) = u32::try_from(inode) else {
-            return Ok(());
-        };
-        let mut catalog = unsafe { MaybeUninit::<CatalogInfo>::zeroed().assume_init() };
+
+        let mut path = [0_u8; libc::PATH_MAX as usize];
         let status = unsafe {
-            FSGetCatalogInfo(
+            FSRefMakePath(
                 reference,
-                CATALOG_NODE_ID,
-                &mut catalog,
-                ptr::null_mut(),
-                ptr::null_mut(),
-                ptr::null_mut(),
+                path.as_mut_ptr(),
+                u32::try_from(path.len()).map_err(|_| SessionError::UnsafePath)?,
             )
         };
-        if status != NO_ERR {
-            return Err(carbon_error("FSGetCatalogInfo", i32::from(status)));
+        if status != i32::from(NO_ERR) {
+            return Err(carbon_error("FSRefMakePath", status));
         }
-        let node_id = unsafe { ptr::addr_of!(catalog.node_id).read_unaligned() };
-        if node_id != inode {
+        let path = unsafe { CStr::from_ptr(path.as_ptr().cast()) };
+        let descriptor = unsafe {
+            libc::open(
+                path.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            )
+        };
+        if descriptor < 0 {
+            return Err(SessionError::Io {
+                source: io::Error::last_os_error(),
+            });
+        }
+        let current = unsafe { File::from_raw_fd(descriptor) };
+        if file_identity(&current)? != pinned_identity {
             return Err(SessionError::UnsafePath);
         }
         Ok(())
@@ -1918,7 +1923,8 @@ std::thread_local! {
     #[cfg(target_vendor = "apple")]
     static FAIL_APPLE_DELETE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     #[cfg(target_vendor = "apple")]
-    static SKIP_APPLE_CATALOG_NODE_ID: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static SKIP_APPLE_REFERENCE_IDENTITY: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -1957,8 +1963,8 @@ fn apple_delete_failure_injected() -> bool {
 }
 
 #[cfg(all(test, target_vendor = "apple"))]
-fn apple_catalog_node_id_check_skipped() -> bool {
-    SKIP_APPLE_CATALOG_NODE_ID.with(|skipped| skipped.replace(false))
+fn apple_reference_identity_check_skipped() -> bool {
+    SKIP_APPLE_REFERENCE_IDENTITY.with(|skipped| skipped.replace(false))
 }
 
 #[cfg(all(test, target_vendor = "apple"))]
@@ -3010,7 +3016,7 @@ mod apple_regression_tests {
         let worker = thread::spawn(move || {
             thread_tx.send(thread::current().id()).unwrap();
             start_rx.recv().unwrap();
-            super::SKIP_APPLE_CATALOG_NODE_ID.with(|skipped| skipped.set(true));
+            super::SKIP_APPLE_REFERENCE_IDENTITY.with(|skipped| skipped.set(true));
             result_tx
                 .send(PinnedExportDestination::create(&target, &[&session]))
                 .unwrap();
