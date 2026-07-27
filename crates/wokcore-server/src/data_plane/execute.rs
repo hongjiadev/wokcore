@@ -678,6 +678,16 @@ pub trait UpstreamExecutor: Send + Sync + 'static {
         request: UpstreamExecutionRequest,
         cancellation: ExecutionCancellation,
     ) -> UpstreamExecutionResult;
+
+    async fn execute_image(
+        &self,
+        _request: super::ImageExecutionRequest,
+        _cancellation: ExecutionCancellation,
+    ) -> super::ImageExecutionResult {
+        super::ImageExecutionResult::Failed(UpstreamExecutionFailure::new(
+            UpstreamFailureKind::Policy,
+        ))
+    }
 }
 
 enum AttemptExecutionOutput {

@@ -1,10 +1,16 @@
 use std::{
+    io,
+    pin::Pin,
     sync::Arc,
+    task::{Context, Poll},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
+use bytes::Bytes;
+use futures_core::Stream;
 use secrecy::SecretString;
+use tokio::{io::AsyncReadExt, sync::mpsc};
 use url::Url;
 use wokcore_engine::{
     auth::{SecretResolutionError, SecretResolver, resolve_outbound_auth},
@@ -19,17 +25,24 @@ use wokcore_engine::{
 use wokcore_protocols::{
     UpstreamLimits,
     canonical::{GatewayError, RetryClass},
+    images::ImageEditMetadata,
     upstream::{
         UpstreamAdapter, UpstreamOperation as ProtocolOperation, UpstreamProtocol,
         UpstreamStreamDecoder,
     },
 };
 use wokcore_server::data_plane::{
-    SafeUpstreamRequestId, UpstreamExecutionFailure, UpstreamExecutionRequest,
+    ImageExecutionInput, ImageExecutionRequest, ImageExecutionResponse, ImageExecutionResult,
+    ImageInputFile, SafeUpstreamRequestId, UpstreamExecutionFailure, UpstreamExecutionRequest,
     UpstreamExecutionResponse, UpstreamExecutionResult, UpstreamExecutionStream, UpstreamExecutor,
     UpstreamFailureKind, UpstreamOperation,
 };
 use wokcore_storage::{SecretStore, StorageError};
+
+const IMAGE_MULTIPART_WIRE_LIMIT: usize = 51 * 1024 * 1024;
+const IMAGE_RESPONSE_LIMIT: usize = 50 * 1024 * 1024;
+const MULTIPART_CHANNEL_CAPACITY: usize = 1;
+const MULTIPART_FILE_CHUNK_BYTES: usize = 64 * 1024;
 
 #[derive(Clone)]
 pub struct ProductionUpstreamExecutor {
@@ -64,9 +77,97 @@ impl UpstreamExecutor for ProductionUpstreamExecutor {
             .await
             .unwrap_or_else(UpstreamExecutionResult::Failed)
     }
+
+    async fn execute_image(
+        &self,
+        request: ImageExecutionRequest,
+        cancellation: ExecutionCancellation,
+    ) -> ImageExecutionResult {
+        self.execute_image_inner(request, cancellation)
+            .await
+            .unwrap_or_else(ImageExecutionResult::Failed)
+    }
 }
 
 impl ProductionUpstreamExecutor {
+    async fn execute_image_inner(
+        &self,
+        request: ImageExecutionRequest,
+        cancellation: ExecutionCancellation,
+    ) -> Result<ImageExecutionResult, UpstreamExecutionFailure> {
+        let operation = match request.input() {
+            ImageExecutionInput::Generation(_) => ImageOperation::Generation,
+            ImageExecutionInput::Edit(_) => ImageOperation::Edit,
+        };
+        let endpoint = image_endpoint(
+            request.endpoint(),
+            request.adapter(),
+            operation,
+            request.model(),
+        )?;
+        let authorization =
+            resolve_outbound_auth(request.auth(), request.adapter(), self.secrets.as_ref())
+                .await
+                .map_err(|_| failure(UpstreamFailureKind::InvalidCredentials))?;
+        let network_policy = network_policy(request.endpoint_access());
+        let request_id = request.request_id().to_owned();
+        let model = request.model().to_owned();
+        let mut transport_request = match request.into_input() {
+            ImageExecutionInput::Generation(input) => {
+                let body = input.encode_with_model(&model).map_err(map_request_error)?;
+                TransportRequest::post(endpoint, body, false, network_policy)
+                    .with_header("content-type", "application/json")
+                    .map_err(map_transport_error)?
+            }
+            ImageExecutionInput::Edit(input) => {
+                let upload = multipart_upload(
+                    input.into_parts(),
+                    &model,
+                    &request_id,
+                    cancellation.clone(),
+                )?;
+                TransportRequest::post_stream(
+                    endpoint,
+                    upload.stream,
+                    upload.content_length,
+                    false,
+                    network_policy,
+                )
+                .map_err(map_transport_error)?
+                .with_header("content-type", &upload.content_type)
+                .map_err(map_transport_error)?
+            }
+        }
+        .with_header("accept", "application/json")
+        .map_err(map_transport_error)?
+        .with_body_limits(IMAGE_MULTIPART_WIRE_LIMIT, IMAGE_RESPONSE_LIMIT)
+        .map_err(map_transport_error)?;
+        if let Some(authorization) = authorization {
+            let (name, value) = authorization.into_parts();
+            transport_request = transport_request
+                .with_sensitive_header(name, value)
+                .map_err(map_transport_error)?;
+        }
+        let response = self
+            .transport
+            .execute(transport_request, &cancellation)
+            .await
+            .map_err(map_transport_error)?;
+        let TransportResponse::Complete(response) = response else {
+            return Err(failure(UpstreamFailureKind::MalformedResponse));
+        };
+        let upstream_request_id = upstream_request_id(response.head());
+        if !(200..=299).contains(&response.head().status()) {
+            return Err(http_failure(response.head(), upstream_request_id));
+        }
+        let mut response = ImageExecutionResponse::json(response.into_body())
+            .map_err(|_| failure(UpstreamFailureKind::MalformedResponse))?;
+        if let Some(request_id) = upstream_request_id {
+            response = response.with_upstream_request_id(request_id);
+        }
+        Ok(ImageExecutionResult::Succeeded(response))
+    }
+
     async fn execute_inner(
         &self,
         request: UpstreamExecutionRequest,
@@ -158,6 +259,207 @@ impl ProductionUpstreamExecutor {
                 Ok(UpstreamExecutionResult::Streaming(stream))
             }
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ImageOperation {
+    Generation,
+    Edit,
+}
+
+fn image_endpoint(
+    endpoint: &str,
+    adapter: AdapterFamily,
+    operation: ImageOperation,
+    model: &str,
+) -> Result<Url, UpstreamExecutionFailure> {
+    let mut endpoint = Url::parse(endpoint).map_err(|_| failure(UpstreamFailureKind::Policy))?;
+    if !matches!(endpoint.scheme(), "http" | "https")
+        || endpoint.host_str().is_none()
+        || !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.query().is_some()
+        || endpoint.fragment().is_some()
+    {
+        return Err(failure(UpstreamFailureKind::Policy));
+    }
+    if !endpoint.path().ends_with('/') {
+        endpoint.set_path(&format!("{}/", endpoint.path()));
+    }
+    let operation = match operation {
+        ImageOperation::Generation => "generations",
+        ImageOperation::Edit => "edits",
+    };
+    match adapter {
+        AdapterFamily::OpenAiResponses | AdapterFamily::OpenAiChat => endpoint
+            .join(&format!("images/{operation}"))
+            .map_err(|_| failure(UpstreamFailureKind::Policy)),
+        AdapterFamily::AzureOpenAi => {
+            let ends_with_openai = endpoint.path().trim_end_matches('/').ends_with("/openai");
+            {
+                let mut segments = endpoint
+                    .path_segments_mut()
+                    .map_err(|_| failure(UpstreamFailureKind::Policy))?;
+                segments.pop_if_empty();
+                if !ends_with_openai {
+                    segments.push("openai");
+                }
+                segments
+                    .push("deployments")
+                    .push(model)
+                    .push("images")
+                    .push(operation);
+            }
+            endpoint
+                .query_pairs_mut()
+                .append_pair("api-version", "2024-10-21");
+            Ok(endpoint)
+        }
+        AdapterFamily::Anthropic
+        | AdapterFamily::Google
+        | AdapterFamily::Cursor
+        | AdapterFamily::Kiro
+        | AdapterFamily::MimoFree => Err(failure(UpstreamFailureKind::Policy)),
+    }
+}
+
+struct MultipartUpload {
+    stream: MultipartStream,
+    content_length: usize,
+    content_type: String,
+}
+
+enum MultipartSegment {
+    Bytes(Bytes),
+    File(ImageInputFile),
+}
+
+fn multipart_upload(
+    (metadata, files): (ImageEditMetadata, Vec<ImageInputFile>),
+    routed_model: &str,
+    request_id: &str,
+    cancellation: ExecutionCancellation,
+) -> Result<MultipartUpload, UpstreamExecutionFailure> {
+    let boundary = format!("wokcore-{request_id}");
+    let mut segments = Vec::new();
+    let mut content_length = 0_usize;
+    for (name, value) in metadata.fields() {
+        let value = if name == "model" { routed_model } else { value };
+        let bytes = Bytes::from(format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+        ));
+        add_multipart_length(&mut content_length, bytes.len())?;
+        segments.push(MultipartSegment::Bytes(bytes));
+    }
+    for file in files {
+        let header = Bytes::from(format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\nContent-Type: {}\r\n\r\n",
+            file.field_name(),
+            file.file_name(),
+            file.content_type(),
+        ));
+        add_multipart_length(&mut content_length, header.len())?;
+        add_multipart_length(
+            &mut content_length,
+            usize::try_from(file.length())
+                .map_err(|_| failure(UpstreamFailureKind::InvalidRequest))?,
+        )?;
+        add_multipart_length(&mut content_length, 2)?;
+        segments.push(MultipartSegment::Bytes(header));
+        segments.push(MultipartSegment::File(file));
+        segments.push(MultipartSegment::Bytes(Bytes::from_static(b"\r\n")));
+    }
+    let closing = Bytes::from(format!("--{boundary}--\r\n"));
+    add_multipart_length(&mut content_length, closing.len())?;
+    segments.push(MultipartSegment::Bytes(closing));
+    if content_length > IMAGE_MULTIPART_WIRE_LIMIT {
+        return Err(failure(UpstreamFailureKind::InvalidRequest));
+    }
+    let (sender, receiver) = mpsc::channel(MULTIPART_CHANNEL_CAPACITY);
+    tokio::spawn(pump_multipart(segments, sender, cancellation));
+    Ok(MultipartUpload {
+        stream: MultipartStream { receiver },
+        content_length,
+        content_type: format!("multipart/form-data; boundary={boundary}"),
+    })
+}
+
+fn add_multipart_length(total: &mut usize, length: usize) -> Result<(), UpstreamExecutionFailure> {
+    *total = total
+        .checked_add(length)
+        .ok_or_else(|| failure(UpstreamFailureKind::InvalidRequest))?;
+    Ok(())
+}
+
+struct MultipartStream {
+    receiver: mpsc::Receiver<Result<Bytes, io::Error>>,
+}
+
+impl Stream for MultipartStream {
+    type Item = Result<Bytes, io::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.receiver.poll_recv(context)
+    }
+}
+
+async fn pump_multipart(
+    segments: Vec<MultipartSegment>,
+    sender: mpsc::Sender<Result<Bytes, io::Error>>,
+    cancellation: ExecutionCancellation,
+) {
+    for segment in segments {
+        match segment {
+            MultipartSegment::Bytes(bytes) => {
+                if !send_multipart(&sender, Ok(bytes), &cancellation).await {
+                    return;
+                }
+            }
+            MultipartSegment::File(file) => {
+                let mut reader = match file.into_reader().await {
+                    Ok(reader) => reader,
+                    Err(error) => {
+                        let _ = send_multipart(&sender, Err(error), &cancellation).await;
+                        return;
+                    }
+                };
+                let mut buffer = vec![0_u8; MULTIPART_FILE_CHUNK_BYTES];
+                loop {
+                    let read = match reader.read(&mut buffer).await {
+                        Ok(read) => read,
+                        Err(error) => {
+                            let _ = send_multipart(&sender, Err(error), &cancellation).await;
+                            return;
+                        }
+                    };
+                    if read == 0 {
+                        break;
+                    }
+                    if !send_multipart(
+                        &sender,
+                        Ok(Bytes::copy_from_slice(&buffer[..read])),
+                        &cancellation,
+                    )
+                    .await
+                    {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn send_multipart(
+    sender: &mpsc::Sender<Result<Bytes, io::Error>>,
+    item: Result<Bytes, io::Error>,
+    cancellation: &ExecutionCancellation,
+) -> bool {
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => false,
+        result = sender.send(item) => result.is_ok(),
     }
 }
 
@@ -376,8 +678,15 @@ fn map_storage_secret_error(_: StorageError) -> SecretResolutionError {
 pub fn production_upstream_executor(
     store: Arc<dyn SecretStore>,
 ) -> Result<Arc<dyn UpstreamExecutor>, ProductionUpstreamBuildError> {
-    let transport = PooledTransport::new(TransportTimeouts::default(), TransportLimits::default())
-        .map_err(|_| ProductionUpstreamBuildError)?;
+    let transport = PooledTransport::new(
+        TransportTimeouts::default(),
+        TransportLimits {
+            max_request_body_bytes: IMAGE_MULTIPART_WIRE_LIMIT,
+            max_response_body_bytes: IMAGE_RESPONSE_LIMIT,
+            ..TransportLimits::default()
+        },
+    )
+    .map_err(|_| ProductionUpstreamBuildError)?;
     Ok(Arc::new(ProductionUpstreamExecutor::new(
         transport,
         Arc::new(StorageSecretResolver { store }),

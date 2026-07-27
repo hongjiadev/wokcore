@@ -1,4 +1,5 @@
 pub mod canonical;
+pub mod images;
 pub mod inbound;
 pub mod stream;
 pub mod upstream;

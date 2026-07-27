@@ -1,16 +1,24 @@
-use axum::{Extension, extract::State, response::Response};
+use axum::{
+    Extension,
+    body::Body,
+    extract::State,
+    http::{HeaderValue, header},
+    response::Response,
+};
 use wokcore_protocols::{
     InboundLimitsV1,
     canonical::{GatewayError, RequestId as CanonicalRequestId},
+    images::ImageGenerationRequest,
 };
 
 use crate::{ServerState, api::RequestId, auth::AuthorizedClient};
 
 use super::{
-    ClientProtocol, UpstreamOperation,
+    ClientProtocol, ImageExecutionInput, UpstreamOperation,
     body::{ValidatedImageEditBody, ValidatedJsonBody},
     execute_canonical,
-    response::{gateway_error_response, invalid_request, unsupported_capability},
+    images::execute_image,
+    response::{attach_upstream_request_id, gateway_error_response},
 };
 
 pub(crate) async fn responses(
@@ -147,23 +155,68 @@ pub(crate) async fn count_tokens(
     }
 }
 
-pub(crate) async fn unsupported_multipart(
+pub(crate) async fn images_edit(
+    State(state): State<ServerState>,
     Extension(request_id): Extension<RequestId>,
     Extension(protocol): Extension<ClientProtocol>,
-    _body: ValidatedImageEditBody,
+    Extension(authorized): Extension<AuthorizedClient>,
+    body: ValidatedImageEditBody,
 ) -> Response {
-    unsupported_capability(request_id, protocol)
+    execute_image_request(
+        &state,
+        &authorized,
+        request_id,
+        protocol,
+        ImageExecutionInput::Edit(body.into_request()),
+    )
+    .await
 }
 
-pub(crate) async fn unsupported_json(
+pub(crate) async fn images_generation(
+    State(state): State<ServerState>,
     Extension(request_id): Extension<RequestId>,
     Extension(protocol): Extension<ClientProtocol>,
+    Extension(authorized): Extension<AuthorizedClient>,
     body: ValidatedJsonBody,
 ) -> Response {
-    if serde_json::from_slice::<serde_json::Value>(&body.into_bytes()).is_err() {
-        return invalid_request(request_id, protocol);
+    let request = match ImageGenerationRequest::decode(&body.into_bytes()) {
+        Ok(request) => request,
+        Err(error) => return gateway_error_response(&error, request_id, protocol, None),
+    };
+    execute_image_request(
+        &state,
+        &authorized,
+        request_id,
+        protocol,
+        ImageExecutionInput::Generation(request),
+    )
+    .await
+}
+
+async fn execute_image_request(
+    state: &ServerState,
+    authorized: &AuthorizedClient,
+    request_id: RequestId,
+    protocol: ClientProtocol,
+    input: ImageExecutionInput,
+) -> Response {
+    match execute_image(state, authorized, &request_id.to_string(), input).await {
+        Ok(executed) => {
+            let upstream_request_id = executed.response.upstream_request_id().cloned();
+            let mut response = Response::new(Body::from(executed.response.into_body()));
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+            attach_upstream_request_id(response, upstream_request_id.as_ref())
+        }
+        Err(error) => gateway_error_response(
+            &error.error,
+            request_id,
+            protocol,
+            error.upstream_request_id.as_ref(),
+        ),
     }
-    unsupported_capability(request_id, protocol)
 }
 
 async fn execute_text(

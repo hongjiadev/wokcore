@@ -3,6 +3,7 @@ mod anthropic;
 mod body;
 mod chat;
 mod execute;
+mod images;
 mod models;
 mod models_endpoint;
 mod registry;
@@ -12,7 +13,7 @@ mod routes;
 mod stream;
 
 pub(crate) use admission_body::hold_admission_until_body_end;
-pub(crate) use body::{IMAGE_MULTIPART_BODY_LIMIT, JSON_BODY_LIMIT};
+pub(crate) use body::{IMAGE_MULTIPART_WIRE_LIMIT, JSON_BODY_LIMIT};
 pub(crate) use execute::{Executed, ExecutedResponse, ExecutedStream, execute_canonical};
 pub use execute::{
     InvalidSafeUpstreamRequestId, InvalidUpstreamExecutionResponse, InvalidUpstreamExecutionStream,
@@ -21,11 +22,13 @@ pub use execute::{
     UpstreamExecutionResult, UpstreamExecutionStream, UpstreamExecutor, UpstreamFailureKind,
     UpstreamFinishReason, UpstreamOperation, UpstreamStreamSendError, UpstreamStreamSender,
 };
+pub use images::{
+    ImageEditRequest, ImageExecutionInput, ImageExecutionRequest, ImageExecutionResponse,
+    ImageExecutionResult, ImageInputFile, ImageInputReader,
+};
 pub use models::{DataPlaneRequest, DataPlaneRequestSummary};
 pub(crate) use models_endpoint::models as models_endpoint;
 pub(crate) use registry::is_json_content_type;
 pub use registry::{ClientProtocol, DataPlaneRequestError, ProtocolRegistry, RequestBodyKind};
 pub(crate) use response::public_error_response;
-pub(crate) use routes::{
-    anthropic, chat, count_tokens, responses, unsupported_json, unsupported_multipart,
-};
+pub(crate) use routes::{anthropic, chat, count_tokens, images_edit, images_generation, responses};

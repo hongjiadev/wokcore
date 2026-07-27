@@ -19,8 +19,8 @@ use axum::{
 use crate::ServerState;
 
 use crate::data_plane::{
-    IMAGE_MULTIPART_BODY_LIMIT, JSON_BODY_LIMIT, anthropic, chat, count_tokens, models_endpoint,
-    responses, unsupported_json, unsupported_multipart,
+    IMAGE_MULTIPART_WIRE_LIMIT, JSON_BODY_LIMIT, anthropic, chat, count_tokens, images_edit,
+    images_generation, models_endpoint, responses,
 };
 use export::diagnostics_export;
 use logs::logs;
@@ -121,11 +121,11 @@ pub fn build_router(state: ServerState) -> Router {
         .route("/v1/models", get(models_endpoint))
         .route(
             "/v1/images/generations",
-            post(unsupported_json).layer(DefaultBodyLimit::max(JSON_BODY_LIMIT)),
+            post(images_generation).layer(DefaultBodyLimit::max(JSON_BODY_LIMIT)),
         )
         .route(
             "/v1/images/edits",
-            post(unsupported_multipart).layer(DefaultBodyLimit::max(IMAGE_MULTIPART_BODY_LIMIT)),
+            post(images_edit).layer(DefaultBodyLimit::max(IMAGE_MULTIPART_WIRE_LIMIT)),
         )
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)

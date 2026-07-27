@@ -15,6 +15,7 @@ use axum::{
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::{Value, json};
+use tokio::io::AsyncReadExt;
 use tower::ServiceExt;
 use wokcore_core::{
     config::{
@@ -34,6 +35,7 @@ use wokcore_server::{
     api::build_router,
     auth::{AuthRegistry, EntropySource, StateAuthMetadataStore, TokenError},
     data_plane::{
+        ImageExecutionInput, ImageExecutionRequest, ImageExecutionResponse, ImageExecutionResult,
         SafeUpstreamRequestId, UpstreamExecutionFailure, UpstreamExecutionRequest,
         UpstreamExecutionResponse, UpstreamExecutionResult, UpstreamExecutionStream,
         UpstreamExecutor, UpstreamFailureKind, UpstreamOperation,
@@ -46,6 +48,7 @@ use wokcore_storage::{ClientTokenScope, MemorySecretStore, StateStore};
 const AUTHORITY: &str = "127.0.0.1:43131";
 const CREATED_AT: &str = "2026-07-27T00:00:00Z";
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
+type ObservedImageRequest = (String, String, Vec<(String, Vec<u8>)>);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Mode {
@@ -65,6 +68,7 @@ struct SyntheticExecutor {
     calls: AtomicUsize,
     cancellation: Mutex<Option<ExecutionCancellation>>,
     requests: Mutex<Vec<(String, UpstreamOperation, String, String)>>,
+    image_requests: Mutex<Vec<ObservedImageRequest>>,
 }
 
 impl SyntheticExecutor {
@@ -74,6 +78,7 @@ impl SyntheticExecutor {
             calls: AtomicUsize::new(0),
             cancellation: Mutex::new(None),
             requests: Mutex::new(Vec::new()),
+            image_requests: Mutex::new(Vec::new()),
         }
     }
 
@@ -194,6 +199,34 @@ impl UpstreamExecutor for SyntheticExecutor {
                 ))
             }
         }
+    }
+
+    async fn execute_image(
+        &self,
+        request: ImageExecutionRequest,
+        _cancellation: ExecutionCancellation,
+    ) -> ImageExecutionResult {
+        let mut files = Vec::new();
+        if let ImageExecutionInput::Edit(edit) = request.input() {
+            for input in edit.files() {
+                let mut reader = input.open().await.unwrap();
+                let mut bytes = Vec::new();
+                reader.read_to_end(&mut bytes).await.unwrap();
+                files.push((input.field_name().to_owned(), bytes));
+            }
+        }
+        self.image_requests.lock().unwrap().push((
+            request.request_id().to_owned(),
+            request.model().to_owned(),
+            files,
+        ));
+        ImageExecutionResult::Succeeded(
+            ImageExecutionResponse::json(
+                br#"{"created":1722000000,"data":[{"b64_json":"aGVsbG8="}]}"#.to_vec(),
+            )
+            .unwrap()
+            .with_upstream_request_id(SafeUpstreamRequestId::new("upstream_image_safe_1").unwrap()),
+        )
     }
 }
 
@@ -355,6 +388,124 @@ async fn all_three_text_protocols_decode_route_execute_and_encode_non_streaming_
         assert_eq!(model, "gpt-5.6");
     }
     assert_eq!(fixture.executor.calls(), 3);
+}
+
+#[tokio::test]
+async fn image_generation_routes_through_an_image_capable_provider() {
+    let fixture = fixture("openai-apikey").await;
+    let response = send_json(
+        &fixture,
+        "/v1/images/generations",
+        json!({
+            "model":"gpt-5.6",
+            "prompt":"draw a lighthouse",
+            "response_format":"b64_json"
+        }),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["x-upstream-request-id"],
+        "upstream_image_safe_1"
+    );
+    assert_eq!(
+        response_json(response).await["data"][0]["b64_json"],
+        "aGVsbG8="
+    );
+    let requests = fixture.executor.image_requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].1, "gpt-5.6");
+    assert!(requests[0].2.is_empty());
+}
+
+#[tokio::test]
+async fn image_edit_streams_files_to_private_temporary_storage_and_executes() {
+    let fixture = fixture("openai-apikey").await;
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/images/edits")
+                .header(header::HOST, AUTHORITY)
+                .header(header::AUTHORIZATION, format!("Bearer {}", fixture.proxy))
+                .header(
+                    header::CONTENT_TYPE,
+                    "multipart/form-data; boundary=wokcore-image-boundary",
+                )
+                .body(Body::from(image_edit_body()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["x-upstream-request-id"],
+        "upstream_image_safe_1"
+    );
+    response_json(response).await;
+    let requests = fixture.executor.image_requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].1, "gpt-5.6");
+    assert_eq!(
+        requests[0].2,
+        vec![
+            ("image".to_owned(), b"synthetic-image".to_vec()),
+            ("mask".to_owned(), b"synthetic-mask".to_vec()),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn image_routing_rejects_a_provider_without_image_capability_before_execution() {
+    let fixture = fixture("anthropic-apikey").await;
+    let response = send_json(
+        &fixture,
+        "/v1/images/generations",
+        json!({
+            "model":"claude-sonnet-4-5",
+            "prompt":"must not execute"
+        }),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        response_json(response).await["error"]["code"],
+        "unsupported_capability"
+    );
+    assert!(fixture.executor.image_requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn image_prompts_and_file_bytes_are_never_persisted_by_the_data_plane() {
+    const CANARY: &str = "image-persistence-canary-7f7d31";
+
+    let fixture = fixture("openai-apikey").await;
+    let response = send_json(
+        &fixture,
+        "/v1/images/generations",
+        json!({"model":"gpt-5.6","prompt":CANARY}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    response_json(response).await;
+
+    let canary = CANARY.as_bytes();
+    for entry in std::fs::read_dir(fixture._directory.path()).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_file() {
+            let bytes = std::fs::read(&path).unwrap();
+            assert!(
+                !bytes.windows(canary.len()).any(|window| window == canary),
+                "image request content leaked into {}",
+                path.display()
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -766,6 +917,34 @@ async fn send_json(fixture: &Fixture, path: &str, body: Value) -> axum::response
         ))
         .await
         .unwrap()
+}
+
+fn image_edit_body() -> Vec<u8> {
+    let mut body = Vec::new();
+    for (name, value) in [("model", "gpt-5.6"), ("prompt", "remove background")] {
+        body.extend_from_slice(b"--wokcore-image-boundary\r\n");
+        body.extend_from_slice(
+            format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n")
+                .as_bytes(),
+        );
+    }
+    for (name, file_name, content) in [
+        ("image", "image.png", b"synthetic-image".as_slice()),
+        ("mask", "mask.png", b"synthetic-mask".as_slice()),
+    ] {
+        body.extend_from_slice(b"--wokcore-image-boundary\r\n");
+        body.extend_from_slice(
+            format!(
+                "Content-Disposition: form-data; name=\"{name}\"; filename=\"{file_name}\"\r\n\
+                 Content-Type: image/png\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(content);
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(b"--wokcore-image-boundary--\r\n");
+    body
 }
 
 fn request(method: Method, path: &str, proxy: &str, body: Body) -> Request<Body> {

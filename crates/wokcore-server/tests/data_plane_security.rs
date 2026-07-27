@@ -1,5 +1,7 @@
 use std::{
+    collections::BTreeSet,
     io,
+    path::PathBuf,
     pin::Pin,
     sync::{
         Arc,
@@ -196,8 +198,8 @@ fn valid_body(path: &str) -> Body {
             r#"{"model":"synthetic-model","messages":[{"role":"user","content":"hello"}]}"#,
         ),
         "/v1/models" => Body::empty(),
-        "/v1/images/generations" => Body::from("{}"),
-        "/v1/images/edits" => Body::from(multipart_body(&[1])),
+        "/v1/images/generations" => Body::from(r#"{"model":"synthetic-image","prompt":"offline"}"#),
+        "/v1/images/edits" => Body::from(valid_image_edit_body()),
         _ => unreachable!("data-plane route table is closed"),
     }
 }
@@ -238,12 +240,7 @@ async fn all_data_plane_routes_are_private_and_accept_only_proxy_scope() {
             ))
             .await
             .unwrap();
-        let (status, code) = if path.starts_with("/v1/images/") {
-            (StatusCode::UNPROCESSABLE_ENTITY, "unsupported_capability")
-        } else {
-            (StatusCode::NOT_IMPLEMENTED, "no_executor")
-        };
-        assert_protocol_error(accepted, path, status, code).await;
+        assert_protocol_error(accepted, path, StatusCode::NOT_IMPLEMENTED, "no_executor").await;
     }
 
     for token in &fixture.non_proxy {
@@ -512,7 +509,13 @@ async fn image_parts_and_total_multipart_body_are_independently_bounded() {
         ))
         .await
         .unwrap();
-    assert_eq!(accepted.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_protocol_error(
+        accepted,
+        "/v1/images/edits",
+        StatusCode::BAD_REQUEST,
+        "invalid_request",
+    )
+    .await;
 
     let oversized_part = fixture
         .app
@@ -599,6 +602,51 @@ async fn image_parts_and_total_multipart_body_are_independently_bounded() {
         "payload_too_large",
     )
     .await;
+}
+
+#[tokio::test]
+async fn aborting_a_partial_image_upload_removes_its_random_temporary_file() {
+    let fixture = fixture().await;
+    let baseline = image_temp_paths();
+    let pending = tokio::spawn(fixture.app.clone().oneshot(request(
+        Method::POST,
+        "/v1/images/edits",
+        Some(&fixture.proxy),
+        Some("multipart/form-data; boundary=wokcore-abort-boundary"),
+        Body::from_stream(PendingMultipartStream(0)),
+    )));
+    let created = tokio::time::timeout(TEST_TIMEOUT, async {
+        loop {
+            let current = image_temp_paths();
+            let created = current.difference(&baseline).cloned().collect::<Vec<_>>();
+            if !created.is_empty() {
+                break created;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(created.iter().all(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                name.starts_with("wokcore-image-") && !name.contains("client-file-name")
+            })
+    }));
+
+    pending.abort();
+    assert!(pending.await.unwrap_err().is_cancelled());
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        loop {
+            if created.iter().all(|path| !path.exists()) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -756,6 +804,24 @@ fn multipart_body(image_sizes: &[usize]) -> Vec<u8> {
     multipart_fields(&fields)
 }
 
+fn valid_image_edit_body() -> Vec<u8> {
+    let mut body = Vec::new();
+    for (name, value) in [("model", "synthetic-image"), ("prompt", "offline edit")] {
+        body.extend_from_slice(b"--wokcore-boundary\r\n");
+        body.extend_from_slice(
+            format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n")
+                .as_bytes(),
+        );
+    }
+    body.extend_from_slice(b"--wokcore-boundary\r\n");
+    body.extend_from_slice(
+        b"Content-Disposition: form-data; name=\"image\"; filename=\"image.png\"\r\n\
+          Content-Type: image/png\r\n\r\nx\r\n",
+    );
+    body.extend_from_slice(b"--wokcore-boundary--\r\n");
+    body
+}
+
 fn multipart_fields(fields: &[(&str, usize)]) -> Vec<u8> {
     let mut body = Vec::new();
     for (index, (name, image_size)) in fields.iter().copied().enumerate() {
@@ -850,6 +916,30 @@ impl Stream for PendingStream {
     }
 }
 
+struct PendingMultipartStream(u8);
+
+impl Stream for PendingMultipartStream {
+    type Item = Result<Bytes, io::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let chunk = match self.0 {
+            0 => Some(Bytes::from_static(
+                b"--wokcore-abort-boundary\r\n\
+                  Content-Disposition: form-data; name=\"image\"; filename=\"client-file-name.png\"\r\n\
+                  Content-Type: image/png\r\n\r\n",
+            )),
+            1 => Some(Bytes::from_static(b"partial-image-bytes")),
+            _ => None,
+        };
+        if let Some(chunk) = chunk {
+            self.0 = self.0.saturating_add(1);
+            Poll::Ready(Some(Ok(chunk)))
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
 struct DisconnectStream(bool);
 
 impl Stream for DisconnectStream {
@@ -876,4 +966,18 @@ impl Stream for PanicStream {
     fn poll_next(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         panic!("synthetic request body panic")
     }
+}
+
+fn image_temp_paths() -> BTreeSet<PathBuf> {
+    std::fs::read_dir(std::env::temp_dir())
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("wokcore-image-"))
+        })
+        .collect()
 }

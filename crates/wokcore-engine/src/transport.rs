@@ -6,8 +6,9 @@ use std::{
 };
 
 use bytes::Bytes;
+use futures_core::TryStream;
 use reqwest::{
-    Client, Response, Url,
+    Body as ReqwestBody, Client, Response, Url,
     dns::{Addrs, Name, Resolve, Resolving},
     header::{self, HeaderMap, HeaderName, HeaderValue},
     redirect,
@@ -21,6 +22,8 @@ const MAX_REQUEST_HEADERS: usize = 16;
 const MAX_REQUEST_HEADER_BYTES: usize = 16 * 1024;
 const DEFAULT_POOL_IDLE_CONNECTIONS_PER_HOST: usize = 8;
 const DEFAULT_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_REQUEST_BODY_LIMIT: usize = 16 * 1024 * 1024;
+const DEFAULT_RESPONSE_BODY_LIMIT: usize = 16 * 1024 * 1024;
 
 const ORDINARY_REQUEST_HEADERS: &[&str] = &[
     "accept",
@@ -107,9 +110,11 @@ pub struct TransportRequest {
     url: Url,
     headers: HeaderMap,
     sensitive_header: Option<SensitiveHeader>,
-    body: Vec<u8>,
+    body: TransportRequestBody,
     stream: bool,
     network_policy: NetworkPolicy,
+    max_request_body_bytes: usize,
+    max_response_body_bytes: usize,
 }
 
 impl TransportRequest {
@@ -118,10 +123,54 @@ impl TransportRequest {
             url,
             headers: HeaderMap::new(),
             sensitive_header: None,
-            body,
+            body: TransportRequestBody::Bytes(body),
             stream,
             network_policy,
+            max_request_body_bytes: DEFAULT_REQUEST_BODY_LIMIT,
+            max_response_body_bytes: DEFAULT_RESPONSE_BODY_LIMIT,
         }
+    }
+
+    pub fn post_stream<S, E>(
+        url: Url,
+        stream: S,
+        content_length: usize,
+        stream_response: bool,
+        network_policy: NetworkPolicy,
+    ) -> Result<Self, TransportError>
+    where
+        S: TryStream<Ok = Bytes, Error = E> + Send + Sync + 'static,
+        E: Into<Box<dyn std::error::Error + Send + Sync>> + 'static,
+    {
+        if content_length == 0 {
+            return Err(TransportError::new(TransportErrorKind::InvalidRequest));
+        }
+        Ok(Self {
+            url,
+            headers: HeaderMap::new(),
+            sensitive_header: None,
+            body: TransportRequestBody::Stream {
+                body: ReqwestBody::wrap_stream(stream),
+                content_length,
+            },
+            stream: stream_response,
+            network_policy,
+            max_request_body_bytes: content_length,
+            max_response_body_bytes: DEFAULT_RESPONSE_BODY_LIMIT,
+        })
+    }
+
+    pub fn with_body_limits(
+        mut self,
+        max_request_body_bytes: usize,
+        max_response_body_bytes: usize,
+    ) -> Result<Self, TransportError> {
+        if max_request_body_bytes == 0 || max_response_body_bytes == 0 {
+            return Err(TransportError::new(TransportErrorKind::InvalidRequest));
+        }
+        self.max_request_body_bytes = max_request_body_bytes;
+        self.max_response_body_bytes = max_response_body_bytes;
+        Ok(self)
     }
 
     pub fn with_header(mut self, name: &str, value: &str) -> Result<Self, TransportError> {
@@ -166,10 +215,42 @@ impl fmt::Debug for TransportRequest {
                 "sensitive_header",
                 &self.sensitive_header.as_ref().map(|_| "[redacted]"),
             )
+            .field("body_kind", &self.body.kind())
             .field("body_bytes", &self.body.len())
             .field("stream", &self.stream)
             .field("network_policy", &self.network_policy)
             .finish()
+    }
+}
+
+enum TransportRequestBody {
+    Bytes(Vec<u8>),
+    Stream {
+        body: ReqwestBody,
+        content_length: usize,
+    },
+}
+
+impl TransportRequestBody {
+    const fn len(&self) -> usize {
+        match self {
+            Self::Bytes(body) => body.len(),
+            Self::Stream { content_length, .. } => *content_length,
+        }
+    }
+
+    const fn kind(&self) -> &'static str {
+        match self {
+            Self::Bytes(_) => "bytes",
+            Self::Stream { .. } => "stream",
+        }
+    }
+
+    fn into_reqwest(self) -> ReqwestBody {
+        match self {
+            Self::Bytes(body) => ReqwestBody::from(body),
+            Self::Stream { body, .. } => body,
+        }
     }
 }
 
@@ -207,6 +288,11 @@ impl PooledTransport {
             return Err(TransportError::new(TransportErrorKind::Cancelled));
         }
 
+        let response_body_limit = self
+            .limits
+            .max_response_body_bytes
+            .min(request.max_response_body_bytes);
+        let content_length = request.body.len();
         let started_at = Instant::now();
         let total_deadline = started_at + self.timeouts.non_stream_total;
         let client = match request.network_policy {
@@ -218,7 +304,8 @@ impl PooledTransport {
             .post(request.url)
             .headers(request.headers)
             .header(header::ACCEPT_ENCODING, "identity")
-            .body(request.body);
+            .header(header::CONTENT_LENGTH, content_length)
+            .body(request.body.into_reqwest());
         if let Some(sensitive) = request.sensitive_header {
             let value = HeaderValue::from_str(sensitive.value.expose_secret())
                 .map_err(|_| TransportError::new(TransportErrorKind::InvalidRequest))?;
@@ -245,18 +332,13 @@ impl PooledTransport {
                 head,
                 response: Some(response),
                 received_bytes: 0,
-                maximum_body_bytes: self.limits.max_response_body_bytes,
+                maximum_body_bytes: response_body_limit,
                 idle_timeout: self.timeouts.idle_stream,
             }));
         }
 
-        let body = read_complete_body(
-            response,
-            cancellation,
-            total_deadline,
-            self.limits.max_response_body_bytes,
-        )
-        .await?;
+        let body =
+            read_complete_body(response, cancellation, total_deadline, response_body_limit).await?;
         Ok(TransportResponse::Complete(CompleteTransportResponse {
             head,
             body,
@@ -293,6 +375,10 @@ impl CompleteTransportResponse {
 
     pub fn body(&self) -> &[u8] {
         &self.body
+    }
+
+    pub fn into_body(self) -> Vec<u8> {
+        self.body
     }
 }
 
@@ -479,7 +565,10 @@ fn validate_request(
     request: &TransportRequest,
     limits: TransportLimits,
 ) -> Result<(), TransportError> {
-    if request.body.len() > limits.max_request_body_bytes
+    if request.body.len()
+        > limits
+            .max_request_body_bytes
+            .min(request.max_request_body_bytes)
         || request.headers.len() > MAX_REQUEST_HEADERS
         || request.headers.contains_key(header::ACCEPT_ENCODING)
         || !request.url.username().is_empty()

@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    io::Write,
     net::SocketAddr,
     sync::{Arc, Mutex},
 };
@@ -7,6 +8,7 @@ use std::{
 use async_trait::async_trait;
 use axum::{
     Router,
+    body::Bytes,
     extract::State,
     http::{HeaderMap, StatusCode},
     routing::post,
@@ -26,12 +28,14 @@ use wokcore_engine::{
     routing::EndpointAccess,
     transport::{PooledTransport, TransportLimits, TransportTimeouts},
 };
-use wokcore_protocols::canonical::{
-    CanonicalEvent, CanonicalRequest, InputItem, PublicModelId, RequestId,
+use wokcore_protocols::{
+    canonical::{CanonicalEvent, CanonicalRequest, InputItem, PublicModelId, RequestId},
+    images::{ImageEditMetadata, ImageGenerationRequest},
 };
 use wokcore_server::data_plane::{
-    UpstreamExecutionOutput, UpstreamExecutionRequest, UpstreamExecutionResult, UpstreamExecutor,
-    UpstreamFailureKind, UpstreamOperation,
+    ImageEditRequest, ImageExecutionInput, ImageExecutionRequest, ImageExecutionResult,
+    ImageInputFile, UpstreamExecutionOutput, UpstreamExecutionRequest, UpstreamExecutionResult,
+    UpstreamExecutor, UpstreamFailureKind, UpstreamOperation,
 };
 
 const SECRET_CANARY: &str = "production-upstream-secret-canary";
@@ -105,6 +109,45 @@ async fn responses(
 
 async fn rate_limited() -> (StatusCode, [(&'static str, &'static str); 1]) {
     (StatusCode::TOO_MANY_REQUESTS, [("retry-after", "7")])
+}
+
+async fn image_generation(
+    State(captured): State<Captured>,
+    headers: HeaderMap,
+    axum::Json(body): axum::Json<serde_json::Value>,
+) -> axum::Json<serde_json::Value> {
+    *captured
+        .headers
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(headers);
+    *captured
+        .body
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(body);
+    axum::Json(serde_json::json!({
+        "created": 1722000000,
+        "data": [{"b64_json":"aGVsbG8="}]
+    }))
+}
+
+async fn image_edit(
+    State(captured): State<Captured>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> axum::Json<serde_json::Value> {
+    *captured
+        .headers
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(headers);
+    *captured
+        .body
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Some(serde_json::json!({"multipart": String::from_utf8(body.to_vec()).unwrap()}));
+    axum::Json(serde_json::json!({
+        "created": 1722000000,
+        "data": [{"url":"https://example.invalid/edited.png"}]
+    }))
 }
 
 struct FixedResolver {
@@ -239,6 +282,124 @@ async fn production_upstream_executes_loopback_without_leaking_credentials() {
 
     let rendered = format!("{response:?}");
     assert!(!rendered.contains(SECRET_CANARY));
+}
+
+#[tokio::test]
+async fn production_upstream_executes_bounded_image_generation_on_loopback() {
+    let captured = Captured::default();
+    let server = LoopbackServer::start(
+        Router::new()
+            .route("/v1/images/generations", post(image_generation))
+            .with_state(captured.clone()),
+    )
+    .await;
+    let secret_ref = SecretRef::new();
+    let reads = Arc::new(Mutex::new(0));
+    let executor = executor(secret_ref.clone(), Arc::clone(&reads));
+    let input = ImageExecutionInput::Generation(
+        ImageGenerationRequest::decode(
+            br#"{"model":"public-image","prompt":"offline image","response_format":"b64_json"}"#,
+        )
+        .unwrap(),
+    );
+    let request = ImageExecutionRequest::new(
+        "req_image_loopback",
+        ProviderId::new("loopback-provider").unwrap(),
+        AccountId::new("loopback-account").unwrap(),
+        AdapterFamily::OpenAiResponses,
+        server.endpoint(),
+        EndpointAccess::LoopbackOnly,
+        "routed-image-model",
+        AccountAuthConfig::ApiKey { secret: secret_ref },
+        input,
+    )
+    .unwrap();
+
+    let result = executor
+        .execute_image(request, ExecutionCancellation::new())
+        .await;
+
+    let response = match result {
+        ImageExecutionResult::Succeeded(response) => response,
+        other => panic!("unexpected image execution result: {other:?}"),
+    };
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(response.body()).unwrap()["data"][0]["b64_json"],
+        "aGVsbG8="
+    );
+    assert_eq!(
+        captured
+            .body
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .unwrap()["model"],
+        "routed-image-model"
+    );
+    assert_eq!(
+        *reads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        1
+    );
+}
+
+#[tokio::test]
+async fn production_upstream_streams_image_edit_and_cleans_the_temporary_file() {
+    let captured = Captured::default();
+    let server = LoopbackServer::start(
+        Router::new()
+            .route("/v1/images/edits", post(image_edit))
+            .with_state(captured.clone()),
+    )
+    .await;
+    let secret_ref = SecretRef::new();
+    let executor = executor(secret_ref.clone(), Arc::new(Mutex::new(0)));
+    let mut temporary = tempfile::NamedTempFile::new().unwrap();
+    temporary.write_all(b"offline-image-bytes").unwrap();
+    temporary.flush().unwrap();
+    let temporary_path = temporary.path().to_owned();
+    let input_file =
+        ImageInputFile::from_named_temp("image", "input.png", "image/png", temporary).unwrap();
+    let metadata = ImageEditMetadata::from_fields([
+        ("model", "public-image"),
+        ("prompt", "remove background"),
+    ])
+    .unwrap();
+    let input =
+        ImageExecutionInput::Edit(ImageEditRequest::new(metadata, vec![input_file]).unwrap());
+    let request = ImageExecutionRequest::new(
+        "req_image_edit_loopback",
+        ProviderId::new("loopback-provider").unwrap(),
+        AccountId::new("loopback-account").unwrap(),
+        AdapterFamily::OpenAiResponses,
+        server.endpoint(),
+        EndpointAccess::LoopbackOnly,
+        "routed-image-model",
+        AccountAuthConfig::ApiKey { secret: secret_ref },
+        input,
+    )
+    .unwrap();
+
+    let result = executor
+        .execute_image(request, ExecutionCancellation::new())
+        .await;
+
+    assert!(matches!(result, ImageExecutionResult::Succeeded(_)));
+    let body = captured
+        .body
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+        .unwrap()["multipart"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(body.contains("name=\"model\"\r\n\r\nrouted-image-model"));
+    assert!(body.contains("name=\"prompt\"\r\n\r\nremove background"));
+    assert!(body.contains("filename=\"input.png\""));
+    assert!(body.contains("offline-image-bytes"));
+    assert!(!temporary_path.exists());
 }
 
 #[tokio::test]

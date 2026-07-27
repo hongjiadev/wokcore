@@ -36,6 +36,7 @@ All notable WokCore changes are documented in this file.
 - Injected non-streaming Provider execution for Responses, Chat Completions, Anthropic Messages, Anthropic token counting, and local model snapshots, with bounded canonical aggregation, pre-visible failover, safe request correlation, and client-drop cancellation.
 - Capacity-two Provider event streams with upstream backpressure, first-visible retry closure, client-drop cancellation, incremental Responses/Chat/Anthropic SSE encoding, single terminal protocol errors, and completion-only in-memory runtime counters with no per-event disk writes.
 - Production pooled upstream execution for OpenAI Responses, OpenAI Chat, Anthropic, Gemini, and Azure with last-moment credential resolution, redirect and proxy denial, DNS-aware endpoint policy, bounded headers/bodies/timeouts, incremental stream decoding, and loopback-only offline verification.
+- Capability-aware image generation and edit execution with bounded JSON, 20 MiB per-file and 50 MiB aggregate multipart limits, randomized private temporary files, cancellation cleanup, streamed upstream uploads, and content-free diagnostics.
 
 ### Fixed
 

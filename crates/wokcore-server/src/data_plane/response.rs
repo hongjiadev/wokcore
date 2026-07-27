@@ -171,16 +171,6 @@ impl Write for BoundedJsonWriter {
     }
 }
 
-pub(crate) fn unsupported_capability(request_id: RequestId, protocol: ClientProtocol) -> Response {
-    public_error_response(
-        StatusCode::UNPROCESSABLE_ENTITY,
-        "unsupported_capability",
-        "The requested capability is not supported.",
-        request_id,
-        protocol,
-    )
-}
-
 pub(crate) fn payload_too_large(request_id: RequestId, protocol: ClientProtocol) -> Response {
     public_error_response(
         StatusCode::PAYLOAD_TOO_LARGE,

@@ -139,6 +139,54 @@ async fn transport_reuses_a_policy_compatible_connection_pool() {
 }
 
 #[tokio::test]
+async fn transport_streams_a_length_bounded_request_body_without_coalescing_it() {
+    async fn echo(body: Bytes) -> Bytes {
+        body
+    }
+
+    let server = LoopbackServer::start(Router::new().route("/stream-upload", post(echo))).await;
+    let transport = transport(
+        TransportTimeouts::default(),
+        TransportLimits {
+            max_request_body_bytes: 64,
+            max_response_body_bytes: 64,
+            max_response_headers: 32,
+            max_response_header_bytes: 4 * 1024,
+        },
+    );
+    let chunks = stream::iter([
+        Ok::<_, std::io::Error>(Bytes::from_static(b"bounded-")),
+        Ok(Bytes::from_static(b"stream")),
+    ]);
+    let request = TransportRequest::post_stream(
+        server.url("/stream-upload"),
+        chunks,
+        14,
+        false,
+        NetworkPolicy::LoopbackOnly,
+    )
+    .unwrap()
+    .with_header("content-type", "application/octet-stream")
+    .unwrap();
+
+    assert_eq!(complete_body(&transport, request).await, b"bounded-stream");
+
+    let too_large = TransportRequest::post_stream(
+        server.url("/stream-upload"),
+        stream::empty::<Result<Bytes, std::io::Error>>(),
+        65,
+        false,
+        NetworkPolicy::LoopbackOnly,
+    )
+    .unwrap();
+    let error = transport
+        .execute(too_large, &ExecutionCancellation::new())
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), TransportErrorKind::InvalidRequest);
+}
+
+#[tokio::test]
 async fn transport_disables_redirects_and_never_reaches_the_location() {
     #[derive(Clone, Default)]
     struct RedirectState {
