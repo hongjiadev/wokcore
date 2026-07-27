@@ -61,28 +61,32 @@ pub(crate) async fn anthropic(
     let canonical_request_id = CanonicalRequestId::new(request_id.to_string());
     let bytes = body.into_bytes();
     let canonical = match decode(protocol, canonical_request_id.clone(), &bytes) {
-        Ok(canonical) if !canonical.stream => canonical,
-        Ok(_) => {
-            return gateway_error_response(
-                &GatewayError::unsupported_capability(),
-                request_id,
-                protocol,
-                None,
-            );
-        }
+        Ok(canonical) => canonical,
         Err(error) => return gateway_error_response(&error, request_id, protocol, None),
     };
+    let streaming = canonical.stream;
     drop(bytes);
     match execute_canonical(&state, &authorized, canonical, UpstreamOperation::Text).await {
-        Ok(executed) => match super::anthropic::encode_message(&executed, canonical_request_id) {
-            Ok(response) => response,
-            Err(error) => gateway_error_response(
-                &error,
-                request_id,
-                protocol,
-                executed.response.upstream_request_id(),
-            ),
-        },
+        Ok(super::Executed::Response(executed)) if !streaming => {
+            match super::anthropic::encode_message(&executed, canonical_request_id) {
+                Ok(response) => response,
+                Err(error) => gateway_error_response(
+                    &error,
+                    request_id,
+                    protocol,
+                    executed.response.upstream_request_id(),
+                ),
+            }
+        }
+        Ok(super::Executed::Stream(executed)) if streaming => {
+            encode_stream(&state, executed, request_id, protocol)
+        }
+        Ok(_) => gateway_error_response(
+            &GatewayError::internal("upstream execution mode mismatch"),
+            request_id,
+            protocol,
+            None,
+        ),
         Err(error) => gateway_error_response(
             &error.error,
             request_id,
@@ -117,15 +121,23 @@ pub(crate) async fn count_tokens(
     )
     .await
     {
-        Ok(executed) => match super::anthropic::encode_token_count(&executed) {
-            Ok(response) => response,
-            Err(error) => gateway_error_response(
-                &error,
-                request_id,
-                protocol,
-                executed.response.upstream_request_id(),
-            ),
-        },
+        Ok(super::Executed::Response(executed)) => {
+            match super::anthropic::encode_token_count(&executed) {
+                Ok(response) => response,
+                Err(error) => gateway_error_response(
+                    &error,
+                    request_id,
+                    protocol,
+                    executed.response.upstream_request_id(),
+                ),
+            }
+        }
+        Ok(super::Executed::Stream(_)) => gateway_error_response(
+            &GatewayError::internal("upstream execution mode mismatch"),
+            request_id,
+            protocol,
+            None,
+        ),
         Err(error) => gateway_error_response(
             &error.error,
             request_id,
@@ -169,23 +181,16 @@ async fn execute_text(
         CanonicalRequestId::new(request_id.to_string()),
         &bytes,
     ) {
-        Ok(canonical) if !canonical.stream => canonical,
-        Ok(_) => {
-            return gateway_error_response(
-                &GatewayError::unsupported_capability(),
-                request_id,
-                protocol,
-                None,
-            );
-        }
+        Ok(canonical) => canonical,
         Err(error) => return gateway_error_response(&error, request_id, protocol, None),
     };
+    let streaming = canonical.stream;
     drop(bytes);
     if let Err(error) = validate(&canonical) {
         return gateway_error_response(&error, request_id, protocol, None);
     }
     match execute_canonical(state, authorized, canonical, UpstreamOperation::Text).await {
-        Ok(executed) => match encode(&executed) {
+        Ok(super::Executed::Response(executed)) if !streaming => match encode(&executed) {
             Ok(response) => response,
             Err(error) => gateway_error_response(
                 &error,
@@ -194,12 +199,36 @@ async fn execute_text(
                 executed.response.upstream_request_id(),
             ),
         },
+        Ok(super::Executed::Stream(executed)) if streaming => {
+            encode_stream(state, executed, request_id, protocol)
+        }
+        Ok(_) => gateway_error_response(
+            &GatewayError::internal("upstream execution mode mismatch"),
+            request_id,
+            protocol,
+            None,
+        ),
         Err(error) => gateway_error_response(
             &error.error,
             request_id,
             protocol,
             error.upstream_request_id.as_ref(),
         ),
+    }
+}
+
+fn encode_stream(
+    state: &ServerState,
+    executed: super::ExecutedStream,
+    request_id: RequestId,
+    protocol: ClientProtocol,
+) -> Response {
+    let upstream_request_id = executed.stream.upstream().upstream_request_id().cloned();
+    match super::stream::encode(executed, protocol, &state.stream_diagnostics) {
+        Ok(response) => response,
+        Err(error) => {
+            gateway_error_response(&error, request_id, protocol, upstream_request_id.as_ref())
+        }
     }
 }
 

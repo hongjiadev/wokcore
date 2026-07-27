@@ -34,6 +34,7 @@ All notable WokCore changes are documented in this file.
 - Stable versioned Responses, Chat Completions, Anthropic Messages, and strictly non-streaming Anthropic token-count inbound codecs with bounded canonical and retained-identifier validation, an exact frozen data-plane protocol registry, and content-free request summaries.
 - Proxy-scope-only data-plane routes with strict protocol-specific methods and media types, OpenAI/Anthropic-safe errors, separate 16 MiB JSON and 20/50 MiB image limits, and cancellation-safe unlimited lifecycle admission.
 - Injected non-streaming Provider execution for Responses, Chat Completions, Anthropic Messages, Anthropic token counting, and local model snapshots, with bounded canonical aggregation, pre-visible failover, safe request correlation, and client-drop cancellation.
+- Capacity-two Provider event streams with upstream backpressure, first-visible retry closure, client-drop cancellation, incremental Responses/Chat/Anthropic SSE encoding, single terminal protocol errors, and completion-only in-memory runtime counters with no per-event disk writes.
 
 ### Fixed
 

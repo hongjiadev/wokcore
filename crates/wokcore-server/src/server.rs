@@ -5,6 +5,7 @@ use std::{
 
 use tokio::{net::TcpListener, sync::watch, task::JoinHandle};
 use uuid::Uuid;
+use wokcore_diagnostics::runtime::StreamRuntimeDiagnostics;
 use wokcore_engine::accounts::AccountHealthTable;
 
 use crate::{
@@ -33,6 +34,7 @@ pub struct ServerState {
     pub(crate) providers: Option<Arc<ProviderManagement>>,
     pub(crate) upstream_executor: Option<Arc<dyn UpstreamExecutor>>,
     pub(crate) account_health: Option<Arc<AccountHealthTable>>,
+    pub(crate) stream_diagnostics: StreamRuntimeDiagnostics,
     shutdown: watch::Sender<bool>,
     coordinated_shutdown: bool,
 }
@@ -94,6 +96,7 @@ impl ServerState {
             providers: None,
             upstream_executor: None,
             account_health: None,
+            stream_diagnostics: StreamRuntimeDiagnostics::default(),
             shutdown,
             coordinated_shutdown: false,
         }
@@ -138,6 +141,11 @@ impl ServerState {
             self.account_health = Some(account_health);
         }
         self.upstream_executor = Some(executor);
+        self
+    }
+
+    pub fn with_stream_diagnostics(mut self, diagnostics: StreamRuntimeDiagnostics) -> Self {
+        self.stream_diagnostics = diagnostics;
         self
     }
 

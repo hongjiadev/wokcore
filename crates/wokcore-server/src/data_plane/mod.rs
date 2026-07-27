@@ -9,15 +9,17 @@ mod registry;
 mod response;
 mod responses;
 mod routes;
+mod stream;
 
 pub(crate) use admission_body::hold_admission_until_body_end;
 pub(crate) use body::{IMAGE_MULTIPART_BODY_LIMIT, JSON_BODY_LIMIT};
-pub(crate) use execute::{ExecutedResponse, execute_canonical};
+pub(crate) use execute::{Executed, ExecutedResponse, ExecutedStream, execute_canonical};
 pub use execute::{
-    InvalidSafeUpstreamRequestId, InvalidUpstreamExecutionResponse, SafeUpstreamRequestId,
-    UpstreamExecutionFailure, UpstreamExecutionOutput, UpstreamExecutionRequest,
-    UpstreamExecutionResponse, UpstreamExecutionResult, UpstreamExecutor, UpstreamFailureKind,
-    UpstreamFinishReason, UpstreamOperation,
+    InvalidSafeUpstreamRequestId, InvalidUpstreamExecutionResponse, InvalidUpstreamExecutionStream,
+    SafeUpstreamRequestId, UPSTREAM_STREAM_CHANNEL_CAPACITY, UpstreamExecutionFailure,
+    UpstreamExecutionOutput, UpstreamExecutionRequest, UpstreamExecutionResponse,
+    UpstreamExecutionResult, UpstreamExecutionStream, UpstreamExecutor, UpstreamFailureKind,
+    UpstreamFinishReason, UpstreamOperation, UpstreamStreamSendError, UpstreamStreamSender,
 };
 pub use models::{DataPlaneRequest, DataPlaneRequestSummary};
 pub(crate) use models_endpoint::models as models_endpoint;

@@ -6,6 +6,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use tokio::sync::mpsc;
 use wokcore_core::{
     config::AccountAuthConfig,
     id::{AccountId, ProviderId},
@@ -21,7 +22,9 @@ use wokcore_engine::{
     retry::RetryPolicy,
     routing::{RouteDecision, RouteError, RouteRequest},
 };
-use wokcore_protocols::canonical::{CanonicalEvent, CanonicalRequest, GatewayError, PublicModelId};
+use wokcore_protocols::canonical::{
+    CanonicalEvent, CanonicalRequest, GatewayError, PublicModelId, Usage,
+};
 
 use crate::{ServerState, auth::AuthorizedClient};
 
@@ -30,7 +33,9 @@ use super::JSON_BODY_LIMIT;
 const MAX_UPSTREAM_REQUEST_ID_BYTES: usize = 256;
 const MAX_UPSTREAM_EVENTS: usize = 4_096;
 const MAX_UPSTREAM_METADATA_BYTES: usize = 1024 * 1024;
+const MAX_UPSTREAM_IDENTIFIER_BYTES: usize = 512;
 const ACCOUNTLESS_ACCOUNT_ID: &str = "accountless";
+pub const UPSTREAM_STREAM_CHANNEL_CAPACITY: usize = 2;
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct SafeUpstreamRequestId(Arc<str>);
@@ -372,10 +377,244 @@ impl UpstreamExecutionFailure {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub enum UpstreamExecutionResult {
     Succeeded(UpstreamExecutionResponse),
+    Streaming(UpstreamExecutionStream),
     Failed(UpstreamExecutionFailure),
+}
+
+#[derive(Clone)]
+pub struct UpstreamStreamSender {
+    inner: mpsc::Sender<UpstreamStreamItem>,
+}
+
+impl UpstreamStreamSender {
+    pub async fn send_event(&self, event: CanonicalEvent) -> Result<(), UpstreamStreamSendError> {
+        if !stream_event_fits(&event) {
+            return Err(UpstreamStreamSendError::InvalidEvent);
+        }
+        self.inner
+            .send(UpstreamStreamItem::Event(event))
+            .await
+            .map_err(|_| UpstreamStreamSendError::Closed)
+    }
+
+    pub async fn send_failure(
+        &self,
+        failure: UpstreamExecutionFailure,
+    ) -> Result<(), UpstreamStreamSendError> {
+        self.inner
+            .send(UpstreamStreamItem::Failure(failure))
+            .await
+            .map_err(|_| UpstreamStreamSendError::Closed)
+    }
+
+    pub fn max_capacity(&self) -> usize {
+        self.inner.max_capacity()
+    }
+
+    pub fn remaining_capacity(&self) -> usize {
+        self.inner.capacity()
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.inner.is_closed()
+    }
+}
+
+impl fmt::Debug for UpstreamStreamSender {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UpstreamStreamSender")
+            .field("max_capacity", &self.max_capacity())
+            .field("remaining_capacity", &self.remaining_capacity())
+            .field("closed", &self.is_closed())
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum UpstreamStreamSendError {
+    #[error("the upstream stream event exceeds its bounds")]
+    InvalidEvent,
+    #[error("the upstream stream receiver is closed")]
+    Closed,
+}
+
+pub(crate) enum UpstreamStreamItem {
+    Event(CanonicalEvent),
+    Failure(UpstreamExecutionFailure),
+}
+
+pub struct UpstreamExecutionStream {
+    receiver: mpsc::Receiver<UpstreamStreamItem>,
+    created_at: u64,
+    finish_reason: UpstreamFinishReason,
+    stop_sequence: Option<String>,
+    thinking_signatures: BTreeMap<String, String>,
+    initial_usage: Usage,
+    upstream_request_id: Option<SafeUpstreamRequestId>,
+}
+
+impl UpstreamExecutionStream {
+    pub fn channel(created_at: u64) -> (UpstreamStreamSender, Self) {
+        let (sender, receiver) = mpsc::channel(UPSTREAM_STREAM_CHANNEL_CAPACITY);
+        (
+            UpstreamStreamSender { inner: sender },
+            Self {
+                receiver,
+                created_at,
+                finish_reason: UpstreamFinishReason::Stop,
+                stop_sequence: None,
+                thinking_signatures: BTreeMap::new(),
+                initial_usage: Usage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cached_input_tokens: None,
+                    reasoning_tokens: None,
+                    extensions: BTreeMap::new(),
+                },
+                upstream_request_id: None,
+            },
+        )
+    }
+
+    pub fn with_upstream_request_id(mut self, request_id: SafeUpstreamRequestId) -> Self {
+        self.upstream_request_id = Some(request_id);
+        self
+    }
+
+    pub fn with_finish_reason(mut self, finish_reason: UpstreamFinishReason) -> Self {
+        self.finish_reason = finish_reason;
+        self
+    }
+
+    pub fn with_stop_sequence(
+        mut self,
+        stop_sequence: impl Into<String>,
+    ) -> Result<Self, InvalidUpstreamExecutionStream> {
+        let stop_sequence = stop_sequence.into();
+        if !valid_stream_identifier(&stop_sequence) {
+            return Err(InvalidUpstreamExecutionStream);
+        }
+        self.stop_sequence = Some(stop_sequence);
+        Ok(self)
+    }
+
+    pub fn with_thinking_signatures(
+        mut self,
+        thinking_signatures: BTreeMap<String, String>,
+    ) -> Result<Self, InvalidUpstreamExecutionStream> {
+        if thinking_signatures.len() > MAX_UPSTREAM_EVENTS
+            || thinking_signatures.iter().any(|(item_id, signature)| {
+                !valid_stream_identifier(item_id)
+                    || signature.is_empty()
+                    || signature.len() > MAX_UPSTREAM_METADATA_BYTES
+            })
+            || !json_fits(&thinking_signatures, MAX_UPSTREAM_METADATA_BYTES)
+        {
+            return Err(InvalidUpstreamExecutionStream);
+        }
+        self.thinking_signatures = thinking_signatures;
+        Ok(self)
+    }
+
+    pub fn with_initial_usage(
+        mut self,
+        initial_usage: Usage,
+    ) -> Result<Self, InvalidUpstreamExecutionStream> {
+        if !json_fits(&initial_usage, MAX_UPSTREAM_METADATA_BYTES) {
+            return Err(InvalidUpstreamExecutionStream);
+        }
+        self.initial_usage = initial_usage;
+        Ok(self)
+    }
+
+    pub const fn created_at(&self) -> u64 {
+        self.created_at
+    }
+
+    pub const fn finish_reason(&self) -> UpstreamFinishReason {
+        self.finish_reason
+    }
+
+    pub fn stop_sequence(&self) -> Option<&str> {
+        self.stop_sequence.as_deref()
+    }
+
+    pub fn thinking_signatures(&self) -> &BTreeMap<String, String> {
+        &self.thinking_signatures
+    }
+
+    pub fn initial_usage(&self) -> &Usage {
+        &self.initial_usage
+    }
+
+    pub fn upstream_request_id(&self) -> Option<&SafeUpstreamRequestId> {
+        self.upstream_request_id.as_ref()
+    }
+
+    async fn receive(
+        &mut self,
+        cancellation: &ExecutionCancellation,
+    ) -> Option<UpstreamStreamItem> {
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => None,
+            item = self.receiver.recv() => item,
+        }
+    }
+
+    pub(crate) fn poll_receive(
+        &mut self,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<UpstreamStreamItem>> {
+        self.receiver.poll_recv(context)
+    }
+}
+
+impl fmt::Debug for UpstreamExecutionStream {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UpstreamExecutionStream")
+            .field("created_at", &self.created_at)
+            .field("finish_reason", &self.finish_reason)
+            .field("has_stop_sequence", &self.stop_sequence.is_some())
+            .field("thinking_signature_count", &self.thinking_signatures.len())
+            .field("upstream_request_id", &self.upstream_request_id)
+            .field("channel_capacity", &UPSTREAM_STREAM_CHANNEL_CAPACITY)
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("the upstream execution stream metadata exceeds its bounds")]
+pub struct InvalidUpstreamExecutionStream;
+
+fn stream_event_fits(event: &CanonicalEvent) -> bool {
+    let identifiers_fit = match event {
+        CanonicalEvent::Created { response_id } => valid_stream_identifier(response_id),
+        CanonicalEvent::OutputTextDelta { item_id, .. }
+        | CanonicalEvent::ReasoningDelta { item_id, .. } => valid_stream_identifier(item_id),
+        CanonicalEvent::ToolCallDelta {
+            item_id,
+            call_id,
+            name,
+            ..
+        } => {
+            valid_stream_identifier(item_id)
+                && valid_stream_identifier(call_id)
+                && valid_stream_identifier(name)
+        }
+        CanonicalEvent::Usage(_) | CanonicalEvent::Completed => true,
+        CanonicalEvent::Failed(_) => false,
+    };
+    identifiers_fit && json_fits(event, MAX_UPSTREAM_METADATA_BYTES)
+}
+
+fn valid_stream_identifier(value: &str) -> bool {
+    !value.is_empty() && value.len() <= MAX_UPSTREAM_IDENTIFIER_BYTES
 }
 
 #[async_trait]
@@ -387,11 +626,48 @@ pub trait UpstreamExecutor: Send + Sync + 'static {
     ) -> UpstreamExecutionResult;
 }
 
+enum AttemptExecutionOutput {
+    Complete(UpstreamExecutionResponse),
+    Stream(StartedUpstreamStream),
+}
+
+pub(crate) enum Executed {
+    Response(ExecutedResponse),
+    Stream(ExecutedStream),
+}
+
 pub(crate) struct ExecutedResponse {
     pub(crate) response: UpstreamExecutionResponse,
     pub(crate) public_model: PublicModelId,
     pub(crate) request: Arc<CanonicalRequest>,
     pub(crate) public_reasoning_effort: Option<String>,
+}
+
+pub(crate) struct ExecutedStream {
+    pub(crate) stream: StartedUpstreamStream,
+    pub(crate) public_model: PublicModelId,
+    pub(crate) request: Arc<CanonicalRequest>,
+    pub(crate) public_reasoning_effort: Option<String>,
+    pub(crate) cancellation: CancelOnDrop,
+}
+
+pub(crate) struct StartedUpstreamStream {
+    first_event: Option<CanonicalEvent>,
+    upstream: UpstreamExecutionStream,
+}
+
+impl StartedUpstreamStream {
+    pub(crate) fn take_first_event(&mut self) -> Option<CanonicalEvent> {
+        self.first_event.take()
+    }
+
+    pub(crate) fn upstream(&self) -> &UpstreamExecutionStream {
+        &self.upstream
+    }
+
+    pub(crate) fn upstream_mut(&mut self) -> &mut UpstreamExecutionStream {
+        &mut self.upstream
+    }
 }
 
 pub(crate) struct DataPlaneExecutionError {
@@ -409,7 +685,7 @@ struct RequestAttempt {
 
 #[async_trait]
 impl UpstreamAttempt for RequestAttempt {
-    type Output = UpstreamExecutionResponse;
+    type Output = AttemptExecutionOutput;
 
     async fn execute(
         &self,
@@ -454,9 +730,55 @@ impl UpstreamAttempt for RequestAttempt {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) =
                     response.upstream_request_id().cloned();
-                AttemptResult::Succeeded {
-                    output: response,
-                    boundary: AttemptBoundary::BeforeVisible,
+                if self.canonical.stream {
+                    failed_attempt(UpstreamExecutionFailure::new(
+                        UpstreamFailureKind::MalformedResponse,
+                    ))
+                } else {
+                    AttemptResult::Succeeded {
+                        output: AttemptExecutionOutput::Complete(response),
+                        boundary: AttemptBoundary::BeforeVisible,
+                    }
+                }
+            }
+            UpstreamExecutionResult::Streaming(mut stream) => {
+                *self
+                    .last_upstream_request_id
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    stream.upstream_request_id().cloned();
+                if self.operation != UpstreamOperation::Text || !self.canonical.stream {
+                    return failed_attempt(UpstreamExecutionFailure::new(
+                        UpstreamFailureKind::MalformedResponse,
+                    ));
+                }
+                match stream.receive(cancellation).await {
+                    Some(UpstreamStreamItem::Event(
+                        first_event @ CanonicalEvent::Created { .. },
+                    )) => AttemptResult::Succeeded {
+                        output: AttemptExecutionOutput::Stream(StartedUpstreamStream {
+                            first_event: Some(first_event),
+                            upstream: stream,
+                        }),
+                        boundary: AttemptBoundary::Visible,
+                    },
+                    Some(UpstreamStreamItem::Event(_)) => failed_attempt(
+                        UpstreamExecutionFailure::new(UpstreamFailureKind::MalformedResponse),
+                    ),
+                    Some(UpstreamStreamItem::Failure(failure)) => {
+                        *self
+                            .last_upstream_request_id
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            failure.upstream_request_id().cloned();
+                        failed_attempt(failure)
+                    }
+                    None if cancellation.is_cancelled() => failed_attempt(
+                        UpstreamExecutionFailure::new(UpstreamFailureKind::Cancelled),
+                    ),
+                    None => failed_attempt(UpstreamExecutionFailure::new(
+                        UpstreamFailureKind::MalformedResponse,
+                    )),
                 }
             }
             UpstreamExecutionResult::Failed(failure) => {
@@ -465,16 +787,20 @@ impl UpstreamAttempt for RequestAttempt {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) =
                     failure.upstream_request_id().cloned();
-                AttemptResult::Failed {
-                    failure: AttemptFailure::new(
-                        map_failure_kind(failure.kind()),
-                        failure.status(),
-                        failure.retry_after_ms(),
-                    ),
-                    boundary: AttemptBoundary::BeforeVisible,
-                }
+                failed_attempt(failure)
             }
         }
+    }
+}
+
+fn failed_attempt(failure: UpstreamExecutionFailure) -> AttemptResult<AttemptExecutionOutput> {
+    AttemptResult::Failed {
+        failure: AttemptFailure::new(
+            map_failure_kind(failure.kind()),
+            failure.status(),
+            failure.retry_after_ms(),
+        ),
+        boundary: AttemptBoundary::BeforeVisible,
     }
 }
 
@@ -483,7 +809,7 @@ pub(crate) async fn execute_canonical(
     authorized: &AuthorizedClient,
     mut canonical: CanonicalRequest,
     operation: UpstreamOperation,
-) -> Result<ExecutedResponse, DataPlaneExecutionError> {
+) -> Result<Executed, DataPlaneExecutionError> {
     let providers = state
         .providers
         .as_ref()
@@ -514,12 +840,12 @@ pub(crate) async fn execute_canonical(
     {
         let input_tokens =
             estimate_local_tokens(&canonical).map_err(|error| execution_error(error, None))?;
-        return Ok(ExecutedResponse {
+        return Ok(Executed::Response(ExecutedResponse {
             response: UpstreamExecutionResponse::token_count(input_tokens),
             public_model,
             request: Arc::new(canonical),
             public_reasoning_effort,
-        });
+        }));
     }
     let executor = state
         .upstream_executor
@@ -549,7 +875,7 @@ pub(crate) async fn execute_canonical(
         }
     }
     let cancellation = ExecutionCancellation::new();
-    let _cancel_on_drop = CancelOnDrop(cancellation.clone());
+    let cancel_on_drop = CancelOnDrop(cancellation.clone());
     let last_upstream_request_id = Arc::new(Mutex::new(None));
     let canonical = Arc::new(canonical);
     let attempt = Arc::new(RequestAttempt {
@@ -576,13 +902,17 @@ pub(crate) async fn execute_canonical(
             &account_id,
             PreparedRequestBody::new(Vec::new()),
         );
-        return match coordinator.execute(request, &health, cancellation).await {
-            ExecutionOutcome::Succeeded(success) => Ok(ExecutedResponse {
-                response: success.into_output(),
+        return match coordinator
+            .execute(request, &health, cancellation.clone())
+            .await
+        {
+            ExecutionOutcome::Succeeded(success) => executed_from_attempt(
+                success.into_output(),
                 public_model,
-                request: canonical,
+                canonical,
                 public_reasoning_effort,
-            }),
+                cancel_on_drop,
+            ),
             ExecutionOutcome::Failed(failure) => {
                 let request_id = last_upstream_request_id
                     .lock()
@@ -624,12 +954,13 @@ pub(crate) async fn execute_canonical(
             .await
         {
             ExecutionOutcome::Succeeded(success) => {
-                return Ok(ExecutedResponse {
-                    response: success.into_output(),
+                return executed_from_attempt(
+                    success.into_output(),
                     public_model,
-                    request: Arc::clone(&canonical),
+                    Arc::clone(&canonical),
                     public_reasoning_effort,
-                });
+                    cancel_on_drop,
+                );
             }
             ExecutionOutcome::Failed(failure)
                 if matches!(failure.terminal(), ExecutionTerminal::NoEligibleAccount)
@@ -653,6 +984,37 @@ pub(crate) async fn execute_canonical(
         GatewayError::transport("no eligible account"),
         None,
     ))
+}
+
+fn executed_from_attempt(
+    output: AttemptExecutionOutput,
+    public_model: PublicModelId,
+    request: Arc<CanonicalRequest>,
+    public_reasoning_effort: Option<String>,
+    cancellation: CancelOnDrop,
+) -> Result<Executed, DataPlaneExecutionError> {
+    match (request.stream, output) {
+        (false, AttemptExecutionOutput::Complete(response)) => {
+            Ok(Executed::Response(ExecutedResponse {
+                response,
+                public_model,
+                request,
+                public_reasoning_effort,
+            }))
+        }
+        (true, AttemptExecutionOutput::Stream(stream)) => Ok(Executed::Stream(ExecutedStream {
+            stream,
+            public_model,
+            request,
+            public_reasoning_effort,
+            cancellation,
+        })),
+        (false, AttemptExecutionOutput::Stream(_))
+        | (true, AttemptExecutionOutput::Complete(_)) => Err(execution_error(
+            GatewayError::upstream_response(502, "upstream execution mode mismatch"),
+            None,
+        )),
+    }
 }
 
 fn map_failure_kind(kind: UpstreamFailureKind) -> AttemptFailureKind {
@@ -767,7 +1129,17 @@ fn execution_error(
     }
 }
 
-struct CancelOnDrop(ExecutionCancellation);
+pub(crate) struct CancelOnDrop(ExecutionCancellation);
+
+impl CancelOnDrop {
+    pub(crate) fn cancellation(&self) -> &ExecutionCancellation {
+        &self.0
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.0.cancel();
+    }
+}
 
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {

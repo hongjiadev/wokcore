@@ -6,5 +6,6 @@ pub mod recorder;
 pub mod redaction;
 pub mod retention;
 pub mod ring;
+pub mod runtime;
 pub mod segment;
 pub mod snapshot;

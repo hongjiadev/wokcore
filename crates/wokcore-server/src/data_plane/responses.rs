@@ -6,7 +6,7 @@ use wokcore_protocols::{
 };
 
 use super::{
-    ExecutedResponse, UpstreamExecutionOutput, UpstreamFinishReason,
+    ExecutedResponse, ExecutedStream, UpstreamExecutionOutput, UpstreamFinishReason,
     response::bounded_json_response,
 };
 
@@ -56,6 +56,19 @@ pub(crate) fn encode(executed: &ExecutedResponse) -> Result<Response, GatewayErr
     bounded_json_response(&value, executed.response.upstream_request_id())
 }
 
+pub(crate) fn stream_codec(executed: &ExecutedStream) -> Result<ResponsesCodec, GatewayError> {
+    Ok(ResponsesCodec::new(ResponsesEncodeContext {
+        model: executed.public_model.clone(),
+        created_at: executed.stream.upstream().created_at(),
+        response: response_template_from_parts(
+            &executed.request,
+            executed.public_reasoning_effort.as_deref(),
+            executed.stream.upstream().created_at(),
+            executed.stream.upstream().finish_reason(),
+        )?,
+    }))
+}
+
 fn validate_extension(
     request: &wokcore_protocols::canonical::CanonicalRequest,
     key: &str,
@@ -75,11 +88,22 @@ fn validate_extension(
 fn response_template(
     executed: &ExecutedResponse,
 ) -> Result<ResponsesResponseTemplate, GatewayError> {
-    let request = &executed.request;
-    let incomplete_details = incomplete_details(executed.response.finish_reason());
-    let completed_at = incomplete_details
-        .is_none()
-        .then_some(executed.response.created_at());
+    response_template_from_parts(
+        &executed.request,
+        executed.public_reasoning_effort.as_deref(),
+        executed.response.created_at(),
+        executed.response.finish_reason(),
+    )
+}
+
+fn response_template_from_parts(
+    request: &wokcore_protocols::canonical::CanonicalRequest,
+    public_reasoning_effort: Option<&str>,
+    created_at: u64,
+    finish_reason: UpstreamFinishReason,
+) -> Result<ResponsesResponseTemplate, GatewayError> {
+    let incomplete_details = incomplete_details(finish_reason);
+    let completed_at = incomplete_details.is_none().then_some(created_at);
     let reasoning = request.reasoning.as_ref().map_or_else(
         || json!({"effort": null, "summary": null}),
         |reasoning| {
@@ -88,10 +112,7 @@ fn response_template(
                 .iter()
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect::<Map<_, _>>();
-            value.insert(
-                "effort".to_owned(),
-                json!(executed.public_reasoning_effort.as_deref()),
-            );
+            value.insert("effort".to_owned(), json!(public_reasoning_effort));
             value.entry("summary".to_owned()).or_insert(Value::Null);
             Value::Object(value)
         },

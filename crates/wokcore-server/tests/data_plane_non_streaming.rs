@@ -35,8 +35,8 @@ use wokcore_server::{
     auth::{AuthRegistry, EntropySource, StateAuthMetadataStore, TokenError},
     data_plane::{
         SafeUpstreamRequestId, UpstreamExecutionFailure, UpstreamExecutionRequest,
-        UpstreamExecutionResponse, UpstreamExecutionResult, UpstreamExecutor, UpstreamFailureKind,
-        UpstreamOperation,
+        UpstreamExecutionResponse, UpstreamExecutionResult, UpstreamExecutionStream,
+        UpstreamExecutor, UpstreamFailureKind, UpstreamOperation,
     },
     lifecycle::ServiceLifecycle,
     providers::{ProviderCandidate, ProviderManagement},
@@ -107,6 +107,13 @@ impl UpstreamExecutor for SyntheticExecutor {
                 UpstreamExecutionResult::Succeeded(UpstreamExecutionResponse::token_count(37))
             }
             Mode::Success | Mode::Length => {
+                let usage = Usage {
+                    input_tokens: 11,
+                    output_tokens: 3,
+                    cached_input_tokens: Some(2),
+                    reasoning_tokens: None,
+                    extensions: BTreeMap::new(),
+                };
                 let events = vec![
                     CanonicalEvent::Created {
                         response_id: "resp_safe_1".to_owned(),
@@ -115,15 +122,35 @@ impl UpstreamExecutor for SyntheticExecutor {
                         item_id: "item_safe_1".to_owned(),
                         delta: "synthetic reply".to_owned(),
                     },
-                    CanonicalEvent::Usage(Usage {
-                        input_tokens: 11,
-                        output_tokens: 3,
-                        cached_input_tokens: Some(2),
-                        reasoning_tokens: None,
-                        extensions: BTreeMap::new(),
-                    }),
+                    CanonicalEvent::Usage(usage.clone()),
                     CanonicalEvent::Completed,
                 ];
+                if request.canonical().stream {
+                    let (sender, stream) = UpstreamExecutionStream::channel(1_722_000_000);
+                    let mut stream = stream
+                        .with_initial_usage(Usage {
+                            output_tokens: 0,
+                            reasoning_tokens: None,
+                            ..usage
+                        })
+                        .unwrap()
+                        .with_upstream_request_id(
+                            SafeUpstreamRequestId::new("upstream_safe_1").unwrap(),
+                        );
+                    if mode == Mode::Length {
+                        stream = stream.with_finish_reason(
+                            wokcore_server::data_plane::UpstreamFinishReason::Length,
+                        );
+                    }
+                    tokio::spawn(async move {
+                        for event in events {
+                            if sender.send_event(event).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                    return UpstreamExecutionResult::Streaming(stream);
+                }
                 let mut response = UpstreamExecutionResponse::events(events, 1_722_000_000)
                     .unwrap()
                     .with_upstream_request_id(
@@ -328,6 +355,29 @@ async fn all_three_text_protocols_decode_route_execute_and_encode_non_streaming_
         assert_eq!(model, "gpt-5.6");
     }
     assert_eq!(fixture.executor.calls(), 3);
+}
+
+#[tokio::test]
+async fn streaming_text_requests_return_protocol_sse_instead_of_a_capability_error() {
+    let fixture = fixture("openai-apikey").await;
+    let response = send_json(
+        &fixture,
+        "/v1/responses",
+        json!({"model":"gpt-5.6","input":"hello","stream":true}),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE],
+        "text/event-stream"
+    );
+    let body = to_bytes(response.into_body(), 16 * 1024 * 1024)
+        .await
+        .unwrap();
+    let body = std::str::from_utf8(&body).unwrap();
+    assert!(body.contains("event: response.created"));
+    assert!(body.contains("event: response.completed"));
 }
 
 #[tokio::test]

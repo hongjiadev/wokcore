@@ -6,7 +6,7 @@ use wokcore_protocols::{
 };
 
 use super::{
-    ExecutedResponse, UpstreamExecutionOutput, UpstreamFinishReason,
+    ExecutedResponse, ExecutedStream, UpstreamExecutionOutput, UpstreamFinishReason,
     response::bounded_json_response,
 };
 
@@ -29,6 +29,20 @@ pub(crate) fn encode(executed: &ExecutedResponse) -> Result<Response, GatewayErr
         events,
     )?;
     bounded_json_response(&value, executed.response.upstream_request_id())
+}
+
+pub(crate) fn stream_codec(executed: &ExecutedStream) -> ChatCodec {
+    ChatCodec::new(ChatEncodeContext {
+        model: executed.public_model.clone(),
+        created: executed.stream.upstream().created_at(),
+        response: ChatResponseTemplate {
+            choice_index: 0,
+            finish_reason: finish_reason(executed.stream.upstream().finish_reason()),
+            logprobs: None,
+            include_usage: true,
+            extra: BTreeMap::new(),
+        },
+    })
 }
 
 fn finish_reason(reason: UpstreamFinishReason) -> ChatFinishReason {

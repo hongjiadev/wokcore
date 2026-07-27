@@ -8,7 +8,7 @@ use wokcore_protocols::{
 };
 
 use super::{
-    ExecutedResponse, UpstreamExecutionOutput, UpstreamFinishReason,
+    ExecutedResponse, ExecutedStream, UpstreamExecutionOutput, UpstreamFinishReason,
     response::bounded_json_response,
 };
 
@@ -34,6 +34,24 @@ pub(crate) fn encode_message(
         events,
     )?;
     bounded_json_response(&value, executed.response.upstream_request_id())
+}
+
+pub(crate) fn stream_codec(executed: &ExecutedStream) -> AnthropicCodec {
+    AnthropicCodec::new(AnthropicEncodeContext {
+        request_id: executed.request.request_id.clone(),
+        model: executed.public_model.clone(),
+        initial_usage: executed.stream.upstream().initial_usage().clone(),
+        response: AnthropicResponseTemplate {
+            stop_reason: stop_reason(executed.stream.upstream().finish_reason()),
+            stop_sequence: executed
+                .stream
+                .upstream()
+                .stop_sequence()
+                .map(str::to_owned),
+            thinking_signatures: executed.stream.upstream().thinking_signatures().clone(),
+            extra: BTreeMap::new(),
+        },
+    })
 }
 
 pub(crate) fn encode_token_count(executed: &ExecutedResponse) -> Result<Response, GatewayError> {
