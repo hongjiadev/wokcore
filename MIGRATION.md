@@ -262,3 +262,23 @@ Private pre-rewrite recovery material is excluded from this public repository.
   - `cargo +1.97.1 test -p wokcore-server --all-features --locked --offline`
   - `cargo +1.97.1 test -p wokcore --all-features --locked --offline`
   - `cargo +1.97.1 test --workspace --all-features --locked --offline`
+
+## Runtime foundation 11: frozen Provider catalog
+
+- Source repository: `https://github.com/lidge-jun/opencodex`
+- Source tag and commit: `v2.7.35` at `97e7326f89bcfbb29a2c73250cb25eb801d066b6`
+- Adapted static source:
+  - `src/providers/registry.ts`
+  - `src/providers/base-url-choices.ts`
+  - the referenced static Kiro, Antigravity, Kimi, Anthropic, OpenAI, Alibaba, Tencent, MiniMax, and Cloudflare model seeds
+- Deliberate adaptation:
+  - TypeScript registry objects become a strict, bundled TOML data file consumed by the new internal `wokcore-engine` crate;
+  - the frozen baseline contains exactly 58 canonical Provider IDs and records an explicit adapter family, authentication kind, endpoint policy, model-source kind, and capability set for every Provider;
+  - endpoint validation rejects credentials, fragments, unsafe schemes, remote hosts under loopback policy, local/private literals under public policy, and malformed HTTPS templates;
+  - unknown fields, duplicate IDs/models, alias collisions, invalid identifiers, and inconsistent static/live model metadata fail closed with content-free error codes;
+  - no OpenCodex executable code, OAuth implementation, native local execution path, credential material, runtime command, or network behavior is imported;
+  - WokCore catalog parsing and validation are original Rust code.
+- License: adapted Provider catalog facts retain the complete OpenCodex MIT notice in `NOTICE.md`.
+- Verification:
+  - `cargo +1.97.1 test -p wokcore-engine --test provider_catalog --locked --offline`
+  - `cargo +1.97.1 clippy -p wokcore-engine --all-targets --all-features --locked --offline -- -D warnings`

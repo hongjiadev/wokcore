@@ -2378,6 +2378,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "wokcore-engine"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+ "toml_edit",
+ "url",
+ "wokcore-core",
+]
+
+[[package]]
 name = "wokcore-platform"
 version = "0.1.0"
 dependencies = [

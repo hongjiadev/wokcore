@@ -1,0 +1,720 @@
+# Provider identifiers and compatibility metadata are adapted from OpenCodex v2.7.35.
+# See NOTICE.md and MIGRATION.md for the frozen source revision and MIT attribution.
+schema_version = 1
+baseline_commit = "97e7326f89bcfbb29a2c73250cb25eb801d066b6"
+
+[[providers]]
+id = "openai"
+label = "OpenAI (Codex login)"
+adapter = "open_ai_responses"
+base_url = "https://chatgpt.com/backend-api/codex"
+auth_kind = "forward"
+endpoint_policy = "public_https"
+model_source = "none"
+aliases = []
+models = []
+capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true }
+
+[[providers]]
+id = "cursor"
+label = "Cursor (experimental)"
+adapter = "cursor"
+base_url = "https://api2.cursor.sh"
+auth_kind = "oauth"
+endpoint_policy = "public_https"
+model_source = "live"
+aliases = []
+models = []
+default_model = "auto"
+capabilities = { text = true, streaming = true, tools = true, vision = false, images = false, reasoning = true }
+
+[[providers]]
+id = "xai"
+label = "xAI Grok"
+adapter = "open_ai_chat"
+base_url = "https://api.x.ai/v1"
+auth_kind = "oauth"
+endpoint_policy = "public_https"
+model_source = "hybrid"
+aliases = []
+models = ["grok-4.5", "grok-4.3", "grok-4.20-0309-reasoning", "grok-4.20-0309-non-reasoning", "grok-build-0.1", "grok-composer-2.5-fast"]
+default_model = "grok-4.5"
+capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true }
+
+[[providers]]
+id = "anthropic"
+label = "Anthropic Claude"
+adapter = "anthropic"
+base_url = "https://api.anthropic.com"
+auth_kind = "oauth"
+endpoint_policy = "public_https"
+model_source = "static"
+aliases = []
+models = ["claude-fable-5", "claude-sonnet-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"]
+capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true }
+
+[[providers]]
+id = "anthropic-apikey"
+label = "Anthropic (API key)"
+adapter = "anthropic"
+base_url = "https://api.anthropic.com"
+auth_kind = "key"
+endpoint_policy = "public_https"
+model_source = "hybrid"
+aliases = []
+models = ["claude-fable-5", "claude-sonnet-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"]
+capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true }
+
+[[providers]]
+id = "kimi"
+label = "Kimi"
+adapter = "open_ai_chat"
+base_url = "https://api.kimi.com/coding/v1"
+auth_kind = "oauth"
+endpoint_policy = "public_https"
+model_source = "static"
+aliases = []
+models = ["k3", "k3[1m]", "kimi-k2.7-code", "kimi-k2.7-code-highspeed", "kimi-k2.6", "kimi-k2.5", "kimi-for-coding"]
+default_model = "kimi-k2.7-code"
+capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true }
+
+[[providers]]
+id = "kiro"
+label = "Kiro (AWS CodeWhisperer)"
+adapter = "kiro"
+base_url = "https://runtime.us-east-1.kiro.dev"
+auth_kind = "oauth"
+endpoint_policy = "public_https"
+model_source = "static"
+aliases = []
+models = ["kiro-auto", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "claude-sonnet-5", "claude-opus-4.8", "claude-opus-4.7", "claude-opus-4.6", "claude-opus-4.5", "claude-sonnet-4.6", "claude-sonnet-4.5", "claude-sonnet-4.0", "claude-haiku-4.5", "deepseek-3.2", "minimax-m2.5", "minimax-m2.1", "glm-5", "qwen3-coder-next"]
+default_model = "kiro-auto"
+capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true }
+
+[[providers]]
+id = "openai-apikey"
+label = "OpenAI API"
+adapter = "open_ai_responses"
+base_url = "https://api.openai.com/v1"
+auth_kind = "key"
+endpoint_policy = "public_https"
+model_source = "hybrid"
+aliases = []
+models = ["gpt-5.5", "gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.6-sol-pro", "gpt-5.6-terra-pro", "gpt-5.6-luna-pro"]
+capabilities = { text = true, streaming = true, tools = true, vision = true, images = true, reasoning = true }
+
+[[providers]]
+id = "umans"
+label = "Umans AI Coding Plan"
+adapter = "anthropic"
+base_url = "https://api.code.umans.ai"
+auth_kind = "key"
+endpoint_policy = "public_https"
+model_source = "static"
+aliases = []
+models = ["umans-coder", "umans-kimi-k2.7", "umans-flash", "umans-glm-5.2", "umans-glm-5.1", "umans-qwen3.6-35b-a3b"]
+default_model = "umans-coder"
+capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true }
+
+[[providers]]
+id = "opencode-go"
+label = "opencode go"
+adapter = "open_ai_chat"
+base_url = "https://opencode.ai/zen/go/v1"
+auth_kind = "key"
+endpoint_policy = "public_https"
+model_source = "none"
+aliases = []
+models = []
+capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true }
+
+[[providers]]
+id = "neuralwatt"
+label = "Neuralwatt Cloud"
+adapter = "open_ai_chat"
+base_url = "https://api.neuralwatt.com/v1"
+auth_kind = "key"
+endpoint_policy = "public_https"
+model_source = "none"
+aliases = []
+models = []
+capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true }
+
+[[providers]]
+id = "openrouter"
+label = "OpenRouter"
+adapter = "open_ai_chat"
+base_url = "https://openrouter.ai/api/v1"
+auth_kind = "key"
+endpoint_policy = "public_https"
+model_source = "none"
+aliases = []
+models = []
+capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true }
+
+[[providers]]
+id = "orcarouter"
+label = "OrcaRouter"
+adapter = "open_ai_chat"
+base_url = "https://api.orcarouter.ai/v1"
+auth_kind = "key"
+endpoint_policy = "public_https"
+model_source = "none"
+aliases = []
+models = []
+capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true }
+
+[[providers]]
+id = "groq"
+label = "Groq"
+adapter = "open_ai_chat"
+base_url = "https://api.groq.com/openai/v1"
+auth_kind = "key"
+endpoint_policy = "public_https"
+model_source = "none"
+aliases = []
+models = []
+capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true }
+
+[[providers]]
+id = "google"
+label = "Google Gemini"
+adapter = "google"
+base_url = "https://generativelanguage.googleapis.com"
+auth_kind = "key"
+endpoint_policy = "public_https"
+model_source = "none"
+aliases = []
+models = []
+capabilities = { text = true, streaming = true, tools = true, vision = true, images = true, reasoning = true }
+
+[[providers]]
+id = "google-vertex"
+label = "Google Vertex AI"
+adapter = "google"
+base_url = "https://aiplatform.googleapis.com"
+auth_kind = "key"
+endpoint_policy = "public_https"
+model_source = "none"
+aliases = []
+models = []
+capabilities = { text = true, streaming = true, tools = true, vision = true, images = true, reasoning = true }
+
+[[providers]]
+id = "google-antigravity"
+label = "Google Antigravity"
+adapter = "google"
+base_url = "https://daily-cloudcode-pa.googleapis.com"
+auth_kind = "oauth"
+endpoint_policy = "public_https"
+model_source = "static"
+aliases = []
+models = ["gemini-3.6-flash", "gemini-3.1-pro", "claude-sonnet-4-6", "claude-opus-4-6-thinking", "gpt-oss-120b-medium"]
+capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true }
+
+[[providers]]
+id = "azure-openai"
+label = "Azure OpenAI"
+adapter = "azure_open_ai"
+base_url = "https://{resource}.openai.azure.com/openai"
+auth_kind = "key"
+endpoint_policy = "https_template"
+model_source = "none"
+aliases = []
+models = []
+capabilities = { text = true, streaming = true, tools = true, vision = true, images = true, reasoning = true }
+
+[[providers]]
+id = "ollama"
+label = "Ollama (local)"
+adapter = "open_ai_chat"
+base_url = "http://localhost:11434/v1"
+auth_kind = "local"
+endpoint_policy = "loopback_http"
+model_source = "live"
+aliases = []
+models = []
+capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true }
+
+[[providers]]
+id = "vllm"
+label = "vLLM (local)"
+adapter = "open_ai_chat"
+base_url = "http://localhost:8000/v1"
+auth_kind = "local"
+endpoint_policy = "loopback_http"
+model_source = "live"
+aliases = []
+models = []
+capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true }
+
+[[providers]]
+id = "lm-studio"
+label = "LM Studio (local)"
+adapter = "open_ai_chat"
+base_url = "http://localhost:1234/v1"
+auth_kind = "local"
+endpoint_policy = "loopback_http"
+model_source = "live"
+aliases = []
+models = []
+capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true }
+
+[[providers]]
+id = "deepseek"
+label = "DeepSeek"
+adapter = "open_ai_chat"
+base_url = "https://api.deepseek.com"
+auth_kind = "key"
+endpoint_policy = "public_https"
+model_source = "static"
+aliases = []
+models = ["deepseek-chat", "deepseek-reasoner", "deepseek-v4-pro", "deepseek-v4-flash"]
+default_model = "deepseek-chat"
+capabilities = { text = true, streaming = true, tools = true, vision = false, images = false, reasoning = true }
+
+[[providers]]
+id = "cerebras"
+label = "Cerebras"
+adapter = "open_ai_chat"
+base_url = "https://api.cerebras.ai/v1"
+auth_kind = "key"
+endpoint_policy = "public_https"
+model_source = "none"
+aliases = []
+models = []
+capabilities = { text = true, streaming = true, tools = true, vision = false, images = false, reasoning = true }
+
+[[providers]]
+id = "together"
+label = "Together"
+adapter = "open_ai_chat"
+base_url = "https://api.together.xyz/v1"
+auth_kind = "key"
+endpoint_policy = "public_https"
+model_source = "none"
+aliases = []
+models = []
+capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true }
+
+[[providers]]
+id = "fireworks"
+label = "Fireworks"
+adapter = "open_ai_chat"
+base_url = "https://api.fireworks.ai/inference/v1"
+auth_kind = "key"
+endpoint_policy = "public_https"
+model_source = "none"
+aliases = []
+models = []
+capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true }
+
+[[providers]]
+id = "firepass"
+label = "Fire Pass (Fireworks Kimi)"
+adapter = "open_ai_chat"
+base_url = "https://api.fireworks.ai/inference/v1"
+auth_kind = "key"
+endpoint_policy = "public_https"
+model_source = "none"
+aliases = []
+models = []
+capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true }
+
+[[providers]]
+id = "moonshot"
+label = "Moonshot (Kimi API)"
+adapter = "open_ai_chat"
+base_url = "https://api.moonshot.ai/v1"
+auth_kind = "key"
+endpoint_policy = "public_https"
+model_source = "static"
+aliases = []
+models = ["kimi-k3", "kimi-k2.7-code", "kimi-k2.7-code-highspeed", "kimi-k2.6", "kimi-k2.5"]
+default_model = "kimi-k3"
+capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true }
+
+[[providers]]
+id = "huggingface"
+label = "Hugging Face"
+adapter = "open_ai_chat"
+base_url = "https://router.huggingface.co/v1"
+auth_kind = "key"
+endpoint_policy = "public_https"
+model_source = "none"
+aliases = []
+models = []
+capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true }
+
+[[providers]]
+id = "nvidia"
+label = "NVIDIA NIM"
+adapter = "open_ai_chat"
+base_url = "https://integrate.api.nvidia.com/v1"
+auth_kind = "key"
+endpoint_policy = "public_https"
+model_source = "none"
+aliases = []
+models = []
+capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true }
+
+[[providers]]
+id = "venice"
+label = "Venice"
+adapter = "open_ai_chat"
+base_url = "https://api.venice.ai/api/v1"
+auth_kind = "key"
+endpoint_policy = "public_https"
+model_source = "none"
+aliases = []
+models = []
+capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true }
+
+[[providers]]
+id = "zai"
+label = "Z.AI — GLM Coding Plan"
+adapter = "open_ai_chat"
+base_url = "https://api.z.ai/api/coding/paas/v4"
+auth_kind = "key"
+endpoint_policy = "public_https"
+model_source = "static"
+aliases = []
+models = ["glm-5.2", "glm-5.2[1m]", "glm-5.1", "glm-5", "glm-4.6"]
+default_model = "glm-5.2"
+capabilities = { text = true, streaming = true, tools = true, vision = false, images = false, reasoning = true }
+
+[[providers]]
+id = "nanogpt"
+label = "NanoGPT"
+adapter = "open_ai_chat"
+base_url = "https://nano-gpt.com/api/v1"
+auth_kind = "key"
+endpoint_policy = "public_https"
+model_source = "none"
+aliases = []
+models = []
+capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true }
+
+[[providers]]
+id = "synthetic"
+label = "Synthetic"
+adapter = "open_ai_chat"
+base_url = "https://api.synthetic.new/openai/v1"
+auth_kind = "key"
+endpoint_policy = "public_https"
+model_source = "none"
+aliases = []
+models = []
+capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true }
+
+[[providers]]
+id = "siliconflow"
+label = "SiliconFlow"
+adapter = "open_ai_chat"
+base_url = "https://api.siliconflow.cn/v1"
+auth_kind = "key"
+endpoint_policy = "public_https"
+model_source = "live"
+aliases = []
+models = []
+capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true }
+
+[[providers]]
+id = "qwen-cloud"
+label = "Qwen Cloud"
+adapter = "open_ai_chat"
+base_url = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"
+auth_kind = "key"
+endpoint_policy = "public_https"
+model_source = "none"
+aliases = []
+models = []
+capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true }
+
+[[providers]]
+id = "tencent-coding-plan"
+label = "Tencent Cloud Coding Plan"
+adapter = "open_ai_chat"
+base_url = "https://api.lkeap.cloud.tencent.com/coding/v3"
+auth_kind = "key"
+endpoint_policy = "public_https"
+model_source = "hybrid"
+aliases = []
+models = ["tc-code-latest", "glm-5", "kimi-k2.5", "minimax-m2.5"]
+default_model = "tc-code-latest"
+capabilities = { text = true, streaming = true, tools = true, vision = false, images = false, reasoning = true }
+
+[[providers]]
+id = "qianfan"
+label = "Qianfan (Baidu)"
+adapter = "open_ai_chat"
+base_url = "https://qianfan.baidubce.com/v2"
+auth_kind = "key"
+endpoint_policy = "public_https"
+model_source = "none"
+aliases = []
+models = []
+capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true }
+
+[[providers]]
+id = "alibaba"
+label = "Alibaba Coding Plan"
+adapter = "open_ai_chat"
+base_url = "https://coding-intl.dashscope.aliyuncs.com/v1"
+auth_kind = "key"
+endpoint_policy = "public_https"
+model_source = "none"
+aliases = []
+models = []
+capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true }
+
+[[providers]]
+id = "alibaba-token-plan"
+label = "Alibaba Token Plan (Beijing)"
+adapter = "open_ai_chat"
+base_url = "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
+auth_kind = "key"
+endpoint_policy = "public_https"
+model_source = "static"
+aliases = []
+models = ["qwen3.8-max-preview", "qwen3.7-max", "qwen3.7-plus", "qwen3.6-flash", "glm-5.2", "deepseek-v4-pro"]
+default_model = "qwen3.8-max-preview"
+capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true }
+
+[[providers]]
+id = "alibaba-token-plan-intl"
+label = "Alibaba Token Plan (International)"
+adapter = "open_ai_chat"
+base_url = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"
+auth_kind = "key"
+endpoint_policy = "public_https"
+model_source = "static"
+aliases = []
+models = ["qwen3.8-max-preview", "qwen3.7-max", "qwen3.7-plus", "qwen3.6-plus", "qwen3.6-flash", "deepseek-v4-pro", "deepseek-v4-flash", "deepseek-v3.2", "kimi-k2.7-code", "kimi-k2.6", "kimi-k2.5", "glm-5.2", "glm-5.1", "glm-5", "MiniMax-M2.5"]
+default_model = "qwen3.7-max"
+capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true }
+
+[[providers]]
+id = "parallel"
+label = "Parallel"
+adapter = "open_ai_chat"
+base_url = "https://platform.parallel.ai"
+auth_kind = "key"
+endpoint_policy = "public_https"
+model_source = "none"
+aliases = []
+models = []
+capabilities = { text = true, streaming = true, tools = false, vision = false, images = false, reasoning = false }
+
+[[providers]]
+id = "zenmux"
+label = "ZenMux"
+adapter = "open_ai_chat"
+base_url = "https://zenmux.ai/api/v1"
+auth_kind = "key"
+endpoint_policy = "public_https"
+model_source = "static"
+aliases = []
+models = ["moonshotai/kimi-k3-free", "moonshotai/kimi-k3"]
+capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true }
+
+[[providers]]
+id = "litellm"
+label = "LiteLLM (self-hosted)"
+adapter = "open_ai_chat"
+base_url = "http://localhost:4000/v1"
+auth_kind = "key"
+endpoint_policy = "loopback_http"
+model_source = "live"
+aliases = []
+models = []
+capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true }
+
+[[providers]]
+id = "ollama-cloud"
+label = "Ollama Cloud"
+adapter = "open_ai_chat"
+base_url = "https://ollama.com/v1"
+auth_kind = "key"
+endpoint_policy = "public_https"
+model_source = "static"
+aliases = []
+models = ["glm-5.2", "deepseek-v4-pro", "qwen3-coder:480b", "gpt-oss:120b", "kimi-k2.6", "minimax-m3", "qwen3.5:397b", "gemma4:31b"]
+default_model = "glm-5.2"
+capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true }
+
+[[providers]]
+id = "mistral"
+label = "Mistral"
+adapter = "open_ai_chat"
+base_url = "https://api.mistral.ai/v1"
+auth_kind = "key"
+endpoint_policy = "public_https"
+model_source = "static"
+aliases = []
+models = ["codestral-latest"]
+default_model = "codestral-latest"
+capabilities = { text = true, streaming = true, tools = true, vision = false, images = false, reasoning = true }
+
+[[providers]]
+id = "minimax"
+label = "MiniMax — Coding Plan"
+adapter = "open_ai_chat"
+base_url = "https://api.minimax.io/v1"
+auth_kind = "key"
+endpoint_policy = "public_https"
+model_source = "static"
+aliases = []
+models = ["MiniMax-M3", "MiniMax-M2.7", "MiniMax-M2.7-highspeed", "MiniMax-M2.5", "MiniMax-M2.5-highspeed", "MiniMax-M2.1", "MiniMax-M2.1-highspeed", "MiniMax-M2"]
+default_model = "MiniMax-M3"
+capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true }
+
+[[providers]]
+id = "minimax-cn"
+label = "MiniMax — Coding Plan (CN)"
+adapter = "open_ai_chat"
+base_url = "https://api.minimaxi.com/v1"
+auth_kind = "key"
+endpoint_policy = "public_https"
+model_source = "static"
+aliases = []
+models = ["MiniMax-M3", "MiniMax-M2.7", "MiniMax-M2.7-highspeed", "MiniMax-M2.5", "MiniMax-M2.5-highspeed", "MiniMax-M2.1", "MiniMax-M2.1-highspeed", "MiniMax-M2"]
+default_model = "MiniMax-M3"
+capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true }
+
+[[providers]]
+id = "kimi-code"
+label = "Kimi (coding)"
+adapter = "open_ai_chat"
+base_url = "https://api.kimi.com/coding/v1"
+auth_kind = "key"
+endpoint_policy = "public_https"
+model_source = "static"
+aliases = []
+models = ["k3", "k3[1m]", "kimi-k2.7-code", "kimi-k2.7-code-highspeed", "kimi-k2.6", "kimi-k2.5", "kimi-for-coding"]
+default_model = "kimi-k2.7-code"
+capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true }
+
+[[providers]]
+id = "opencode-zen"
+label = "opencode zen"
+adapter = "open_ai_chat"
+base_url = "https://opencode.ai/zen/v1"
+auth_kind = "key"
+endpoint_policy = "public_https"
+model_source = "none"
+aliases = []
+models = []
+capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true }
+
+[[providers]]
+id = "vercel-ai-gateway"
+label = "Vercel AI Gateway"
+adapter = "open_ai_chat"
+base_url = "https://ai-gateway.vercel.sh/v1"
+auth_kind = "key"
+endpoint_policy = "public_https"
+model_source = "none"
+aliases = []
+models = []
+capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true }
+
+[[providers]]
+id = "opencode-free"
+label = "OpenCode Free"
+adapter = "open_ai_chat"
+base_url = "https://opencode.ai/zen/v1"
+auth_kind = "key"
+endpoint_policy = "public_https"
+model_source = "live"
+aliases = []
+models = []
+capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true }
+
+[[providers]]
+id = "xiaomi"
+label = "Xiaomi MiMo"
+adapter = "anthropic"
+base_url = "https://api.xiaomimimo.com/anthropic"
+auth_kind = "key"
+endpoint_policy = "public_https"
+model_source = "static"
+aliases = []
+models = ["mimo-v2.5-pro"]
+default_model = "mimo-v2.5-pro"
+capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true }
+
+[[providers]]
+id = "kilo"
+label = "Kilo"
+adapter = "open_ai_chat"
+base_url = "https://api.kilo.ai/api/gateway"
+auth_kind = "key"
+endpoint_policy = "public_https"
+model_source = "none"
+aliases = []
+models = []
+capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true }
+
+[[providers]]
+id = "mimo-free"
+label = "MiMo Free"
+adapter = "mimo_free"
+base_url = "https://api.xiaomimimo.com/api/free-ai/openai/chat"
+auth_kind = "key"
+endpoint_policy = "public_https"
+model_source = "hybrid"
+aliases = []
+models = ["mimo-auto"]
+default_model = "mimo-auto"
+capabilities = { text = true, streaming = true, tools = true, vision = false, images = false, reasoning = true }
+
+[[providers]]
+id = "cloudflare-ai-gateway"
+label = "Cloudflare AI Gateway"
+adapter = "anthropic"
+base_url = "https://gateway.ai.cloudflare.com/v1/{account-id}/{gateway}/anthropic"
+auth_kind = "key"
+endpoint_policy = "https_template"
+model_source = "none"
+aliases = []
+models = []
+capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true }
+
+[[providers]]
+id = "cloudflare-workers-ai"
+label = "Cloudflare Workers AI"
+adapter = "open_ai_chat"
+base_url = "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1"
+auth_kind = "key"
+endpoint_policy = "https_template"
+model_source = "static"
+aliases = []
+models = ["@cf/meta/llama-3.3-70b-instruct-fp8-fast", "@cf/qwen/qwq-32b", "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b", "@cf/moonshotai/kimi-k2.7-code", "@cf/zai-org/glm-5.2", "@cf/mistralai/mistral-small-3.1-24b-instruct"]
+default_model = "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+capabilities = { text = true, streaming = true, tools = true, vision = false, images = false, reasoning = true }
+
+[[providers]]
+id = "github-copilot"
+label = "GitHub Copilot"
+adapter = "open_ai_chat"
+base_url = "https://api.githubcopilot.com"
+auth_kind = "oauth"
+endpoint_policy = "public_https"
+model_source = "hybrid"
+aliases = []
+models = ["gpt-4o", "gpt-4.1", "gpt-4.1-mini", "claude-sonnet-4", "gemini-2.5-pro"]
+default_model = "gpt-4o"
+capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true }
+
+[[providers]]
+id = "gitlab-duo"
+label = "GitLab Duo"
+adapter = "open_ai_chat"
+base_url = "https://cloud.gitlab.com/ai/v1/proxy/openai/v1"
+auth_kind = "key"
+endpoint_policy = "public_https"
+model_source = "none"
+aliases = []
+models = []
+capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true }

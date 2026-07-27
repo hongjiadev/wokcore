@@ -10,6 +10,30 @@ Architecture and compatibility research referenced:
 
 Cockpit Tools is a design reference only. No Cockpit Tools source code is included.
 
+The bundled Provider identifiers, labels, adapter/authentication families, default endpoints, and static model seeds in `crates/wokcore-engine/provider-catalog/providers.toml` are adapted from OpenCodex v2.7.35 commit `97e7326f89bcfbb29a2c73250cb25eb801d066b6`. The validation and runtime catalog implementation are original WokCore code.
+
+The adapted Provider catalog retains the OpenCodex MIT notice:
+
+Copyright (c) 2026 opencodex contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
 The Codex Session discovery, incremental parser, usage reconstruction, and fork-replay index in `crates/wokcore-sessions` are original WokCore code. CC-Switch informed the read-only Session-first compatibility research; no CC-Switch source code is included.
 
 The initial WokCore domain types were migrated from WokRouter commit `226a40e08ad6c783e996ceed77b8e6dfe2640fb4`. The source-path mapping and deliberate adaptations are recorded in `MIGRATION.md`.

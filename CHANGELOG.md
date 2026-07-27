@@ -25,6 +25,7 @@ All notable WokCore changes are documented in this file.
 - Authenticated Session list/message, usage, diagnostic-log, and diagnostic-export APIs with exact client scopes, opaque pagination cursors, bounded query workers, response byte limits, and OpenAPI 3.1 schemas.
 - Terminal-safe Session/log CLI output, JSON/JSONL modes, repeatable authorization scopes, and create-new diagnostic ZIP export protected from Session-root aliasing.
 - Typed request diagnostics correlated by response request ID; ordinary request events stay memory-only while internal failures remain durable warning candidates.
+- Internal `wokcore-engine` with a strict, immutable 58-Provider frozen catalog, explicit adapter/auth/endpoint/model/capability metadata, and content-free fail-closed validation.
 
 ### Fixed
 

@@ -1,0 +1,19 @@
+[package]
+name = "wokcore-engine"
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+toml_edit.workspace = true
+url.workspace = true
+wokcore-core = { version = "0.1.0", path = "../wokcore-core" }
