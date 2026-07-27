@@ -276,6 +276,11 @@ fn request_metric(identity: usize) -> RequestMetric {
     }
 }
 
+#[test]
+fn request_metric_batches_amortize_high_concurrency_wal_transactions() {
+    assert_eq!(REQUEST_METRIC_BATCH_ROWS, 512);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn request_metrics_flush_by_count_or_elapsed_time_and_never_write_per_request() {
     let fixture = tempdir().unwrap();

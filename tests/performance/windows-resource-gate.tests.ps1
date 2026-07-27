@@ -62,6 +62,38 @@ if ($evidence.PeakHandleCount -ne 44 -or $evidence.PeakThreadCount -ne 9) {
 if ($evidence.WriteBytesPerSecond -ne 4096) {
     throw "Write rate aggregation failed."
 }
+if (
+    $evidence.InitialPrivateWorkingSetBytes -ne 33554432 -or
+    $evidence.FinalPrivateWorkingSetBytes -ne 67108864
+) {
+    throw "Initial or final private working set aggregation failed."
+}
+if (
+    $evidence.InitialHandleCount -ne 30 -or
+    $evidence.FinalHandleCount -ne 44 -or
+    $evidence.InitialThreadCount -ne 6 -or
+    $evidence.FinalThreadCount -ne 9
+) {
+    throw "Initial or final handle/thread aggregation failed."
+}
+if ($evidence.MaxConsecutivePrivateWorkingSetIncreases -ne 1) {
+    throw "Monotonic private working set growth aggregation failed."
+}
+
+$trendSamples = @(
+    (New-SyntheticSample -ObservedMs 1000 -PrivateWorkingSetBytes 100)
+    (New-SyntheticSample -ObservedMs 2000 -PrivateWorkingSetBytes 110)
+    (New-SyntheticSample -ObservedMs 3000 -PrivateWorkingSetBytes 120)
+    (New-SyntheticSample -ObservedMs 4000 -PrivateWorkingSetBytes 115)
+    (New-SyntheticSample -ObservedMs 5000 -PrivateWorkingSetBytes 125)
+)
+$trendEvidence = ConvertTo-WokCorePhaseEvidence `
+    -Samples $trendSamples `
+    -PhaseName "observation_1000" `
+    -ExecutableName "wokcore.exe"
+if ($trendEvidence.MaxConsecutivePrivateWorkingSetIncreases -ne 2) {
+    throw "Longest monotonic private working set run was not preserved."
+}
 
 $json = $evidence | ConvertTo-Json -Depth 4 -Compress
 $csv = ($evidence | ConvertTo-Csv -NoTypeInformation) -join [Environment]::NewLine
@@ -87,7 +119,14 @@ foreach ($forbidden in @(
     }
 }
 
-foreach ($phaseName in @("warm_idle", "active", "recovery")) {
+foreach ($phaseName in @(
+    "warm_idle",
+    "active",
+    "standard_500",
+    "long_500",
+    "recovery",
+    "observation_1000"
+)) {
     $phaseEvidence = ConvertTo-WokCorePhaseEvidence `
         -Samples $samples `
         -PhaseName $phaseName `

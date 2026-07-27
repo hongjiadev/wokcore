@@ -114,7 +114,7 @@ fn responses_events(scenario: &Scenario) -> Vec<Vec<u8>> {
 }
 
 fn chat_events(scenario: &Scenario) -> Vec<Vec<u8>> {
-    let mut events = Vec::with_capacity(scenario.event_count().saturating_add(2));
+    let mut events = Vec::with_capacity(scenario.event_count().saturating_add(3));
     for index in 0..scenario.event_count() {
         let delta = match scenario.payload_profile() {
             PayloadProfile::Standard if index == 0 => {
@@ -150,6 +150,24 @@ fn chat_events(scenario: &Scenario) -> Vec<Vec<u8>> {
             format!(
                 "data: {}\n\n",
                 json!({"id":"chatcmpl_synthetic","object":"chat.completion.chunk","created":1,"model":"synthetic","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]})
+            )
+            .into_bytes(),
+        );
+        events.push(
+            format!(
+                "data: {}\n\n",
+                json!({
+                    "id":"chatcmpl_synthetic",
+                    "object":"chat.completion.chunk",
+                    "created":1,
+                    "model":"synthetic",
+                    "choices":[],
+                    "usage":{
+                        "prompt_tokens":8,
+                        "completion_tokens":4,
+                        "total_tokens":12
+                    }
+                })
             )
             .into_bytes(),
         );

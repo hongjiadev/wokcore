@@ -69,7 +69,7 @@ The bundled catalog describes 58 Provider families, but a catalog capability is 
 
 JSON requests are capped at 16 MiB. Image edits are streamed through private randomized temporary files with a 20 MiB per-file, 50 MiB aggregate payload, and 51 MiB multipart wire cap; temporary files are removed on success, failure, cancellation, and drop. Pooled transports reject redirects and ambient proxies, validate DNS results against endpoint policy, and bound headers, bodies, connect time, and total time.
 
-Request diagnostics contain only stable request/attempt identifiers, Provider/model metadata, status, timing, and token totals. Successful request events stay in memory. SQLite metrics and account-health metadata flush in batches of 64 or after 250 ms of observed activity; an idle service performs no periodic write, and observability backpressure never blocks a Provider request. Session-derived usage remains the primary detailed usage source.
+Request diagnostics contain only stable request/attempt identifiers, Provider/model metadata, status, timing, and token totals. Successful request events stay in memory. SQLite metrics and account-health metadata flush in batches of 512 or after 250 ms of observed activity; an idle service performs no periodic write, and observability backpressure never blocks a Provider request. Session-derived usage remains the primary detailed usage source.
 
 All repository transport and concurrency tests use injected executors or synthetic loopback Providers. They do not read real credentials or Sessions and do not contact a billable endpoint.
 
@@ -84,6 +84,31 @@ cargo +1.97.1 run --locked --offline --bin wokcore-provider-sim -- `
   --bind 127.0.0.1:40100 `
   --scenario crates/wokcore-provider-sim/scenarios/standard.toml
 ```
+
+## Offline Provider performance gates
+
+The Windows release gate builds and launches only the fixed `wokcore.exe`, `wokcore-provider-sim.exe`, and `wokcore-loadgen.exe` names. It isolates `APPDATA`, `LOCALAPPDATA`, `HOME`, and `USERPROFILE`, supplies an accountless local Provider configuration, denies ambient proxy use, and permits only literal loopback traffic. No real Provider, credential, Session, prompt, response, or tool payload is available to the run.
+
+After a representative 500-stream long-reasoning synthetic warmup and a 10-second settle, the hard Windows thresholds in `tests/performance/provider-gates.toml` are:
+
+- warmed idle private working set at or below 64 MiB;
+- 500 active standard SSE streams at or below 512 MiB private working set;
+- private working set 60 seconds after completion at or below 1.5 times warmed idle;
+- WokCore disk writes at or below 128 KiB/s during 500 long streams;
+- a reported 1,000-active-stream observation with no crash, incomplete task, request error, handle/thread leak, or sustained unbounded memory growth.
+
+The gate has no request semaphore and does not reject work because the requested concurrency was reached. Missing, restarted, path-mismatched, counter-rollback, incomplete, or ambiguous samples fail closed.
+
+Run it from a Windows checkout:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File tests/performance/run-provider-gates.ps1 `
+  -Profile release `
+  -OutputDirectory C:\path\outside\the\public\repository
+```
+
+The output is one bounded, content-free JSON report. The script refuses to place evidence inside the public repository. Its temporary native management credential is synthetic, scoped to the isolated run, identified by the newly created exact UUID target, deleted after shutdown, and never included in evidence. Pre-existing Credential Manager entries are not modified.
 
 ## Development
 

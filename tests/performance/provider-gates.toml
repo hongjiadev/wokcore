@@ -1,0 +1,12 @@
+schema_version = 1
+
+[windows]
+warm_idle_private_working_set_bytes = 67108864
+standard_500_private_working_set_bytes = 536870912
+recovery_multiplier_milli = 1500
+long_500_write_bytes_per_second = 131072
+observation_concurrency = 1000
+observation_max_handle_growth = 64
+observation_max_thread_growth = 8
+observation_monotonic_increase_samples = 8
+observation_growth_multiplier_milli = 1250

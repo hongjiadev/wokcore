@@ -121,8 +121,10 @@ fn profile_fixtures_cover_bounded_standard_reasoning_tool_and_failure_shapes() {
     let malformed = Scenario::from_toml(include_str!("../scenarios/malformed.toml")).unwrap();
     let cancellation = Scenario::from_toml(include_str!("../scenarios/cancellation.toml")).unwrap();
 
+    assert_eq!(standard.protocol(), Protocol::OpenAiChat);
     assert_eq!(standard.payload_profile(), PayloadProfile::Standard);
     assert!(standard.schedule().unwrap().total_bytes() >= 32 * 1024);
+    assert_eq!(slow.protocol(), Protocol::OpenAiChat);
     assert_eq!(slow.payload_profile(), PayloadProfile::Reasoning);
     assert!(slow.schedule().unwrap().total_bytes() >= 1024 * 1024);
     assert_eq!(cancellation.payload_profile(), PayloadProfile::Tool);
@@ -133,6 +135,26 @@ fn profile_fixtures_cover_bounded_standard_reasoning_tool_and_failure_shapes() {
             .windows(10)
             .any(|value| value == b"{malformed")
     }));
+}
+
+#[test]
+fn chat_streams_emit_usage_before_the_terminal_done_marker() {
+    let schedule = Scenario::standard(Protocol::OpenAiChat)
+        .with_event_count(2)
+        .schedule()
+        .unwrap();
+    let bytes = schedule
+        .chunks()
+        .iter()
+        .flat_map(|chunk| chunk.bytes())
+        .copied()
+        .collect::<Vec<_>>();
+    let rendered = String::from_utf8(bytes).unwrap();
+    let usage = rendered.find("\"usage\"").unwrap();
+    let done = rendered.find("data: [DONE]").unwrap();
+
+    assert!(usage < done);
+    assert!(rendered.contains("\"choices\":[]"));
 }
 
 #[tokio::test]

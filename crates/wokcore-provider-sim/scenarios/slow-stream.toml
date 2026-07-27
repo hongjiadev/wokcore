@@ -1,9 +1,9 @@
-protocol = "openai_responses"
+protocol = "openai_chat"
 stream = true
 status = 200
-ttft_ms = 250
-cadence_ms = 4
-jitter_ms = 2
+ttft_ms = 500
+cadence_ms = 10
+jitter_ms = 3
 event_count = 256
 content_bytes = 1048576
 chunk_bytes = 8192

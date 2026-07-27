@@ -2,7 +2,14 @@
 param(
     [uint32] $ProcessId,
     [string] $ExpectedExecutablePath,
-    [ValidateSet("warm_idle", "active", "recovery")]
+    [ValidateSet(
+        "warm_idle",
+        "active",
+        "standard_500",
+        "long_500",
+        "recovery",
+        "observation_1000"
+    )]
     [string] $Phase = "active",
     [ValidateRange(1, 1800)]
     [int] $DurationSeconds = 10,
@@ -243,7 +250,14 @@ function ConvertTo-WokCorePhaseEvidence {
         [Parameter(Mandatory = $true)]
         [object[]] $Samples,
         [Parameter(Mandatory = $true)]
-        [ValidateSet("warm_idle", "active", "recovery")]
+        [ValidateSet(
+            "warm_idle",
+            "active",
+            "standard_500",
+            "long_500",
+            "recovery",
+            "observation_1000"
+        )]
         [string] $PhaseName,
         [Parameter(Mandatory = $true)]
         [string] $ExecutableName
@@ -255,6 +269,22 @@ function ConvertTo-WokCorePhaseEvidence {
     $durationMs = [uint64] [Math]::Max(1, $last.ObservedMs - $first.ObservedMs)
     $writeDelta = [uint64] ($last.WriteBytes - $first.WriteBytes)
     $readDelta = [uint64] ($last.ReadBytes - $first.ReadBytes)
+    $consecutiveIncreases = 0
+    $maximumConsecutiveIncreases = 0
+    for ($index = 1; $index -lt $Samples.Count; $index++) {
+        if (
+            $Samples[$index].PrivateWorkingSetBytes -gt
+                $Samples[$index - 1].PrivateWorkingSetBytes
+        ) {
+            $consecutiveIncreases++
+            $maximumConsecutiveIncreases = [Math]::Max(
+                $maximumConsecutiveIncreases,
+                $consecutiveIncreases
+            )
+        } else {
+            $consecutiveIncreases = 0
+        }
+    }
     [PSCustomObject] @{
         SchemaVersion = 1
         ExecutableName = [IO.Path]::GetFileName($ExecutableName)
@@ -278,6 +308,14 @@ function ConvertTo-WokCorePhaseEvidence {
             $Samples |
                 Measure-Object -Property ThreadCount -Maximum
         ).Maximum
+        InitialPrivateWorkingSetBytes = [uint64] $first.PrivateWorkingSetBytes
+        FinalPrivateWorkingSetBytes = [uint64] $last.PrivateWorkingSetBytes
+        InitialHandleCount = [uint32] $first.HandleCount
+        FinalHandleCount = [uint32] $last.HandleCount
+        InitialThreadCount = [uint32] $first.ThreadCount
+        FinalThreadCount = [uint32] $last.ThreadCount
+        MaxConsecutivePrivateWorkingSetIncreases =
+            [uint32] $maximumConsecutiveIncreases
         ReadBytes = $readDelta
         WriteBytes = $writeDelta
         WriteBytesPerSecond = [uint64] [Math]::Ceiling($writeDelta * 1000.0 / $durationMs)
@@ -293,7 +331,14 @@ function Measure-WokCoreProcessPhase {
         [Parameter(Mandatory = $true)]
         [string] $ExactExecutablePath,
         [Parameter(Mandatory = $true)]
-        [ValidateSet("warm_idle", "active", "recovery")]
+        [ValidateSet(
+            "warm_idle",
+            "active",
+            "standard_500",
+            "long_500",
+            "recovery",
+            "observation_1000"
+        )]
         [string] $PhaseName,
         [Parameter(Mandatory = $true)]
         [int] $SampleDurationSeconds,

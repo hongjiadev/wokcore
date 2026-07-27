@@ -37,10 +37,11 @@ All notable WokCore changes are documented in this file.
 - Capacity-two Provider event streams with upstream backpressure, first-visible retry closure, client-drop cancellation, incremental Responses/Chat/Anthropic SSE encoding, single terminal protocol errors, and completion-only in-memory runtime counters with no per-event disk writes.
 - Production pooled upstream execution for OpenAI Responses, OpenAI Chat, Anthropic, Gemini, and Azure with last-moment credential resolution, redirect and proxy denial, DNS-aware endpoint policy, bounded headers/bodies/timeouts, incremental stream decoding, and loopback-only offline verification.
 - Capability-aware image generation and edit execution with bounded JSON, 20 MiB per-file and 50 MiB aggregate multipart limits, randomized private temporary files, cancellation cleanup, streamed upstream uploads, and content-free diagnostics.
-- Completion-only request counters, safe request/attempt diagnostic correlation, bounded 64-row or 250 ms request-metric and account-health batching with zero idle writes, validated metric fields, and complete OpenAPI 3.1 coverage for all seven proxy endpoints.
+- Completion-only request counters, safe request/attempt diagnostic correlation, bounded 512-row or 250 ms request-metric and account-health batching with zero idle writes, validated metric fields, and complete OpenAPI 3.1 coverage for all seven proxy endpoints.
 - Fixed-name loopback-only Provider simulator with strict bounded inert scenarios, deterministic timing, protocol-shaped JSON/SSE for five upstream adapters, failure/fragmentation/cancellation profiles, content-free counters, and no real Provider or credential capability.
 - Fixed-name loopback-only load generator with uncapped 500/1,000-stream modes, deterministic protocol/payload/cancellation/slow-consumer controls, pooled streaming clients, bounded aggregation, and payload-free JSON evidence.
 - Exact Windows PID/path process sampling for private working set, peak private bytes, I/O, handles, threads, and lifetime, with restart/counter-rollback rejection and bounded content-free phase evidence.
+- Offline release performance gates for 64 MiB warmed idle, 512 MiB at 500 standard streams, 1.5× 60-second recovery, 128 KiB/s WokCore writes at 500 long streams, and crash/leak/growth observation at 1,000 streams, with fail-closed exact-process evidence and no configured concurrency ceiling.
 
 ### Fixed
 
