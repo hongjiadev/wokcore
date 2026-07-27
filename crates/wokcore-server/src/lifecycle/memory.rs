@@ -10,10 +10,13 @@ use super::ServiceLifecycle;
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 const SYSTEM_IDLE_DELAY: Duration = Duration::from_secs(1);
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+const SYSTEM_FOLLOW_UP_IDLE_DELAY: Duration = Duration::from_secs(9);
 
 pub struct PreparedIdleMemoryReclaimer {
     lifecycle: ServiceLifecycle,
     idle_delay: Duration,
+    follow_up_idle_delay: Duration,
     backend: Arc<dyn MemoryReclaimBackend>,
 }
 
@@ -24,6 +27,7 @@ impl PreparedIdleMemoryReclaimer {
             Some(Self {
                 lifecycle,
                 idle_delay: SYSTEM_IDLE_DELAY,
+                follow_up_idle_delay: SYSTEM_FOLLOW_UP_IDLE_DELAY,
                 backend: Arc::new(SystemMemoryReclaimBackend),
             })
         }
@@ -43,6 +47,7 @@ impl PreparedIdleMemoryReclaimer {
         Self {
             lifecycle,
             idle_delay,
+            follow_up_idle_delay: idle_delay,
             backend,
         }
     }
@@ -123,6 +128,29 @@ async fn run_reclaimer(
             return;
         }
         reclaimed_activity_revision = activity_revision;
+
+        tokio::select! {
+            biased;
+            changed = shutdown_requested.changed() => {
+                if changed.is_err() || *shutdown_requested.borrow() {
+                    return;
+                }
+            }
+            () = sleep(prepared.follow_up_idle_delay) => {}
+        }
+
+        if prepared.lifecycle.snapshot().active_requests != 0
+            || prepared.lifecycle.activity_revision() != reclaimed_activity_revision
+        {
+            continue;
+        }
+        let backend = Arc::clone(&prepared.backend);
+        if tokio::task::spawn_blocking(move || backend.reclaim())
+            .await
+            .is_err()
+        {
+            return;
+        }
     }
 }
 
@@ -201,9 +229,27 @@ mod tests {
 
         drop(guards);
 
-        wait_for_calls(&backend, 1).await;
+        wait_for_calls(&backend, 2).await;
         sleep(IDLE_DELAY * 3).await;
-        assert_eq!(backend.calls(), 1);
+        assert_eq!(backend.calls(), 2);
+        running.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn idle_memory_reclaimer_reclaims_delayed_frees_once_in_the_same_idle_epoch() {
+        let lifecycle = ServiceLifecycle::new();
+        lifecycle.mark_running().unwrap();
+        let admission = lifecycle.admission_controller();
+        let backend = Arc::new(CountingBackend::default());
+        let mut running =
+            PreparedIdleMemoryReclaimer::with_backend(lifecycle, IDLE_DELAY, backend.clone())
+                .start();
+
+        drop(admission.try_enter().unwrap());
+
+        wait_for_calls(&backend, 2).await;
+        sleep(IDLE_DELAY * 3).await;
+        assert_eq!(backend.calls(), 2);
         running.shutdown().await.unwrap();
     }
 
@@ -224,7 +270,7 @@ mod tests {
         sleep(IDLE_DELAY * 2).await;
         assert_eq!(backend.calls(), 0);
         drop(resumed);
-        wait_for_calls(&backend, 1).await;
+        wait_for_calls(&backend, 2).await;
         running.shutdown().await.unwrap();
     }
 
@@ -239,9 +285,9 @@ mod tests {
                 .start();
 
         drop(admission.try_enter().unwrap());
-        wait_for_calls(&backend, 1).await;
-        drop(admission.try_enter().unwrap());
         wait_for_calls(&backend, 2).await;
+        drop(admission.try_enter().unwrap());
+        wait_for_calls(&backend, 4).await;
 
         running.shutdown().await.unwrap();
     }
@@ -260,9 +306,9 @@ mod tests {
         sleep(IDLE_DELAY / 2).await;
         drop(admission.try_enter().unwrap());
 
-        wait_for_calls(&backend, 1).await;
+        wait_for_calls(&backend, 2).await;
         sleep(IDLE_DELAY * 3).await;
-        assert_eq!(backend.calls(), 1);
+        assert_eq!(backend.calls(), 2);
         running.shutdown().await.unwrap();
     }
 

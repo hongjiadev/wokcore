@@ -789,7 +789,6 @@ async fn models_reads_one_local_snapshot_and_never_calls_the_executor() {
 
 #[tokio::test]
 async fn stable_errors_cover_timeout_malformed_rate_limit_and_server_failures() {
-    let fixture = fixture("openai-apikey").await;
     for (mode, status, code, upstream_request_id) in [
         (
             Mode::Timeout,
@@ -828,6 +827,7 @@ async fn stable_errors_cover_timeout_malformed_rate_limit_and_server_failures() 
             None,
         ),
     ] {
+        let fixture = fixture("openai-apikey").await;
         fixture.executor.set_mode(mode);
         let response = send_json(
             &fixture,

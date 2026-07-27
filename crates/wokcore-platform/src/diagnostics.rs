@@ -1985,6 +1985,22 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn macos_parent_lock_opens_on_a_private_directory() {
+        let fixture = tempdir().unwrap();
+        let root = fixture.path().join("diagnostics");
+        fs::create_dir(&root).unwrap();
+        let lease = super::SessionRootLease::open(&root).unwrap();
+        let parent = lease.clone_chain().unwrap();
+
+        match super::try_lock_diagnostic_parent(&parent) {
+            Ok(Some(_lock)) => {}
+            Ok(None) => panic!("a new private directory must not have a contended parent lock"),
+            Err(error) => panic!("macOS diagnostic parent lock failed: {error:?}"),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn macos_parent_lock_is_private_exclusive_and_hidden_from_diagnostic_entries() {
         use std::os::unix::fs::MetadataExt;
 
