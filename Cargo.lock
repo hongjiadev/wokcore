@@ -2165,6 +2165,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "wokcore-diagnostics"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "wokcore-platform"
 version = "0.1.0"
 dependencies = [
