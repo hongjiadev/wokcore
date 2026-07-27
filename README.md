@@ -98,6 +98,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
 
 On Windows, the test runner compiles Cargo test artifacts without executing their hash-named files, then runs every artifact sequentially as the fixed `target/wokcore-test-host.exe`. Tests that open loopback listeners therefore keep one stable executable identity. Linux and macOS can run `cargo +1.97.1 test --workspace --all-features` directly.
 
+Windows performance evidence targets one exact PID and fixed executable path. `tests/performance/windows-resource-gate.ps1` records bounded phase aggregates for private working set, peak private bytes, read/write bytes, handles, threads, and process lifetime; it rejects process replacement, counter rollback, missing samples, and path mismatch while excluding simulator/load-generator overhead.
+
 ## License
 
 Licensed under either Apache-2.0 or MIT, at your option.

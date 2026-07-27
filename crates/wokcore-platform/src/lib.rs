@@ -1,6 +1,7 @@
 //! Platform-specific WokCore path discovery.
 
 pub mod diagnostics;
+pub mod process_metrics;
 pub mod runtime;
 pub mod sessions;
 pub mod system;
