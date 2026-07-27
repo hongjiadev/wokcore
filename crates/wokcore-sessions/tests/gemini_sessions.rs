@@ -7,6 +7,7 @@ use std::{
 
 use tempfile::TempDir;
 use wokcore_sessions::{
+    discovery::SessionDiscoverySliceBudget,
     gemini::{
         GeminiScanner, MAX_GEMINI_LOGICAL_WORKING_BYTES, MAX_LEGACY_JSON_PARSER_BYTES,
         MAX_LEGACY_JSON_SOURCE_WORK_BYTES,
@@ -118,6 +119,36 @@ fn scanner(root: &TempDir, state: &TempDir) -> GeminiScanner {
         TEST_DOMAIN_KEY,
     )
     .unwrap()
+}
+
+#[test]
+fn slice_scanner_reuses_one_cycle_and_commits_current_format_once() {
+    let root = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    write_bytes(
+        root.path(),
+        "tmp/project-a/chats/session-current.jsonl",
+        include_bytes!("fixtures/gemini/current.jsonl"),
+    );
+    let mut scanner = scanner(&root, &state);
+    let mut sources = Vec::new();
+
+    for _ in 0..16 {
+        let summary = scanner
+            .scan_slice(
+                NOW,
+                SessionScanControl::default(),
+                SessionDiscoverySliceBudget::default(),
+            )
+            .unwrap();
+        sources.extend(summary.sources);
+        if summary.outcome == SessionScanOutcome::Complete {
+            break;
+        }
+    }
+
+    assert_eq!(sources.len(), 1);
+    assert_eq!(sources[0].status, SessionSourceStatus::Available);
 }
 
 #[test]

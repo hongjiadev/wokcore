@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     ffi::OsString,
     fmt,
     path::{Path, PathBuf},
@@ -6,7 +7,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
 
 use thiserror::Error;
@@ -22,6 +23,10 @@ pub const DURABLE_QUEUE_CAPACITY: usize = 256;
 pub const MAX_BATCH_EVENTS: usize = 128;
 pub const MAX_BATCH_EVENT_BYTES: usize = 256 * 1024;
 pub const MAX_SEGMENT_BYTES: usize = 4 * 1024 * 1024;
+const DROP_REQUEST_QUEUE_CAPACITY: usize = 1;
+
+pub type BoxedDurableWriterOwner =
+    DurableWriterOwner<Box<dyn FnMut(DiagnosticDropSummary) -> Result<(), ()> + Send>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DurableEventKind {
@@ -209,6 +214,48 @@ impl DropAtoms {
     }
 }
 
+struct DropRequestRecovery {
+    drops: Arc<DropAtoms>,
+    drop_summary_inflight: Arc<AtomicBool>,
+}
+
+pub struct DurableDropRequest {
+    summary: DiagnosticDropSummary,
+    recovery: Option<DropRequestRecovery>,
+}
+
+impl DurableDropRequest {
+    pub const fn summary(&self) -> DiagnosticDropSummary {
+        self.summary
+    }
+
+    pub fn acknowledge(mut self) {
+        self.recovery = None;
+    }
+
+    fn disarm(&mut self) {
+        self.recovery = None;
+    }
+}
+
+impl Drop for DurableDropRequest {
+    fn drop(&mut self) {
+        let Some(recovery) = self.recovery.take() else {
+            return;
+        };
+        recovery.drops.restore(self.summary);
+        recovery
+            .drop_summary_inflight
+            .store(false, Ordering::Release);
+    }
+}
+
+impl fmt::Debug for DurableDropRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("DurableDropRequest([redacted])")
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DurableRecordOutcome {
     Accepted,
@@ -225,14 +272,57 @@ pub struct DurableProducer {
 }
 
 impl DurableProducer {
+    pub fn with_drop_requests(
+        root: impl AsRef<Path>,
+    ) -> (Self, BoxedDurableWriterOwner, DurableDropRequests) {
+        let (sender, receiver) = mpsc::channel(DROP_REQUEST_QUEUE_CAPACITY);
+        let drops = Arc::new(DropAtoms::default());
+        let drop_summary_inflight = Arc::new(AtomicBool::new(false));
+        let request_drops = Arc::clone(&drops);
+        let request_inflight = Arc::clone(&drop_summary_inflight);
+        let request_drop: Box<dyn FnMut(DiagnosticDropSummary) -> Result<(), ()> + Send> =
+            Box::new(move |summary| {
+                let request = DurableDropRequest {
+                    summary,
+                    recovery: Some(DropRequestRecovery {
+                        drops: Arc::clone(&request_drops),
+                        drop_summary_inflight: Arc::clone(&request_inflight),
+                    }),
+                };
+                match sender.try_send(request) {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        let mut request = error.into_inner();
+                        request.disarm();
+                        Err(())
+                    }
+                }
+            });
+        let (producer, owner) = Self::with_state(root, request_drop, drops, drop_summary_inflight);
+        (producer, owner, DurableDropRequests { receiver })
+    }
+
     pub fn new<F, E>(root: impl AsRef<Path>, request_drop: F) -> (Self, DurableWriterOwner<F>)
     where
         F: FnMut(DiagnosticDropSummary) -> Result<(), E>,
     {
         let root = root.as_ref().to_path_buf();
-        let (sender, receiver) = mpsc::channel(DURABLE_QUEUE_CAPACITY);
         let drops = Arc::new(DropAtoms::default());
         let drop_summary_inflight = Arc::new(AtomicBool::new(false));
+        Self::with_state(root, request_drop, drops, drop_summary_inflight)
+    }
+
+    fn with_state<F, E>(
+        root: impl AsRef<Path>,
+        request_drop: F,
+        drops: Arc<DropAtoms>,
+        drop_summary_inflight: Arc<AtomicBool>,
+    ) -> (Self, DurableWriterOwner<F>)
+    where
+        F: FnMut(DiagnosticDropSummary) -> Result<(), E>,
+    {
+        let root = root.as_ref().to_path_buf();
+        let (sender, receiver) = mpsc::channel(DURABLE_QUEUE_CAPACITY);
         (
             Self {
                 sender,
@@ -248,7 +338,7 @@ impl DurableProducer {
                 drop_summary_inflight,
                 request_drop,
                 indeterminate_drop: None,
-                pending_ingress: None,
+                pending_ingress: VecDeque::new(),
                 progress_observed: false,
             },
         )
@@ -295,9 +385,32 @@ impl fmt::Debug for DurableProducer {
     }
 }
 
+pub struct DurableDropRequests {
+    receiver: mpsc::Receiver<DurableDropRequest>,
+}
+
+impl DurableDropRequests {
+    pub async fn recv(&mut self) -> Option<DurableDropRequest> {
+        self.receiver.recv().await
+    }
+}
+
+impl fmt::Debug for DurableDropRequests {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("DurableDropRequests([redacted])")
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DurableProcessOutcome {
     Idle,
+    DropSummaryRequested,
+    Written { events: usize, rotations: usize },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DurableWorkOutcome {
+    Closed,
     DropSummaryRequested,
     Written { events: usize, rotations: usize },
 }
@@ -321,7 +434,7 @@ pub struct DurableWriterOwner<F> {
     drop_summary_inflight: Arc<AtomicBool>,
     request_drop: F,
     indeterminate_drop: Option<(PreparedDiagnosticEvent, DiagnosticDropSummary)>,
-    pending_ingress: Option<PreparedDiagnosticEvent>,
+    pending_ingress: VecDeque<PreparedDiagnosticEvent>,
     progress_observed: bool,
 }
 
@@ -331,6 +444,123 @@ where
 {
     pub fn try_process_next(&mut self) -> Result<DurableProcessOutcome, DurableProcessError> {
         self.try_process_next_at(SystemTime::now())
+    }
+
+    pub async fn wait_process_next(&mut self) -> Result<DurableWorkOutcome, DurableProcessError> {
+        loop {
+            match self.try_process_next()? {
+                DurableProcessOutcome::Idle => match self.receiver.recv().await {
+                    Some(event) => self.pending_ingress.push_back(event),
+                    None => return Ok(DurableWorkOutcome::Closed),
+                },
+                DurableProcessOutcome::DropSummaryRequested => {
+                    return Ok(DurableWorkOutcome::DropSummaryRequested);
+                }
+                DurableProcessOutcome::Written { events, rotations } => {
+                    return Ok(DurableWorkOutcome::Written { events, rotations });
+                }
+            }
+        }
+    }
+
+    pub async fn wait_process_next_batched(
+        &mut self,
+        partial_flush_interval: Duration,
+    ) -> Result<DurableWorkOutcome, DurableProcessError> {
+        loop {
+            if self.indeterminate_drop.is_some() {
+                if let Some(work) = self.process_ready_work()? {
+                    return Ok(work);
+                }
+                continue;
+            }
+            if let Some(first) = self.pending_ingress.front() {
+                if drop_summary_from_prepared(first).is_none() {
+                    self.collect_partial_batch(partial_flush_interval).await;
+                }
+                return self
+                    .process_ready_work()?
+                    .ok_or(DurableProcessError::Segment(SegmentError::InvalidData));
+            }
+            if self.progress_observed
+                && !self.drop_summary_inflight.load(Ordering::Acquire)
+                && self.drops.snapshot().total() > 0
+            {
+                return self
+                    .process_ready_work()?
+                    .ok_or(DurableProcessError::Segment(SegmentError::InvalidData));
+            }
+            match self.receiver.recv().await {
+                Some(event) => {
+                    let is_drop_summary = drop_summary_from_prepared(&event).is_some();
+                    self.pending_ingress.push_back(event);
+                    if !is_drop_summary {
+                        self.collect_partial_batch(partial_flush_interval).await;
+                    }
+                    return self
+                        .process_ready_work()?
+                        .ok_or(DurableProcessError::Segment(SegmentError::InvalidData));
+                }
+                None => {
+                    return match self.try_process_next()? {
+                        DurableProcessOutcome::Idle => Ok(DurableWorkOutcome::Closed),
+                        DurableProcessOutcome::DropSummaryRequested => {
+                            Ok(DurableWorkOutcome::DropSummaryRequested)
+                        }
+                        DurableProcessOutcome::Written { events, rotations } => {
+                            Ok(DurableWorkOutcome::Written { events, rotations })
+                        }
+                    };
+                }
+            }
+        }
+    }
+
+    async fn collect_partial_batch(&mut self, partial_flush_interval: Duration) {
+        let mut events = self.pending_ingress.len();
+        let mut bytes = self.pending_ingress.iter().fold(0_usize, |total, event| {
+            total.saturating_add(event.encoded_len())
+        });
+        if events >= MAX_BATCH_EVENTS || bytes >= MAX_BATCH_EVENT_BYTES {
+            return;
+        }
+        let deadline = tokio::time::sleep(partial_flush_interval);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                () = &mut deadline => return,
+                event = self.receiver.recv() => {
+                    let Some(event) = event else {
+                        return;
+                    };
+                    let event_bytes = event.encoded_len();
+                    let is_drop_summary = drop_summary_from_prepared(&event).is_some();
+                    self.pending_ingress.push_back(event);
+                    if is_drop_summary
+                        || events.saturating_add(1) >= MAX_BATCH_EVENTS
+                        || bytes
+                            .checked_add(event_bytes)
+                            .is_none_or(|total| total >= MAX_BATCH_EVENT_BYTES)
+                    {
+                        return;
+                    }
+                    events += 1;
+                    bytes += event_bytes;
+                }
+            }
+        }
+    }
+
+    fn process_ready_work(&mut self) -> Result<Option<DurableWorkOutcome>, DurableProcessError> {
+        match self.try_process_next()? {
+            DurableProcessOutcome::Idle => Ok(None),
+            DurableProcessOutcome::DropSummaryRequested => {
+                Ok(Some(DurableWorkOutcome::DropSummaryRequested))
+            }
+            DurableProcessOutcome::Written { events, rotations } => {
+                Ok(Some(DurableWorkOutcome::Written { events, rotations }))
+            }
+        }
     }
 
     pub fn recover_startup(
@@ -377,7 +607,7 @@ where
                 return Err(SegmentError::InvalidData.into());
             }
         }
-        let first = if let Some(pending) = self.pending_ingress.take() {
+        let first = if let Some(pending) = self.pending_ingress.pop_front() {
             pending
         } else {
             match self.receiver.try_recv() {
@@ -416,14 +646,20 @@ where
             .try_push(first)
             .map_err(|_| SegmentError::InvalidData)?;
         while !is_drop_summary && batch.event_count() < MAX_BATCH_EVENTS {
-            let event = match self.receiver.try_recv() {
-                Ok(event) => event,
-                Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
-                    break;
+            let event = if let Some(pending) = self.pending_ingress.pop_front() {
+                pending
+            } else {
+                match self.receiver.try_recv() {
+                    Ok(event) => event,
+                    Err(
+                        mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected,
+                    ) => {
+                        break;
+                    }
                 }
             };
             if drop_summary_from_prepared(&event).is_some() {
-                self.pending_ingress = Some(event);
+                self.pending_ingress.push_front(event);
                 break;
             }
             if batch
@@ -431,7 +667,7 @@ where
                 .checked_add(event.encoded_len())
                 .is_none_or(|bytes| bytes > MAX_BATCH_EVENT_BYTES)
             {
-                self.pending_ingress = Some(event);
+                self.pending_ingress.push_front(event);
                 break;
             }
             batch.try_push(event).map_err(|_| {

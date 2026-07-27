@@ -2,12 +2,12 @@ use std::{
     fmt,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 
 use crate::{
     event::{DiagnosticBuildError, DiagnosticEventDraft, DiagnosticEventTemplate},
@@ -16,6 +16,7 @@ use crate::{
 };
 
 pub const INGRESS_QUEUE_CAPACITY: usize = 256;
+const INTERNAL_INGRESS_QUEUE_CAPACITY: usize = 4;
 pub const QUERY_QUEUE_CAPACITY: usize = 32;
 pub const MAX_QUERY_DEADLINE: Duration = Duration::from_secs(5);
 
@@ -137,9 +138,11 @@ fn increment(counter: &AtomicU64) {
 #[derive(Clone)]
 pub struct DiagnosticRecorder {
     ingress: mpsc::Sender<DiagnosticEventTemplate>,
-    queries: mpsc::Sender<QueryCommand>,
+    internal_ingress: mpsc::Sender<DiagnosticEventTemplate>,
+    queries: mpsc::Sender<RecorderCommand>,
     metrics: DropMetrics,
     remaining_sequences: Arc<AtomicU64>,
+    shutdown: Arc<RecorderShutdownState>,
 }
 
 impl DiagnosticRecorder {
@@ -158,25 +161,32 @@ impl DiagnosticRecorder {
 
     fn with_ring(ring: DiagnosticRing, next_sequence: u64) -> (Self, RecorderOwner) {
         let (ingress, ingress_receiver) = mpsc::channel(INGRESS_QUEUE_CAPACITY);
+        let (internal_ingress, internal_ingress_receiver) =
+            mpsc::channel(INTERNAL_INGRESS_QUEUE_CAPACITY);
         let (queries, query_receiver) = mpsc::channel(QUERY_QUEUE_CAPACITY);
         let metrics = DropMetrics::new();
+        let shutdown = Arc::new(RecorderShutdownState::default());
         let remaining = u64::MAX.saturating_sub(next_sequence).saturating_add(1);
         let remaining_sequences = Arc::new(AtomicU64::new(remaining));
         (
             Self {
                 ingress,
+                internal_ingress,
                 queries,
                 metrics: metrics.clone(),
                 remaining_sequences: Arc::clone(&remaining_sequences),
+                shutdown: Arc::clone(&shutdown),
             },
             RecorderOwner {
                 ring,
                 ingress: ingress_receiver,
+                internal_ingress: internal_ingress_receiver,
                 queries: query_receiver,
                 metrics,
                 next_sequence,
                 remaining_sequences: Arc::clone(&remaining_sequences),
                 durable: None,
+                shutdown,
             },
         )
     }
@@ -195,6 +205,27 @@ impl DiagnosticRecorder {
         &self,
         draft: Result<DiagnosticEventDraft, DiagnosticBuildError>,
     ) -> RecordOutcome {
+        self.try_record_with_admission(draft, false)
+    }
+
+    pub fn try_record_internal(
+        &self,
+        draft: Result<DiagnosticEventDraft, DiagnosticBuildError>,
+    ) -> RecordOutcome {
+        self.try_record_with_admission(draft, true)
+    }
+
+    fn try_record_with_admission(
+        &self,
+        draft: Result<DiagnosticEventDraft, DiagnosticBuildError>,
+        internal: bool,
+    ) -> RecordOutcome {
+        if self.shutdown.requested.load(Ordering::Acquire)
+            || (!internal && self.shutdown.ingress_closed.load(Ordering::Acquire))
+        {
+            increment(&self.metrics.inner.ingress_closed);
+            return RecordOutcome::DroppedClosed;
+        }
         let draft = match draft {
             Ok(draft) => draft,
             Err(_) => {
@@ -202,7 +233,12 @@ impl DiagnosticRecorder {
                 return RecordOutcome::DroppedInvalid;
             }
         };
-        let permit = match self.ingress.try_reserve() {
+        let ingress = if internal {
+            &self.internal_ingress
+        } else {
+            &self.ingress
+        };
+        let permit = match ingress.try_reserve() {
             Ok(permit) => permit,
             Err(mpsc::error::TrySendError::Full(())) => {
                 increment(&self.metrics.inner.ingress_full);
@@ -233,8 +269,15 @@ impl DiagnosticRecorder {
     }
 
     pub fn try_query(&self, request: PageRequest) -> Result<PendingQuery, QueryAdmissionError> {
+        if self.shutdown.requested.load(Ordering::Acquire) {
+            increment(&self.metrics.inner.query_closed);
+            return Err(QueryAdmissionError::Closed);
+        }
         let (reply, receiver) = oneshot::channel();
-        match self.queries.try_send(QueryCommand { request, reply }) {
+        match self
+            .queries
+            .try_send(RecorderCommand::Query(QueryCommand { request, reply }))
+        {
             Ok(()) => Ok(PendingQuery { receiver }),
             Err(mpsc::error::TrySendError::Full(_)) => {
                 increment(&self.metrics.inner.query_busy);
@@ -244,6 +287,34 @@ impl DiagnosticRecorder {
                 increment(&self.metrics.inner.query_closed);
                 Err(QueryAdmissionError::Closed)
             }
+        }
+    }
+
+    pub fn try_barrier(&self) -> Result<PendingBarrier, BarrierAdmissionError> {
+        if self.shutdown.requested.load(Ordering::Acquire) {
+            return Err(BarrierAdmissionError::Closed);
+        }
+        let (reply, receiver) = oneshot::channel();
+        match self.queries.try_send(RecorderCommand::Barrier { reply }) {
+            Ok(()) => Ok(PendingBarrier { receiver }),
+            Err(mpsc::error::TrySendError::Full(_)) => Err(BarrierAdmissionError::Busy),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(BarrierAdmissionError::Closed),
+        }
+    }
+
+    pub fn try_close_ingress_barrier(&self) -> Result<PendingBarrier, BarrierAdmissionError> {
+        if self.shutdown.requested.load(Ordering::Acquire) {
+            return Err(BarrierAdmissionError::Closed);
+        }
+        self.shutdown.ingress_closed.store(true, Ordering::Release);
+        let (reply, receiver) = oneshot::channel();
+        match self
+            .queries
+            .try_send(RecorderCommand::CloseIngress { reply })
+        {
+            Ok(()) => Ok(PendingBarrier { receiver }),
+            Err(mpsc::error::TrySendError::Full(_)) => Err(BarrierAdmissionError::Busy),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(BarrierAdmissionError::Closed),
         }
     }
 
@@ -261,6 +332,12 @@ impl fmt::Debug for DiagnosticRecorder {
 struct QueryCommand {
     request: PageRequest,
     reply: oneshot::Sender<RingPage>,
+}
+
+enum RecorderCommand {
+    Query(QueryCommand),
+    Barrier { reply: oneshot::Sender<()> },
+    CloseIngress { reply: oneshot::Sender<()> },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -304,17 +381,96 @@ impl fmt::Debug for PendingQuery {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum BarrierAdmissionError {
+    #[error("diagnostic recorder barrier is busy")]
+    Busy,
+    #[error("diagnostic recorder owner is unavailable")]
+    Closed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum BarrierReplyError {
+    #[error("diagnostic recorder barrier deadline elapsed")]
+    Deadline,
+    #[error("diagnostic recorder owner is unavailable")]
+    Closed,
+}
+
+pub struct PendingBarrier {
+    receiver: oneshot::Receiver<()>,
+}
+
+impl PendingBarrier {
+    pub async fn wait(self) -> Result<(), BarrierReplyError> {
+        self.wait_with_deadline(MAX_QUERY_DEADLINE).await
+    }
+
+    pub async fn wait_with_deadline(self, deadline: Duration) -> Result<(), BarrierReplyError> {
+        let bounded = deadline.min(MAX_QUERY_DEADLINE);
+        match tokio::time::timeout(bounded, self.receiver).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(BarrierReplyError::Closed),
+            Err(_) => Err(BarrierReplyError::Deadline),
+        }
+    }
+}
+
+impl fmt::Debug for PendingBarrier {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PendingBarrier([redacted])")
+    }
+}
+
 pub struct RecorderOwner {
     ring: DiagnosticRing,
     ingress: mpsc::Receiver<DiagnosticEventTemplate>,
-    queries: mpsc::Receiver<QueryCommand>,
+    internal_ingress: mpsc::Receiver<DiagnosticEventTemplate>,
+    queries: mpsc::Receiver<RecorderCommand>,
     metrics: DropMetrics,
     next_sequence: u64,
     remaining_sequences: Arc<AtomicU64>,
     durable: Option<DurableProducer>,
+    shutdown: Arc<RecorderShutdownState>,
+}
+
+#[derive(Default)]
+struct RecorderShutdownState {
+    ingress_closed: AtomicBool,
+    requested: AtomicBool,
+    wake: Notify,
+}
+
+#[derive(Clone)]
+pub struct RecorderShutdown {
+    state: Arc<RecorderShutdownState>,
+}
+
+impl RecorderShutdown {
+    pub fn close_ingress(&self) {
+        self.state.ingress_closed.store(true, Ordering::Release);
+    }
+
+    pub fn request(&self) {
+        self.close_ingress();
+        self.state.requested.store(true, Ordering::Release);
+        self.state.wake.notify_one();
+    }
+}
+
+impl fmt::Debug for RecorderShutdown {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RecorderShutdown([redacted])")
+    }
 }
 
 impl RecorderOwner {
+    pub fn shutdown_handle(&self) -> RecorderShutdown {
+        RecorderShutdown {
+            state: Arc::clone(&self.shutdown),
+        }
+    }
+
     pub fn with_durable_producer(mut self, producer: DurableProducer) -> Self {
         self.durable = Some(producer);
         self
@@ -358,25 +514,57 @@ impl RecorderOwner {
 
     pub async fn run(mut self) {
         let mut ingress_open = true;
+        let mut internal_ingress_open = true;
         let mut queries_open = true;
-        while ingress_open || queries_open {
+        let mut stopping = false;
+        let mut close_ingress_replies: Vec<oneshot::Sender<()>> = Vec::new();
+        while ingress_open || internal_ingress_open || queries_open {
+            if !stopping && self.shutdown.requested.load(Ordering::Acquire) {
+                self.ingress.close();
+                self.internal_ingress.close();
+                self.queries.close();
+                stopping = true;
+            }
             tokio::select! {
                 biased;
                 event = self.ingress.recv(), if ingress_open => {
                     match event {
                         Some(event) => self.finalize_and_insert(event),
-                        None => ingress_open = false,
+                        None => {
+                            ingress_open = false;
+                            for reply in close_ingress_replies.drain(..) {
+                                let _ = reply.send(());
+                            }
+                        }
+                    }
+                }
+                event = self.internal_ingress.recv(), if internal_ingress_open => {
+                    match event {
+                        Some(event) => self.finalize_and_insert(event),
+                        None => internal_ingress_open = false,
                     }
                 }
                 query = self.queries.recv(), if queries_open => {
                     match query {
-                        Some(query) => {
+                        Some(RecorderCommand::Query(query)) => {
                             let page = self.ring.page(query.request);
                             let _ = query.reply.send(page);
+                        }
+                        Some(RecorderCommand::Barrier { reply }) => {
+                            let _ = reply.send(());
+                        }
+                        Some(RecorderCommand::CloseIngress { reply }) => {
+                            self.ingress.close();
+                            if ingress_open {
+                                close_ingress_replies.push(reply);
+                            } else {
+                                let _ = reply.send(());
+                            }
                         }
                         None => queries_open = false,
                     }
                 }
+                () = self.shutdown.wake.notified(), if !stopping => {}
             }
         }
     }
@@ -645,6 +833,132 @@ mod tests {
         assert_eq!(sequences.len(), 200);
         assert!(sequences.windows(2).all(|pair| pair[0] < pair[1]));
         owner_task.abort();
+    }
+
+    #[tokio::test]
+    async fn explicit_shutdown_drains_accepted_events_while_senders_remain_alive() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("graceful-recorder-shutdown");
+        fs::create_dir(&root).unwrap();
+        let (producer, mut durable_owner) = DurableProducer::new(&root, |_| Ok::<_, ()>(()));
+        let (recorder, owner) = DiagnosticRecorder::new();
+        let shutdown = owner.shutdown_handle();
+
+        for identity in 1..=16 {
+            assert_eq!(
+                recorder.try_record(durable_draft(identity)),
+                RecordOutcome::Accepted
+            );
+        }
+        let owner_task = tokio::spawn(owner.with_durable_producer(producer).run());
+        shutdown.request();
+
+        tokio::time::timeout(Duration::from_secs(1), owner_task)
+            .await
+            .expect("recorder owner did not stop while producer handles remained")
+            .unwrap();
+        assert_eq!(
+            recorder.try_record(durable_draft(17)),
+            RecordOutcome::DroppedClosed
+        );
+
+        let mut written = 0_usize;
+        loop {
+            match durable_owner.try_process_next().unwrap() {
+                DurableProcessOutcome::Idle => break,
+                DurableProcessOutcome::Written { events, .. } => {
+                    written = written.saturating_add(events);
+                }
+                DurableProcessOutcome::DropSummaryRequested => {
+                    panic!("graceful shutdown unexpectedly requested a drop summary")
+                }
+            }
+        }
+        assert_eq!(written, 16);
+    }
+
+    #[tokio::test]
+    async fn explicit_shutdown_rejects_new_work_before_the_owner_is_polled() {
+        let (recorder, owner) = DiagnosticRecorder::new();
+        let shutdown = owner.shutdown_handle();
+
+        shutdown.request();
+
+        assert_eq!(
+            recorder.try_record(durable_draft(1)),
+            RecordOutcome::DroppedClosed
+        );
+        assert!(matches!(
+            recorder.try_query(
+                PageRequest::with_limits(PageDirection::Ascending, None, 1, MAX_PAGE_BYTES,)
+                    .unwrap(),
+            ),
+            Err(QueryAdmissionError::Closed)
+        ));
+        assert!(matches!(
+            recorder.try_barrier(),
+            Err(BarrierAdmissionError::Closed)
+        ));
+        tokio::time::timeout(Duration::from_secs(1), owner.run())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn ingress_can_close_while_internal_drop_events_and_barriers_still_drain() {
+        let (recorder, owner) = DiagnosticRecorder::new();
+        let shutdown = owner.shutdown_handle();
+        let owner_task = tokio::spawn(owner.run());
+
+        shutdown.close_ingress();
+        assert_eq!(
+            recorder.try_record(durable_draft(1)),
+            RecordOutcome::DroppedClosed
+        );
+        assert_eq!(
+            recorder.try_record_internal(durable_draft(2)),
+            RecordOutcome::Accepted
+        );
+        recorder.try_barrier().unwrap().wait().await.unwrap();
+
+        shutdown.request();
+        tokio::time::timeout(Duration::from_secs(1), owner_task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn barrier_waits_for_prior_ingress_and_is_closed_after_shutdown() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("recorder-barrier");
+        fs::create_dir(&root).unwrap();
+        let (producer, mut durable_owner) = DurableProducer::new(&root, |_| Ok::<_, ()>(()));
+        let (recorder, owner) = DiagnosticRecorder::new();
+        let shutdown = owner.shutdown_handle();
+        let owner_task = tokio::spawn(owner.with_durable_producer(producer).run());
+
+        for identity in 1..=16 {
+            assert_eq!(
+                recorder.try_record(durable_draft(identity)),
+                RecordOutcome::Accepted
+            );
+        }
+        recorder.try_barrier().unwrap().wait().await.unwrap();
+        assert!(matches!(
+            durable_owner.try_process_next().unwrap(),
+            DurableProcessOutcome::Written { events: 16, .. }
+        ));
+
+        shutdown.request();
+        assert!(matches!(
+            recorder.try_barrier(),
+            Err(BarrierAdmissionError::Closed)
+        ));
+        tokio::time::timeout(Duration::from_secs(1), owner_task)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

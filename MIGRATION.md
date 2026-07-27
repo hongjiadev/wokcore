@@ -10,7 +10,7 @@ The first runtime-code import will be reviewed separately. Its migration commit 
 - retained MIT attribution;
 - verification results before and after extraction.
 
-The private pre-rewrite recovery bundle is stored in WokDocs, not this public repository.
+Private pre-rewrite recovery material is excluded from this public repository.
 
 ## Session ingestion 1: Codex
 

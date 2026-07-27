@@ -644,6 +644,54 @@ async fn loopback_listener_stop_response_is_complete_before_graceful_shutdown() 
 }
 
 #[tokio::test]
+async fn coordinated_stop_keeps_listener_owned_until_runtime_flushes() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (state, management, _, _) = state_fixture(&address.to_string()).await;
+    let (state, mut stop_requests) = state.with_coordinated_shutdown();
+    let running = RunningServer::start(listener, state).await.unwrap();
+
+    let mut connection = TcpStream::connect(address).await.unwrap();
+    let stop = format!(
+        "POST /wokcore/v1/service/stop HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer {management}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    connection.write_all(stop.as_bytes()).await.unwrap();
+    let mut stop_response = Vec::new();
+    connection.read_to_end(&mut stop_response).await.unwrap();
+    assert!(
+        String::from_utf8(stop_response)
+            .unwrap()
+            .starts_with("HTTP/1.1 200 OK")
+    );
+    timeout(Duration::from_secs(5), stop_requests.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(*stop_requests.borrow_and_update());
+
+    let mut health = TcpStream::connect(address).await.unwrap();
+    health
+        .write_all(
+            format!(
+                "GET /wokcore/v1/health HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut health_response = Vec::new();
+    health.read_to_end(&mut health_response).await.unwrap();
+    assert!(
+        String::from_utf8(health_response)
+            .unwrap()
+            .starts_with("HTTP/1.1 200 OK")
+    );
+
+    running.shutdown().await.unwrap();
+    assert_listener_closes(address).await;
+}
+
+#[tokio::test]
 async fn listener_rejects_unspecified_ipv4_bindings() {
     let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
     let address = listener.local_addr().unwrap();

@@ -21,3 +21,4 @@ wokcore-storage = { version = "0.1.0", path = "../wokcore-storage" }
 
 [dev-dependencies]
 tempfile.workspace = true
+tokio.workspace = true

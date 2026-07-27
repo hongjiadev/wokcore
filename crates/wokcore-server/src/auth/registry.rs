@@ -6,6 +6,7 @@ use std::{
 
 use arc_swap::ArcSwap;
 use secrecy::ExposeSecret;
+use sha2::{Digest, Sha256};
 use tokio::task;
 use wokcore_core::{
     id::ClientId,
@@ -150,6 +151,13 @@ struct AuthRegistryState {
 }
 
 impl AuthRegistry {
+    pub fn session_domain_key(&self) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        digest.update(b"wokcore.session-domain-key.v1");
+        digest.update(self.state.management_digest.into_bytes());
+        digest.finalize().into()
+    }
+
     pub async fn bootstrap(
         secrets: Arc<dyn SecretStore>,
         metadata: Arc<dyn AuthMetadataStore>,

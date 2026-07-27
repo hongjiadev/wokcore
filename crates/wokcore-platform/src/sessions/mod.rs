@@ -6,8 +6,8 @@ pub use environment::{SessionEnvironment, SessionRootOverrides, SessionRoots, Se
 pub(crate) use export_destination::PinnedPublishedFile;
 pub use export_destination::{MAX_PINNED_EXPORT_READ_BYTES, PinnedExportDestination};
 pub use file::{
-    SessionDirectoryEntry, SessionDirectoryLease, SessionFile, SessionFileIdentity,
-    SessionFileKind, SessionFileSnapshot, SessionRootLease,
+    SessionDirectoryEntry, SessionDirectoryLease, SessionDirectoryPage, SessionDirectoryPageKey,
+    SessionFile, SessionFileIdentity, SessionFileKind, SessionFileSnapshot, SessionRootLease,
 };
 
 #[derive(Debug, thiserror::Error)]

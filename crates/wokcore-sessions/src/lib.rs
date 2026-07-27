@@ -5,3 +5,4 @@ pub mod discovery;
 pub mod gemini;
 pub mod messages;
 pub mod model;
+mod state;

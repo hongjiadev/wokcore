@@ -3,6 +3,7 @@ use std::{fs, io::Write, path::Path, time::SystemTime};
 use tempfile::TempDir;
 use wokcore_sessions::{
     claude::{ClaudeScanner, MAX_CLAUDE_LOGICAL_WORKING_BYTES},
+    discovery::SessionDiscoverySliceBudget,
     messages::{MAX_MESSAGE_PAGE_UTF8_BYTES, MessagePageRequest, MessagePager, MessageRole},
     model::{SessionScanControl, SessionScanOutcome},
 };
@@ -87,6 +88,63 @@ fn scanner(root: &TempDir, state: &TempDir) -> ClaudeScanner {
         TEST_DOMAIN_KEY,
     )
     .unwrap()
+}
+
+#[test]
+fn slice_scanner_reuses_one_cycle_and_preserves_missing_source_transitions() {
+    let root = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let relative = "projects/project-a/session.jsonl";
+    write_bytes(
+        root.path(),
+        relative,
+        include_bytes!("fixtures/claude/snapshots.jsonl"),
+    );
+    let mut scanner = scanner(&root, &state);
+    let mut sources = Vec::new();
+
+    for _ in 0..16 {
+        let summary = scanner
+            .scan_slice(
+                NOW,
+                SessionScanControl::default(),
+                SessionDiscoverySliceBudget::default(),
+            )
+            .unwrap();
+        sources.extend(summary.sources);
+        if summary.outcome == SessionScanOutcome::Complete {
+            break;
+        }
+    }
+
+    assert_eq!(sources.len(), 1);
+    let source_key = sources[0].source_key.clone();
+    fs::remove_file(root.path().join(relative)).unwrap();
+    let mut deleted = 0;
+    for _ in 0..16 {
+        let summary = scanner
+            .scan_slice(
+                "2026-07-26T12:31:00Z",
+                SessionScanControl::default(),
+                SessionDiscoverySliceBudget::default(),
+            )
+            .unwrap();
+        deleted += summary.deleted_sources;
+        if summary.outcome == SessionScanOutcome::Complete {
+            break;
+        }
+    }
+
+    assert_eq!(deleted, 1);
+    assert_eq!(
+        scanner
+            .state()
+            .load_session_source(&source_key)
+            .unwrap()
+            .unwrap()
+            .status,
+        SessionSourceStatus::Stale
+    );
 }
 
 #[test]

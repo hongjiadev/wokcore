@@ -5,7 +5,9 @@ use std::{future::Future, io, pin::Pin, sync::Arc, time::Duration};
 use secrecy::zeroize::Zeroizing;
 use uuid::Uuid;
 use wokcore_platform::{AppPaths, DiscoveryRecord, DiscoveryStore, PlatformError};
-use wokcore_server::{auth::EntropySource, lifecycle::ServiceLifecycle};
+use wokcore_server::{
+    auth::EntropySource, lifecycle::ServiceLifecycle, observability::SessionRootPaths,
+};
 use wokcore_storage::SecretStore;
 
 pub mod cli;
@@ -119,6 +121,7 @@ pub struct RunDependencies {
     pub(crate) shutdown: Arc<dyn ShutdownSignal>,
     pub(crate) discovery_publisher: Arc<dyn DiscoveryPublisher>,
     pub(crate) lifecycle_observer: Arc<dyn LifecycleObserver>,
+    pub(crate) session_roots: Option<SessionRootPaths>,
     pub(crate) drain_timeout: Duration,
 }
 
@@ -143,6 +146,7 @@ impl RunDependencies {
             shutdown,
             discovery_publisher: Arc::new(PlatformDiscoveryPublisher),
             lifecycle_observer: Arc::new(NoopLifecycleObserver),
+            session_roots: None,
             drain_timeout: Duration::from_secs(30),
         }
     }
@@ -160,6 +164,11 @@ impl RunDependencies {
         lifecycle_observer: Arc<dyn LifecycleObserver>,
     ) -> Self {
         self.lifecycle_observer = lifecycle_observer;
+        self
+    }
+
+    pub fn with_session_roots(mut self, session_roots: SessionRootPaths) -> Self {
+        self.session_roots = Some(session_roots);
         self
     }
 

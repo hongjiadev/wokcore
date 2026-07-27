@@ -186,7 +186,7 @@ impl MessagePager {
         Ok(Self {
             kind,
             root: SessionRootLease::open(root_path).map_err(|_| MessagePagerError::Root)?,
-            state: StateStore::open(state_path)?,
+            state: StateStore::open_live_reader(state_path)?,
             domain_key,
             jsonl_cache: None,
             legacy_cache: None,

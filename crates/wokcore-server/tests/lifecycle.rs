@@ -141,6 +141,31 @@ async fn zero_active_drain_completes_and_can_transition_to_stopping() {
     ));
 }
 
+#[tokio::test]
+async fn activity_revision_changes_only_for_admitted_request_lifetimes() {
+    let lifecycle = ServiceLifecycle::new();
+    lifecycle.mark_running().unwrap();
+    let admission = lifecycle.admission_controller();
+    let initial = lifecycle.activity_revision();
+
+    let guard = admission.try_enter().unwrap();
+    let admitted = lifecycle.activity_revision();
+    assert_eq!(admitted, initial + 1);
+
+    drop(guard);
+    let completed = lifecycle.activity_revision();
+    assert_eq!(completed, admitted + 1);
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    assert!(lifecycle.has_been_idle_for(Duration::from_millis(1)));
+
+    assert_eq!(
+        lifecycle.begin_drain(TEST_TIMEOUT).await.unwrap(),
+        DrainOutcome::Completed
+    );
+    assert!(admission.try_enter().is_err());
+    assert_eq!(lifecycle.activity_revision(), completed);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn drain_timeout_awaits_explicit_cancellation_without_killing_guards() {
     let lifecycle = running_lifecycle();

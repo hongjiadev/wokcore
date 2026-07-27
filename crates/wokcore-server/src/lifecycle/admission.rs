@@ -2,9 +2,10 @@ use std::{
     fmt,
     num::NonZeroU64,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 use tokio::sync::Notify;
@@ -47,6 +48,7 @@ impl AdmissionController {
             #[cfg(test)]
             self.shared
                 .checkpoint(AdmissionTestPoint::RunningPhaseRecheck);
+            self.shared.observe_activity();
             return Ok(ActiveRequestGuard {
                 shared: Arc::clone(&self.shared),
             });
@@ -106,6 +108,8 @@ pub(crate) struct SharedLifecycle {
     pub(crate) phase: AtomicU8,
     pub(crate) active: AtomicUsize,
     transition_revision: AtomicU64,
+    activity_revision: AtomicU64,
+    last_activity_tick_millis: AtomicU64,
     zero_active: Notify,
     #[cfg(test)]
     test_hooks: AdmissionTestHooks,
@@ -117,6 +121,8 @@ impl SharedLifecycle {
             phase: AtomicU8::new(PHASE_STARTING),
             active: AtomicUsize::new(0),
             transition_revision: AtomicU64::new(0),
+            activity_revision: AtomicU64::new(0),
+            last_activity_tick_millis: AtomicU64::new(monotonic_tick_millis()),
             zero_active: Notify::new(),
             #[cfg(test)]
             test_hooks: AdmissionTestHooks::default(),
@@ -150,6 +156,26 @@ impl SharedLifecycle {
         self.transition_revision.load(Ordering::SeqCst)
     }
 
+    pub(crate) fn activity_revision(&self) -> u64 {
+        self.activity_revision.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn has_been_idle_for(&self, duration: Duration) -> bool {
+        let elapsed = monotonic_tick_millis()
+            .saturating_sub(self.last_activity_tick_millis.load(Ordering::SeqCst));
+        elapsed >= duration.as_millis().min(u128::from(u64::MAX)) as u64
+    }
+
+    fn observe_activity(&self) {
+        self.last_activity_tick_millis
+            .store(monotonic_tick_millis(), Ordering::SeqCst);
+        let _ =
+            self.activity_revision
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |revision| {
+                    revision.checked_add(1)
+                });
+    }
+
     pub(crate) fn active_requests(&self) -> usize {
         self.active.load(Ordering::SeqCst)
     }
@@ -172,7 +198,11 @@ impl SharedLifecycle {
         self.test_hooks
             .decrement_attempts
             .fetch_add(1, Ordering::SeqCst);
-        if Self::checked_decrement(&self.active) == DecrementOutcome::BecameZero {
+        let outcome = Self::checked_decrement(&self.active);
+        if outcome != DecrementOutcome::AlreadyZero {
+            self.observe_activity();
+        }
+        if outcome == DecrementOutcome::BecameZero {
             self.zero_active.notify_waiters();
         }
     }
@@ -224,6 +254,15 @@ impl SharedLifecycle {
     fn decrement_attempts(&self) -> usize {
         self.test_hooks.decrement_attempts.load(Ordering::SeqCst)
     }
+}
+
+fn monotonic_tick_millis() -> u64 {
+    static ORIGIN: OnceLock<Instant> = OnceLock::new();
+    ORIGIN
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

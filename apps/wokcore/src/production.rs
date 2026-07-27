@@ -10,7 +10,8 @@ use uuid::Uuid;
 use wokcore_platform::{AppPaths, is_process_running};
 use wokcore_server::{
     auth::{EntropySource, OsEntropy},
-    runtime::generate_uuid_v4,
+    observability::SessionRootPaths,
+    runtime::{generate_uuid_v4, utc_timestamp_from_epoch_seconds},
 };
 use wokcore_storage::NativeSecretStore;
 
@@ -35,7 +36,7 @@ pub async fn run_production(cli: Cli) -> ExitCode {
         }
     };
     let entropy: Arc<dyn EntropySource> = Arc::new(OsEntropy);
-    let dependencies = RunDependencies::new(
+    let mut dependencies = RunDependencies::new(
         paths,
         Arc::new(NativeSecretStore::new()),
         entropy.clone(),
@@ -44,6 +45,9 @@ pub async fn run_production(cli: Cli) -> ExitCode {
         Arc::new(SystemProcessIdentity),
         Arc::new(ControlCSignal),
     );
+    if let Some(session_roots) = SessionRootPaths::discover() {
+        dependencies = dependencies.with_session_roots(session_roots);
+    }
     run_with_dependencies(cli, &dependencies, &mut output).await
 }
 
@@ -65,7 +69,7 @@ impl Clock for SystemClock {
             .duration_since(UNIX_EPOCH)
             .map_err(|_| RuntimeValueError)?
             .as_secs();
-        Ok(seconds.to_string())
+        utc_timestamp_from_epoch_seconds(seconds).ok_or(RuntimeValueError)
     }
 }
 

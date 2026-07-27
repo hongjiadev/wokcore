@@ -98,6 +98,44 @@ fn enumeration_is_bounded_before_collecting_untrusted_directory_entries() {
 }
 
 #[test]
+fn directory_pages_resume_in_sorted_order_without_retaining_prior_entries() {
+    let fixture = SessionFixture::new(b"first");
+    let parent = fixture.file.parent().unwrap();
+    for name in ["fifth.jsonl", "second.jsonl", "fourth.jsonl", "third.jsonl"] {
+        fs::write(parent.join(name), name.as_bytes()).unwrap();
+    }
+    let root = SessionRootLease::open(fixture.root.path()).unwrap();
+    let directory = root.open_directory("sessions/2026/07/26").unwrap();
+    let mut after = None;
+    let mut names = Vec::new();
+
+    loop {
+        let page = directory.entries_page_keyed(after.as_ref(), 2).unwrap();
+        assert!(page.entries().len() <= 2);
+        names.extend(
+            page.entries()
+                .iter()
+                .map(|entry| entry.name().to_string_lossy().into_owned()),
+        );
+        after = page.next_page_key().cloned();
+        if after.is_none() {
+            break;
+        }
+    }
+
+    assert_eq!(
+        names,
+        [
+            "fifth.jsonl",
+            "fourth.jsonl",
+            "second.jsonl",
+            "session.jsonl",
+            "third.jsonl",
+        ]
+    );
+}
+
+#[test]
 fn relative_paths_cannot_escape_the_pinned_root() {
     let fixture = SessionFixture::new(b"inside");
     let outside = fixture.root.path().parent().unwrap().join("outside.jsonl");

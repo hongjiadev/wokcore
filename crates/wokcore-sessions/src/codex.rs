@@ -21,16 +21,20 @@ use wokcore_storage::{
     ReplaySignaturePageKey, SessionAvailability, SessionBatch, SessionFileIdentity,
     SessionGenerationState, SessionIndexRecord, SessionScanCursor, SessionScanResultCode,
     SessionSourceErrorCode, SessionSourceKind, SessionSourcePageKey, SessionSourceStatus,
-    SessionUsageRecord, StateStore, StorageError,
+    SessionUsageRecord, StateStore, StateStoreWriterClient, StorageError,
 };
 
 use crate::{
     cursor::{JsonlCursor, JsonlError, JsonlReader, JsonlRecordStatus, MAX_JSONL_LINE_BYTES},
     discovery::{
-        DiscoveredSession, DiscoveryError, DiscoveryLimits, SessionLocation,
-        discover_codex_sessions,
+        DiscoveredSession, DiscoveryError, DiscoveryLimits, SessionDiscoveryClock,
+        SessionDiscoveryCursor, SessionDiscoveryKind, SessionDiscoverySliceBudget,
+        SessionDiscoverySliceError, SessionDiscoverySliceOutcome, SessionLocation,
+        SystemSessionDiscoveryClock, discover_codex_sessions,
+        discover_codex_sessions_slice_with_clock,
     },
     model::{ReplayResolution, TokenTotals},
+    state::SessionState,
 };
 
 pub const REPLAY_PAGE_SIZE: usize = 512;
@@ -569,12 +573,13 @@ pub enum CodexScannerError {
 pub struct CodexScanner {
     root: SessionRootLease,
     root_path: PathBuf,
-    state: StateStore,
+    state: SessionState,
     domain_key: [u8; 32],
     discovery_limits: DiscoveryLimits,
     replay_limit: u64,
     title_database_identities: HashMap<String, PlatformFileIdentity>,
     metrics: ScannerMetrics,
+    slice_cycle: Option<CodexSliceCycle>,
 }
 
 impl CodexScanner {
@@ -583,9 +588,27 @@ impl CodexScanner {
         state_path: impl AsRef<Path>,
         domain_key: [u8; 32],
     ) -> Result<Self, CodexScannerError> {
+        Self::open_internal(root_path, state_path, domain_key, None)
+    }
+
+    pub fn open_with_writer(
+        root_path: impl AsRef<Path>,
+        state_path: impl AsRef<Path>,
+        domain_key: [u8; 32],
+        writer: StateStoreWriterClient,
+    ) -> Result<Self, CodexScannerError> {
+        Self::open_internal(root_path, state_path, domain_key, Some(writer))
+    }
+
+    fn open_internal(
+        root_path: impl AsRef<Path>,
+        state_path: impl AsRef<Path>,
+        domain_key: [u8; 32],
+        writer: Option<StateStoreWriterClient>,
+    ) -> Result<Self, CodexScannerError> {
         let root_path = root_path.as_ref().to_path_buf();
         let root = SessionRootLease::open(&root_path).map_err(|_| CodexScannerError::Root)?;
-        let state = StateStore::open(state_path)?;
+        let state = SessionState::open(state_path, writer)?;
         Ok(Self {
             root,
             root_path,
@@ -595,11 +618,477 @@ impl CodexScanner {
             replay_limit: MAX_CODEX_REPLAY_SIGNATURES,
             title_database_identities: HashMap::new(),
             metrics: ScannerMetrics::default(),
+            slice_cycle: None,
         })
     }
 
     pub fn state(&self) -> &StateStore {
-        &self.state
+        self.state.reader()
+    }
+
+    pub fn scan_slice(
+        &mut self,
+        transition_at: &str,
+        control: ScanControl,
+        budget: SessionDiscoverySliceBudget,
+    ) -> Result<CodexScanSummary, CodexScannerError> {
+        self.scan_slice_with_clock(transition_at, control, budget, &SystemSessionDiscoveryClock)
+    }
+
+    pub fn scan_slice_with_clock<C>(
+        &mut self,
+        transition_at: &str,
+        control: ScanControl,
+        budget: SessionDiscoverySliceBudget,
+        clock: &C,
+    ) -> Result<CodexScanSummary, CodexScannerError>
+    where
+        C: SessionDiscoveryClock + ?Sized,
+    {
+        self.metrics = ScannerMetrics::default();
+        let mut cycle = match self.slice_cycle.take() {
+            Some(cycle) => cycle,
+            None => CodexSliceCycle::new(self, transition_at)?,
+        };
+        let result = self.scan_slice_cycle(&mut cycle, control, budget, clock);
+        match result {
+            Ok((summary, complete)) => {
+                if !complete {
+                    self.slice_cycle = Some(cycle);
+                }
+                Ok(summary)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn scan_slice_cycle<C>(
+        &mut self,
+        cycle: &mut CodexSliceCycle,
+        control: ScanControl,
+        budget: SessionDiscoverySliceBudget,
+        clock: &C,
+    ) -> Result<(CodexScanSummary, bool), CodexScannerError>
+    where
+        C: SessionDiscoveryClock + ?Sized,
+    {
+        match cycle.phase {
+            CodexScannerSlicePhase::Discovering => {
+                let slice = discover_codex_sessions_slice_with_clock(
+                    &self.root,
+                    &mut cycle.cursor,
+                    budget,
+                    clock,
+                )
+                .map_err(map_codex_slice_error)?;
+                for entry in &slice.entries {
+                    let Some(source) = DiscoveredSession::from_slice(entry) else {
+                        continue;
+                    };
+                    cycle.observe(self, &source)?;
+                }
+                let mut deleted_sources = 0;
+                if slice.outcome == SessionDiscoverySliceOutcome::Complete {
+                    for source_key in cycle.persisted_sources.difference(&cycle.current_sources) {
+                        let _ = self.state.mark_source_unavailable(
+                            source_key,
+                            SessionSourceErrorCode::SourceSessionsAbsent,
+                            &cycle.transition_at,
+                        )?;
+                        deleted_sources += 1;
+                    }
+                    cycle.prepare_processing();
+                    cycle.cursor = SessionDiscoveryCursor::with_limits(
+                        SessionDiscoveryKind::Codex,
+                        self.discovery_limits,
+                    )
+                    .map_err(CodexScannerError::Discovery)?;
+                    cycle.persisted_sources = HashSet::new();
+                    cycle.persisted_identities = HashMap::new();
+                    cycle.reserved_keys = HashMap::new();
+                    cycle.current_sources = HashSet::new();
+                }
+                Ok((
+                    CodexScanSummary {
+                        outcome: ScanOutcome::Interrupted,
+                        advanced_sources: 0,
+                        unchanged_sources: 0,
+                        deleted_sources,
+                        sources: Vec::new(),
+                        metrics: self.metrics.clone(),
+                    },
+                    false,
+                ))
+            }
+            CodexScannerSlicePhase::Processing => {
+                if cycle.processing_depths.is_empty() {
+                    return Ok((
+                        CodexScanSummary {
+                            outcome: ScanOutcome::Complete,
+                            advanced_sources: 0,
+                            unchanged_sources: 0,
+                            deleted_sources: 0,
+                            sources: Vec::new(),
+                            metrics: self.metrics.clone(),
+                        },
+                        true,
+                    ));
+                }
+                let slice = discover_codex_sessions_slice_with_clock(
+                    &self.root,
+                    &mut cycle.cursor,
+                    budget,
+                    clock,
+                )
+                .map_err(map_codex_slice_error)?;
+                let current_depth = cycle.processing_depths[cycle.processing_depth_index];
+                let mut summaries = Vec::new();
+                let mut advanced_sources = 0;
+                let mut unchanged_sources = 0;
+                let mut committed_batches = 0;
+                let mut restart_processing = false;
+                for entry in &slice.entries {
+                    let Some(discovered) = DiscoveredSession::from_slice(entry) else {
+                        continue;
+                    };
+                    let identity = opaque_file_identity(&self.domain_key, discovered.identity());
+                    let Some(&work_index) = cycle.identity_to_index.get(&identity) else {
+                        continue;
+                    };
+                    if cycle.processed_indices.contains(&work_index)
+                        || cycle.replay_topology.depths[work_index] != current_depth
+                    {
+                        continue;
+                    }
+                    let (summary, process) = self.process_codex_slice_source(
+                        cycle,
+                        work_index,
+                        &discovered,
+                        control,
+                        &mut committed_batches,
+                    )?;
+                    match process {
+                        Some(SourceProcessOutcome::Advanced) => advanced_sources += 1,
+                        Some(SourceProcessOutcome::Unchanged) => unchanged_sources += 1,
+                        Some(SourceProcessOutcome::Interrupted) => restart_processing = true,
+                        Some(SourceProcessOutcome::CleanupPending) => {
+                            cycle.needs_rescan = true;
+                        }
+                        Some(SourceProcessOutcome::Failed) | None => {}
+                    }
+                    summaries.push(summary);
+                    if restart_processing {
+                        break;
+                    }
+                    cycle.processed_indices.insert(work_index);
+                }
+                if restart_processing {
+                    cycle.cursor = SessionDiscoveryCursor::with_limits(
+                        SessionDiscoveryKind::Codex,
+                        self.discovery_limits,
+                    )
+                    .map_err(CodexScannerError::Discovery)?;
+                }
+
+                let mut complete = false;
+                if slice.outcome == SessionDiscoverySliceOutcome::Complete && !restart_processing {
+                    cycle.processing_depth_index += 1;
+                    if cycle.processing_depth_index == cycle.processing_depths.len() {
+                        complete = true;
+                    } else {
+                        cycle.cursor = SessionDiscoveryCursor::with_limits(
+                            SessionDiscoveryKind::Codex,
+                            self.discovery_limits,
+                        )
+                        .map_err(CodexScannerError::Discovery)?;
+                    }
+                }
+                let outcome = if complete && !cycle.needs_rescan {
+                    ScanOutcome::Complete
+                } else {
+                    ScanOutcome::Interrupted
+                };
+                Ok((
+                    CodexScanSummary {
+                        outcome,
+                        advanced_sources,
+                        unchanged_sources,
+                        deleted_sources: 0,
+                        sources: summaries,
+                        metrics: self.metrics.clone(),
+                    },
+                    complete,
+                ))
+            }
+        }
+    }
+
+    fn process_codex_slice_source(
+        &mut self,
+        cycle: &mut CodexSliceCycle,
+        work_index: usize,
+        discovered_source: &DiscoveredSession,
+        control: ScanControl,
+        committed_batches: &mut usize,
+    ) -> Result<(SourceScanSummary, Option<SourceProcessOutcome>), CodexScannerError> {
+        let source = &cycle.inspected[work_index];
+        let Some(metadata) = source.metadata.as_ref() else {
+            let error = source
+                .inspection_error
+                .as_ref()
+                .expect("failed inspection has an error");
+            let (code, default_status) = match error {
+                SourceInspectionError::RecordTooLarge => (
+                    SessionSourceErrorCode::SourceRecordTooLarge,
+                    SessionSourceStatus::ResourceLimited,
+                ),
+                SourceInspectionError::Read => (
+                    SessionSourceErrorCode::SourceIoFailed,
+                    SessionSourceStatus::Unavailable,
+                ),
+                SourceInspectionError::Parse => (
+                    SessionSourceErrorCode::SourceParseInvalid,
+                    SessionSourceStatus::Unavailable,
+                ),
+            };
+            self.record_source_failure_if_possible(
+                source,
+                discovered_source,
+                code,
+                &cycle.transition_at,
+            )?;
+            let status = self
+                .state
+                .load_session_source(&source.source_key)?
+                .map_or(default_status, |source| source.status);
+            return Ok((
+                SourceScanSummary {
+                    source_key: source.source_key.clone(),
+                    session_key: None,
+                    status,
+                    error_code: Some(code),
+                    replay_resolution: ReplayResolution::NotForked,
+                    complete_byte_offset: 0,
+                },
+                None,
+            ));
+        };
+
+        let singleton = [work_index];
+        let replay_group_indices =
+            metadata
+                .parent_thread_id
+                .as_ref()
+                .map_or(singleton.as_slice(), |parent_thread_id| {
+                    cycle
+                        .replay_groups
+                        .get(&(
+                            cycle.replay_topology.depths[work_index],
+                            parent_thread_id.clone(),
+                        ))
+                        .map_or(singleton.as_slice(), Vec::as_slice)
+                });
+        let replay_result = if let Some(code) = cycle.replay_topology.errors[work_index] {
+            Ok(ReplayState::deferred(code))
+        } else {
+            self.resolve_replay(
+                work_index,
+                metadata,
+                &cycle.inspected,
+                &cycle.thread_sources,
+                replay_group_indices,
+                &mut cycle.replay_cache,
+            )
+        };
+        let replay = match replay_result {
+            Ok(replay) => replay,
+            Err(error) => {
+                let (code, default_status) = match error {
+                    CodexScannerError::Read => (
+                        SessionSourceErrorCode::SourceIoFailed,
+                        SessionSourceStatus::Unavailable,
+                    ),
+                    CodexScannerError::Parse | CodexScannerError::ReplayInconsistent => (
+                        SessionSourceErrorCode::SourceReplayInconsistent,
+                        SessionSourceStatus::Unavailable,
+                    ),
+                    CodexScannerError::RecordTooLarge => (
+                        SessionSourceErrorCode::SourceRecordTooLarge,
+                        SessionSourceStatus::ResourceLimited,
+                    ),
+                    CodexScannerError::ReplayLimit => (
+                        SessionSourceErrorCode::SourceReplayLimit,
+                        SessionSourceStatus::ResourceLimited,
+                    ),
+                    error => return Err(error),
+                };
+                self.record_source_failure_if_possible(
+                    source,
+                    discovered_source,
+                    code,
+                    &cycle.transition_at,
+                )?;
+                let status = self
+                    .state
+                    .load_session_source(&source.source_key)?
+                    .map_or(default_status, |source| source.status);
+                return Ok((
+                    SourceScanSummary {
+                        source_key: source.source_key.clone(),
+                        session_key: Some(session_key(&self.domain_key, &metadata.root_thread_id)),
+                        status,
+                        error_code: Some(code),
+                        replay_resolution: ReplayResolution::Deferred(code),
+                        complete_byte_offset: self
+                            .state
+                            .load_current_session_scan_cursor(&source.source_key)?
+                            .map_or(0, |cursor| cursor.complete_byte_offset),
+                    },
+                    None,
+                ));
+            }
+        };
+        if let ReplayResolution::Deferred(code) = replay.resolution {
+            self.record_source_failure_if_possible(
+                source,
+                discovered_source,
+                code,
+                &cycle.transition_at,
+            )?;
+            let persisted = self.state.load_session_source(&source.source_key)?;
+            let status = persisted.as_ref().map_or_else(
+                || {
+                    if code == SessionSourceErrorCode::SourceReplayLimit {
+                        SessionSourceStatus::ResourceLimited
+                    } else {
+                        SessionSourceStatus::Unavailable
+                    }
+                },
+                |source| source.status,
+            );
+            return Ok((
+                SourceScanSummary {
+                    source_key: source.source_key.clone(),
+                    session_key: Some(session_key(&self.domain_key, &metadata.root_thread_id)),
+                    status,
+                    error_code: Some(code),
+                    replay_resolution: ReplayResolution::Deferred(code),
+                    complete_byte_offset: self
+                        .state
+                        .load_current_session_scan_cursor(&source.source_key)?
+                        .map_or(0, |cursor| cursor.complete_byte_offset),
+                },
+                None,
+            ));
+        }
+
+        let (process, process_error) = match self.process_source(
+            source,
+            discovered_source,
+            metadata,
+            &replay,
+            &cycle.transition_at,
+            control,
+            committed_batches,
+            cycle.referenced_parent_indices.contains(&work_index),
+        ) {
+            Ok(process) => {
+                let code = match process.outcome {
+                    SourceProcessOutcome::Interrupted | SourceProcessOutcome::CleanupPending => {
+                        Some(SessionSourceErrorCode::SourceCandidateInterrupted)
+                    }
+                    _ if process.status == SessionSourceStatus::ResourceLimited => {
+                        Some(SessionSourceErrorCode::SourceReplayLimit)
+                    }
+                    SourceProcessOutcome::Failed => self
+                        .state
+                        .load_session_source(&source.source_key)?
+                        .and_then(|source| source.error_code),
+                    _ => None,
+                };
+                (process, code)
+            }
+            Err(error) => {
+                let (code, default_status, complete_byte_offset) = match error {
+                    CodexScannerError::Read => (
+                        SessionSourceErrorCode::SourceIoFailed,
+                        SessionSourceStatus::Unavailable,
+                        None,
+                    ),
+                    CodexScannerError::Parse => (
+                        SessionSourceErrorCode::SourceParseInvalid,
+                        SessionSourceStatus::Unavailable,
+                        None,
+                    ),
+                    CodexScannerError::ReplayInconsistent => (
+                        SessionSourceErrorCode::SourceReplayInconsistent,
+                        SessionSourceStatus::Unavailable,
+                        Some(0),
+                    ),
+                    CodexScannerError::RecordTooLarge => (
+                        SessionSourceErrorCode::SourceRecordTooLarge,
+                        SessionSourceStatus::ResourceLimited,
+                        None,
+                    ),
+                    CodexScannerError::ReplayLimit => (
+                        SessionSourceErrorCode::SourceReplayLimit,
+                        SessionSourceStatus::ResourceLimited,
+                        None,
+                    ),
+                    CodexScannerError::CleanupPending => (
+                        SessionSourceErrorCode::SourceCandidateInterrupted,
+                        SessionSourceStatus::Unavailable,
+                        None,
+                    ),
+                    error => return Err(error),
+                };
+                self.record_source_failure_if_possible(
+                    source,
+                    discovered_source,
+                    code,
+                    &cycle.transition_at,
+                )?;
+                let status = self
+                    .state
+                    .load_session_source(&source.source_key)?
+                    .map_or(default_status, |source| source.status);
+                let complete_byte_offset = complete_byte_offset.unwrap_or(
+                    self.state
+                        .load_current_session_scan_cursor(&source.source_key)?
+                        .map_or(0, |cursor| cursor.complete_byte_offset),
+                );
+                (
+                    SourceProcessResult {
+                        outcome: if matches!(error, CodexScannerError::CleanupPending) {
+                            SourceProcessOutcome::CleanupPending
+                        } else {
+                            SourceProcessOutcome::Failed
+                        },
+                        status,
+                        complete_byte_offset,
+                    },
+                    Some(code),
+                )
+            }
+        };
+        let outcome = process.outcome;
+        Ok((
+            SourceScanSummary {
+                source_key: source.source_key.clone(),
+                session_key: Some(session_key(&self.domain_key, &metadata.root_thread_id)),
+                status: process.status,
+                error_code: process_error,
+                replay_resolution: if process_error
+                    == Some(SessionSourceErrorCode::SourceReplayInconsistent)
+                {
+                    ReplayResolution::Deferred(SessionSourceErrorCode::SourceReplayInconsistent)
+                } else {
+                    replay.resolution
+                },
+                complete_byte_offset: process.complete_byte_offset,
+            },
+            Some(outcome),
+        ))
     }
 
     pub fn scan(
@@ -607,6 +1096,7 @@ impl CodexScanner {
         transition_at: &str,
         control: ScanControl,
     ) -> Result<CodexScanSummary, CodexScannerError> {
+        self.slice_cycle = None;
         self.metrics = ScannerMetrics::default();
         let discovered = discover_codex_sessions(&self.root, self.discovery_limits)?;
         #[cfg(test)]
@@ -2532,6 +3022,169 @@ struct InspectedSource {
     identity: String,
     metadata: Option<SourceMetadata>,
     inspection_error: Option<SourceInspectionError>,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum CodexScannerSlicePhase {
+    Discovering,
+    Processing,
+}
+
+struct CodexSliceCycle {
+    transition_at: String,
+    phase: CodexScannerSlicePhase,
+    cursor: SessionDiscoveryCursor,
+    persisted_sources: HashSet<String>,
+    persisted_identities: HashMap<String, String>,
+    reserved_keys: HashMap<String, String>,
+    current_sources: HashSet<String>,
+    identity_to_index: HashMap<String, usize>,
+    inspected: Vec<InspectedSource>,
+    thread_sources: HashMap<String, Vec<usize>>,
+    replay_topology: ReplayTopology,
+    replay_groups: HashMap<(usize, String), Vec<usize>>,
+    referenced_parent_indices: HashSet<usize>,
+    processing_depths: Vec<usize>,
+    processing_depth_index: usize,
+    processed_indices: HashSet<usize>,
+    replay_cache: ReplayGroupCache,
+    needs_rescan: bool,
+}
+
+impl CodexSliceCycle {
+    fn new(scanner: &CodexScanner, transition_at: &str) -> Result<Self, CodexScannerError> {
+        Ok(Self {
+            transition_at: transition_at.to_owned(),
+            phase: CodexScannerSlicePhase::Discovering,
+            cursor: SessionDiscoveryCursor::with_limits(
+                SessionDiscoveryKind::Codex,
+                scanner.discovery_limits,
+            )
+            .map_err(CodexScannerError::Discovery)?,
+            persisted_sources: scanner.persisted_codex_source_keys()?,
+            persisted_identities: scanner.persisted_identity_sources()?,
+            reserved_keys: HashMap::new(),
+            current_sources: HashSet::new(),
+            identity_to_index: HashMap::new(),
+            inspected: Vec::new(),
+            thread_sources: HashMap::new(),
+            replay_topology: ReplayTopology {
+                depths: Vec::new(),
+                errors: Vec::new(),
+            },
+            replay_groups: HashMap::new(),
+            referenced_parent_indices: HashSet::new(),
+            processing_depths: Vec::new(),
+            processing_depth_index: 0,
+            processed_indices: HashSet::new(),
+            replay_cache: ReplayGroupCache::default(),
+            needs_rescan: false,
+        })
+    }
+
+    fn observe(
+        &mut self,
+        scanner: &mut CodexScanner,
+        source: &DiscoveredSession,
+    ) -> Result<(), CodexScannerError> {
+        let identity = opaque_file_identity(&scanner.domain_key, source.identity());
+        if self.identity_to_index.contains_key(&identity) {
+            return Ok(());
+        }
+        let source_key = if let Some(source_key) = self.persisted_identities.get(&identity) {
+            source_key.clone()
+        } else {
+            let path_key = scanner.path_source_key(source);
+            if !self.reserved_keys.contains_key(&path_key) {
+                path_key
+            } else {
+                let mut counter = 0u64;
+                loop {
+                    let candidate = scanner.collision_source_key(source, &identity, counter);
+                    if !self.reserved_keys.contains_key(&candidate)
+                        && !self.persisted_sources.contains(&candidate)
+                    {
+                        break candidate;
+                    }
+                    counter = counter.checked_add(1).ok_or(CodexScannerError::Parse)?;
+                }
+            }
+        };
+        if self
+            .reserved_keys
+            .insert(source_key.clone(), identity.clone())
+            .is_some_and(|existing| existing != identity)
+        {
+            return Err(StorageError::StableRecordConflict {
+                record_kind: "Session source key",
+            }
+            .into());
+        }
+        let (metadata, inspection_error) = match scanner.inspect_source(source) {
+            Ok(metadata) => (Some(metadata), None),
+            Err(error) => (None, Some(error)),
+        };
+        let index = self.inspected.len();
+        self.inspected.push(InspectedSource {
+            discovered_index: 0,
+            source_key: source_key.clone(),
+            identity: identity.clone(),
+            metadata,
+            inspection_error,
+        });
+        self.current_sources.insert(source_key);
+        self.identity_to_index.insert(identity, index);
+        Ok(())
+    }
+
+    fn prepare_processing(&mut self) {
+        self.thread_sources.clear();
+        for (index, source) in self.inspected.iter().enumerate() {
+            if let Some(metadata) = &source.metadata {
+                self.thread_sources
+                    .entry(metadata.root_thread_id.clone())
+                    .or_default()
+                    .push(index);
+            }
+        }
+        self.replay_topology = ReplayTopology::build(&self.inspected, &self.thread_sources);
+        self.referenced_parent_indices = self
+            .inspected
+            .iter()
+            .filter_map(|source| source.metadata.as_ref()?.parent_thread_id.as_ref())
+            .filter_map(|parent_id| self.thread_sources.get(parent_id))
+            .flatten()
+            .copied()
+            .collect();
+        self.processing_depths = self.replay_topology.depths.clone();
+        self.processing_depths.sort_unstable();
+        self.processing_depths.dedup();
+        self.replay_groups.clear();
+        for (index, source) in self.inspected.iter().enumerate() {
+            let Some(parent_thread_id) = source
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.parent_thread_id.as_ref())
+            else {
+                continue;
+            };
+            self.replay_groups
+                .entry((self.replay_topology.depths[index], parent_thread_id.clone()))
+                .or_default()
+                .push(index);
+        }
+        self.phase = CodexScannerSlicePhase::Processing;
+        self.processing_depth_index = 0;
+    }
+}
+
+fn map_codex_slice_error(error: SessionDiscoverySliceError) -> CodexScannerError {
+    match error {
+        SessionDiscoverySliceError::Discovery(error) => CodexScannerError::Discovery(error),
+        SessionDiscoverySliceError::CursorKindMismatch => {
+            CodexScannerError::Discovery(DiscoveryError::Unsafe)
+        }
+    }
 }
 
 #[derive(Clone)]

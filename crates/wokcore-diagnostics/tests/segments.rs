@@ -20,10 +20,10 @@ use wokcore_diagnostics::{
     retention::{RetentionManager, RetentionPolicy, RetentionTrigger},
     ring::{MAX_PAGE_BYTES, PageDirection, PageRequest},
     segment::{
-        BatchLimit, BatchPushError, DURABLE_QUEUE_CAPACITY, DiagnosticDropCause,
-        DropRecoveryTracker, DurableBatch, DurableEventKind, DurableFilter, DurableProcessError,
-        DurableProcessOutcome, DurableProducer, DurableRecordOutcome, FlushOutcome,
-        MAX_BATCH_EVENT_BYTES, MAX_BATCH_EVENTS, SegmentWriter,
+        BatchLimit, BatchPushError, BoxedDurableWriterOwner, DURABLE_QUEUE_CAPACITY,
+        DiagnosticDropCause, DropRecoveryTracker, DurableBatch, DurableEventKind, DurableFilter,
+        DurableProcessError, DurableProcessOutcome, DurableProducer, DurableRecordOutcome,
+        DurableWorkOutcome, FlushOutcome, MAX_BATCH_EVENT_BYTES, MAX_BATCH_EVENTS, SegmentWriter,
     },
     snapshot::{
         FailureSnapshot, MAX_FAILURE_SNAPSHOT_BYTES, MAX_FAILURE_SNAPSHOTS,
@@ -129,6 +129,69 @@ async fn prepared_many(count: usize) -> Vec<wokcore_diagnostics::event::Prepared
     owner_task.abort();
     assert_eq!(events.len(), count);
     events
+}
+
+#[tokio::test]
+async fn partial_flush_window_coalesces_spaced_durable_events() {
+    let directory = tempdir().unwrap();
+    let events = prepared_many(3).await;
+    let (producer, mut owner) = DurableProducer::new(directory.path(), |_| Ok::<_, ()>(()));
+    assert_eq!(
+        producer.try_record(events[0].clone()),
+        DurableRecordOutcome::Accepted
+    );
+    let delayed = producer.clone();
+    let sender = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            delayed.try_record(events[1].clone()),
+            DurableRecordOutcome::Accepted
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            delayed.try_record(events[2].clone()),
+            DurableRecordOutcome::Accepted
+        );
+    });
+
+    let outcome = owner
+        .wait_process_next_batched(Duration::from_millis(100))
+        .await
+        .unwrap();
+    sender.await.unwrap();
+
+    assert_eq!(
+        outcome,
+        DurableWorkOutcome::Written {
+            events: 3,
+            rotations: 0
+        }
+    );
+}
+
+#[tokio::test]
+async fn full_durable_batch_flushes_before_the_partial_deadline() {
+    let directory = tempdir().unwrap();
+    let events = prepared_many(MAX_BATCH_EVENTS).await;
+    let (producer, mut owner) = DurableProducer::new(directory.path(), |_| Ok::<_, ()>(()));
+    for event in events {
+        assert_eq!(producer.try_record(event), DurableRecordOutcome::Accepted);
+    }
+    let started = tokio::time::Instant::now();
+
+    let outcome = owner
+        .wait_process_next_batched(Duration::from_secs(5))
+        .await
+        .unwrap();
+
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert_eq!(
+        outcome,
+        DurableWorkOutcome::Written {
+            events: MAX_BATCH_EVENTS,
+            rotations: 0
+        }
+    );
 }
 
 async fn prepared_debug(identity: u64) -> wokcore_diagnostics::event::PreparedDiagnosticEvent {
@@ -1177,6 +1240,76 @@ async fn durable_producer_filters_before_exact_nonblocking_queue_and_persists_on
 }
 
 #[tokio::test]
+async fn bounded_drop_requests_deliver_once_and_close_without_a_recorder_reference() {
+    let directory = tempdir().unwrap();
+    let root = directory.path().join("bounded-drop-requests");
+    fs::create_dir(&root).unwrap();
+    let events = prepared_many(DURABLE_QUEUE_CAPACITY).await;
+    let (producer, mut owner, mut requests): (_, BoxedDurableWriterOwner, _) =
+        DurableProducer::with_drop_requests(&root);
+
+    for event in events.iter().cloned() {
+        assert_eq!(producer.try_record(event), DurableRecordOutcome::Accepted);
+    }
+    assert_eq!(
+        producer.try_record(events[0].clone()),
+        DurableRecordOutcome::DroppedFull
+    );
+
+    loop {
+        match owner.try_process_next().unwrap() {
+            DurableProcessOutcome::DropSummaryRequested => break,
+            DurableProcessOutcome::Written { .. } => {}
+            DurableProcessOutcome::Idle => panic!("drop summary was not requested"),
+        }
+    }
+    let request = requests.recv().await.unwrap();
+    let summary = request.summary();
+    assert_eq!(summary.ingress_full(), 1);
+    assert_eq!(summary.total(), 1);
+    request.acknowledge();
+
+    drop(owner);
+    assert!(requests.recv().await.is_none());
+}
+
+#[tokio::test]
+async fn unacknowledged_drop_request_restores_counts_for_retry() {
+    let directory = tempdir().unwrap();
+    let root = directory.path().join("retry-unacknowledged-drop-request");
+    fs::create_dir(&root).unwrap();
+    let events = prepared_many(DURABLE_QUEUE_CAPACITY).await;
+    let (producer, mut owner, mut requests) = DurableProducer::with_drop_requests(&root);
+
+    for event in events.iter().cloned() {
+        assert_eq!(producer.try_record(event), DurableRecordOutcome::Accepted);
+    }
+    assert_eq!(
+        producer.try_record(events[0].clone()),
+        DurableRecordOutcome::DroppedFull
+    );
+    loop {
+        match owner.try_process_next().unwrap() {
+            DurableProcessOutcome::DropSummaryRequested => break,
+            DurableProcessOutcome::Written { .. } => {}
+            DurableProcessOutcome::Idle => panic!("drop summary was not requested"),
+        }
+    }
+    {
+        let request = requests.recv().await.unwrap();
+        assert_eq!(request.summary().ingress_full(), 1);
+    }
+
+    assert_eq!(
+        owner.try_process_next().unwrap(),
+        DurableProcessOutcome::DropSummaryRequested
+    );
+    let request = requests.recv().await.unwrap();
+    assert_eq!(request.summary().ingress_full(), 1);
+    request.acknowledge();
+}
+
+#[tokio::test]
 async fn delayed_drop_summary_does_not_duplicate_requests_and_full_restores_all_counts() {
     let directory = tempdir().unwrap();
     let root = directory.path().join("drop-inflight");
@@ -1488,6 +1621,110 @@ async fn durable_startup_runs_without_events_and_failure_does_not_consume_queue(
     ));
     let bytes = fs::read(missing_root.join("segment-00000000000000000001.jsonl")).unwrap();
     assert!(bytes.starts_with(event.encoded()));
+}
+
+#[tokio::test]
+async fn durable_wait_sleeps_without_writes_and_reports_closed_after_draining() {
+    let directory = tempdir().unwrap();
+    let root = directory.path().join("awaitable-durable-work");
+    fs::create_dir(&root).unwrap();
+    let (producer, mut owner) = DurableProducer::new(&root, |_| Ok::<_, ()>(()));
+    owner.recover_startup(std::time::SystemTime::now()).unwrap();
+    let active = root.join("segment-00000000000000000001.jsonl");
+    let before_bytes = fs::read(&active).unwrap();
+    let before_modified = fs::metadata(&active).unwrap().modified().unwrap();
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), owner.wait_process_next())
+            .await
+            .is_err(),
+        "an idle durable owner returned instead of waiting for work"
+    );
+    assert_eq!(fs::read(&active).unwrap(), before_bytes);
+    assert_eq!(
+        fs::metadata(&active).unwrap().modified().unwrap(),
+        before_modified
+    );
+
+    let event = prepared_many(1).await.remove(0);
+    assert_eq!(producer.try_record(event), DurableRecordOutcome::Accepted);
+    assert!(matches!(
+        owner.wait_process_next().await.unwrap(),
+        DurableWorkOutcome::Written { events: 1, .. }
+    ));
+
+    drop(producer);
+    assert_eq!(
+        owner.wait_process_next().await.unwrap(),
+        DurableWorkOutcome::Closed
+    );
+}
+
+#[tokio::test]
+async fn explicit_snapshot_shutdown_drains_requests_while_senders_remain_alive() {
+    let directory = tempdir().unwrap();
+    let root = directory.path().join("graceful-snapshot-shutdown");
+    fs::create_dir(&root).unwrap();
+    let events = prepared_many(3).await;
+    let (recorder, owner) = SnapshotRecorder::new(&root);
+    let metrics = recorder.metrics();
+    let shutdown = owner.shutdown_handle();
+
+    for (identity, event) in events[..2].iter().cloned().enumerate() {
+        assert_eq!(
+            recorder.try_request(SnapshotRequest::new(
+                SnapshotCause::InternalFailure,
+                SnapshotCorrelation::from_u128(identity as u128 + 1),
+                event,
+                30_000 + u64::try_from(identity).unwrap() * 60,
+            )),
+            SnapshotRequestOutcome::Accepted
+        );
+    }
+    let owner_task = tokio::spawn(owner.run());
+    shutdown.request();
+
+    tokio::time::timeout(Duration::from_secs(1), owner_task)
+        .await
+        .expect("snapshot owner did not stop while producer handles remained")
+        .unwrap();
+    assert_eq!(metrics.written(), 2);
+    assert_eq!(
+        recorder.try_request(SnapshotRequest::new(
+            SnapshotCause::InternalFailure,
+            SnapshotCorrelation::from_u128(3),
+            events[2].clone(),
+            30_120,
+        )),
+        SnapshotRequestOutcome::DroppedClosed
+    );
+}
+
+#[tokio::test]
+async fn explicit_snapshot_shutdown_rejects_new_work_before_owner_poll() {
+    let directory = tempdir().unwrap();
+    let root = directory.path().join("snapshot-stop-before-poll");
+    fs::create_dir(&root).unwrap();
+    let event = prepared_many(1).await.remove(0);
+    let (recorder, owner) = SnapshotRecorder::new(&root);
+    let shutdown = owner.shutdown_handle();
+
+    shutdown.request();
+
+    assert_eq!(
+        recorder.try_request(SnapshotRequest::new(
+            SnapshotCause::InternalFailure,
+            SnapshotCorrelation::from_u128(1),
+            event,
+            31_000,
+        )),
+        SnapshotRequestOutcome::DroppedClosed
+    );
+    tokio::time::timeout(Duration::from_secs(1), owner.run())
+        .await
+        .unwrap();
+    assert_eq!(recorder.metrics().queue_closed(), 1);
+    assert!(!root.join("snapshot-00000000000000000001.jsonl").exists());
 }
 
 #[tokio::test]

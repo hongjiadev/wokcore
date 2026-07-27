@@ -12,6 +12,7 @@ use wokcore_sessions::{
         CodexScanner, CodexStructuralRecord, ScanControl, ScanOutcome, SourceScanSummary,
         normalize_model, parse_codex_record, parse_timestamp_utc,
     },
+    discovery::SessionDiscoverySliceBudget,
     model::{ReplayResolution, TokenTotals},
 };
 use wokcore_storage::{
@@ -91,6 +92,59 @@ fn scanner(root: &TempDir, state: &TempDir) -> CodexScanner {
         TEST_DOMAIN_KEY,
     )
     .unwrap()
+}
+
+#[test]
+fn slice_scanner_reuses_cycle_and_processes_fork_topology_without_path_retention() {
+    let root = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    for (relative, bytes) in [
+        (
+            "sessions/2026/07/26/basic.jsonl",
+            include_bytes!("fixtures/codex/basic.jsonl").as_slice(),
+        ),
+        (
+            "sessions/2026/07/26/fork-parent.jsonl",
+            include_bytes!("fixtures/codex/fork-parent.jsonl").as_slice(),
+        ),
+        (
+            "sessions/2026/07/26/fork-child.jsonl",
+            include_bytes!("fixtures/codex/fork-child.jsonl").as_slice(),
+        ),
+    ] {
+        let path = root.path().join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
+    }
+    let mut scanner = scanner(&root, &state);
+    let mut sources = Vec::new();
+    let mut completed = false;
+
+    for _ in 0..32 {
+        let summary = scanner
+            .scan_slice(
+                NOW,
+                ScanControl::default(),
+                SessionDiscoverySliceBudget::default(),
+            )
+            .unwrap();
+        sources.extend(summary.sources);
+        if summary.outcome == ScanOutcome::Complete {
+            completed = true;
+            break;
+        }
+    }
+
+    assert!(completed);
+    assert_eq!(sources.len(), 3);
+    let child = sources
+        .iter()
+        .find(|source| is_session(source, "fixture-child"))
+        .unwrap();
+    assert!(matches!(
+        child.replay_resolution,
+        ReplayResolution::Resolved { .. }
+    ));
 }
 
 fn expected_session_key(thread_id: &str) -> String {

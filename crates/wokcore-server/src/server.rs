@@ -10,6 +10,7 @@ use crate::{
     api::build_router,
     auth::{AuthRegistry, EntropySource, OsEntropy},
     lifecycle::ServiceLifecycle,
+    observability::{DiagnosticWriterHandle, SchedulerHandle, StateWriterHandle},
     runtime::{SystemTokenMetadata, TokenMetadataSource},
 };
 
@@ -21,7 +22,11 @@ pub struct ServerState {
     pub(crate) lifecycle: ServiceLifecycle,
     pub(crate) token_metadata: Arc<dyn TokenMetadataSource>,
     pub(crate) request_id_entropy: Arc<dyn EntropySource>,
+    pub(crate) scheduler: Option<SchedulerHandle>,
+    pub(crate) diagnostics: Option<DiagnosticWriterHandle>,
+    pub(crate) state_writer: Option<StateWriterHandle>,
     shutdown: watch::Sender<bool>,
+    coordinated_shutdown: bool,
 }
 
 impl ServerState {
@@ -74,8 +79,33 @@ impl ServerState {
             lifecycle,
             token_metadata,
             request_id_entropy,
+            scheduler: None,
+            diagnostics: None,
+            state_writer: None,
             shutdown,
+            coordinated_shutdown: false,
         }
+    }
+
+    pub fn with_scheduler(mut self, scheduler: SchedulerHandle) -> Self {
+        self.scheduler = Some(scheduler);
+        self
+    }
+
+    pub fn with_diagnostics(mut self, diagnostics: DiagnosticWriterHandle) -> Self {
+        self.diagnostics = Some(diagnostics);
+        self
+    }
+
+    pub fn with_state_writer(mut self, state_writer: StateWriterHandle) -> Self {
+        self.state_writer = Some(state_writer);
+        self
+    }
+
+    pub fn with_coordinated_shutdown(mut self) -> (Self, watch::Receiver<bool>) {
+        self.coordinated_shutdown = true;
+        let requests = self.shutdown.subscribe();
+        (self, requests)
     }
 
     pub(crate) fn request_shutdown(&self) {
@@ -113,18 +143,30 @@ impl RunningServer {
         if state.authority.as_ref() != local_addr.to_string() {
             return Err(ServerError::AuthorityMismatch);
         }
-        let mut shutdown = state.shutdown_receiver();
-        let owner_shutdown = state.shutdown.clone();
+        let auto_shutdown_on_request = !state.coordinated_shutdown;
+        let mut requested_shutdown = state.shutdown_receiver();
+        let (owner_shutdown, mut listener_shutdown) = watch::channel(false);
         let app = build_router(state);
         let task = tokio::spawn(async move {
             axum::serve(listener, app)
                 .with_graceful_shutdown(async move {
                     loop {
-                        if *shutdown.borrow_and_update() {
+                        if *listener_shutdown.borrow_and_update()
+                            || (auto_shutdown_on_request && *requested_shutdown.borrow_and_update())
+                        {
                             return;
                         }
-                        if shutdown.changed().await.is_err() {
-                            return;
+                        tokio::select! {
+                            changed = listener_shutdown.changed() => {
+                                if changed.is_err() {
+                                    return;
+                                }
+                            }
+                            changed = requested_shutdown.changed(), if auto_shutdown_on_request => {
+                                if changed.is_err() {
+                                    return;
+                                }
+                            }
                         }
                     }
                 })

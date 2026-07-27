@@ -15,6 +15,7 @@ arc-swap.workspace = true
 axum.workspace = true
 base64.workspace = true
 getrandom.workspace = true
+notify.workspace = true
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -25,9 +26,13 @@ tokio.workspace = true
 uuid.workspace = true
 zeroize.workspace = true
 wokcore-core = { version = "0.1.0", path = "../wokcore-core" }
+wokcore-diagnostics = { version = "0.1.0", path = "../wokcore-diagnostics" }
+wokcore-platform = { version = "0.1.0", path = "../wokcore-platform" }
 wokcore-protocols = { version = "0.1.0", path = "../wokcore-protocols" }
+wokcore-sessions = { version = "0.1.0", path = "../wokcore-sessions" }
 wokcore-storage = { version = "0.1.0", path = "../wokcore-storage" }
 
 [dev-dependencies]
 async-trait.workspace = true
+tempfile.workspace = true
 tower.workspace = true

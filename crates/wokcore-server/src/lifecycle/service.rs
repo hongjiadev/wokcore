@@ -140,6 +140,14 @@ impl ServiceLifecycle {
         }
     }
 
+    pub fn activity_revision(&self) -> u64 {
+        self.state.shared.activity_revision()
+    }
+
+    pub fn has_been_idle_for(&self, duration: Duration) -> bool {
+        self.state.shared.has_been_idle_for(duration)
+    }
+
     pub fn mark_running(&self) -> Result<LifecycleSnapshot, LifecycleError> {
         let mut transition = self.lock_transition()?;
         if transition.phase != LifecyclePhase::Starting {

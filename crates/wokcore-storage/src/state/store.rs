@@ -1055,6 +1055,34 @@ impl StateStore {
         }
     }
 
+    pub fn open_live_reader(path: impl AsRef<Path>) -> Result<Self, StorageError> {
+        let path = path
+            .as_ref()
+            .canonicalize()
+            .map_err(|source| StorageError::Io { source })?;
+        let connection = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(map_database_error)?;
+        connection
+            .execute_batch(
+                "PRAGMA busy_timeout = 5000;\
+                 PRAGMA foreign_keys = ON;\
+                 PRAGMA query_only = ON;",
+            )
+            .map_err(map_database_error)?;
+        if schema_versions(&connection)? != [1, 2, LATEST_SCHEMA_VERSION] {
+            return Err(StorageError::StateDatabaseCorrupt {
+                message: "state database has an incompatible migration history".to_owned(),
+            });
+        }
+        Ok(Self {
+            connection,
+            database_path: path,
+        })
+    }
+
     fn open_locked(path: &Path) -> Result<Self, StorageError> {
         let mut connection = Connection::open(path).map_err(map_database_error)?;
         connection

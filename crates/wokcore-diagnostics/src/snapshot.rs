@@ -4,13 +4,13 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use wokcore_platform::diagnostics::{DiagnosticDirectory, DiagnosticEntry, DiagnosticStoreError};
 
 use crate::event::PreparedDiagnosticEvent;
@@ -421,6 +421,7 @@ pub struct SnapshotRecorder {
     sender: mpsc::Sender<SnapshotRequest>,
     metrics: SnapshotMetrics,
     pending_suppressions: Arc<SnapshotMetricAtoms>,
+    shutdown: Arc<SnapshotShutdownState>,
 }
 
 impl SnapshotRecorder {
@@ -432,11 +433,13 @@ impl SnapshotRecorder {
         let (sender, receiver) = mpsc::channel(SNAPSHOT_QUEUE_CAPACITY);
         let metrics = SnapshotMetrics::default();
         let pending_suppressions = Arc::new(SnapshotMetricAtoms::default());
+        let shutdown = Arc::new(SnapshotShutdownState::default());
         (
             Self {
                 sender,
                 metrics: metrics.clone(),
                 pending_suppressions: Arc::clone(&pending_suppressions),
+                shutdown: Arc::clone(&shutdown),
             },
             SnapshotOwner {
                 receiver,
@@ -449,6 +452,7 @@ impl SnapshotRecorder {
                 budget_clock: 0,
                 budget_buckets: Vec::with_capacity(60),
                 next_snapshot: 1,
+                shutdown,
                 #[cfg(test)]
                 fail_completed_after_commit: false,
             },
@@ -456,6 +460,11 @@ impl SnapshotRecorder {
     }
 
     pub fn try_request(&self, request: SnapshotRequest) -> SnapshotRequestOutcome {
+        if self.shutdown.requested.load(Ordering::Acquire) {
+            saturating_increment(&self.metrics.atoms.queue_closed);
+            saturating_increment(&self.pending_suppressions.queue_closed);
+            return SnapshotRequestOutcome::DroppedClosed;
+        }
         match self.sender.try_send(request) {
             Ok(()) => SnapshotRequestOutcome::Accepted,
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -517,11 +526,42 @@ pub struct SnapshotOwner {
     budget_clock: u64,
     budget_buckets: Vec<(u64, usize)>,
     next_snapshot: u64,
+    shutdown: Arc<SnapshotShutdownState>,
     #[cfg(test)]
     fail_completed_after_commit: bool,
 }
 
+#[derive(Default)]
+struct SnapshotShutdownState {
+    requested: AtomicBool,
+    wake: Notify,
+}
+
+#[derive(Clone)]
+pub struct SnapshotShutdown {
+    state: Arc<SnapshotShutdownState>,
+}
+
+impl SnapshotShutdown {
+    pub fn request(&self) {
+        self.state.requested.store(true, Ordering::Release);
+        self.state.wake.notify_one();
+    }
+}
+
+impl fmt::Debug for SnapshotShutdown {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SnapshotShutdown([redacted])")
+    }
+}
+
 impl SnapshotOwner {
+    pub fn shutdown_handle(&self) -> SnapshotShutdown {
+        SnapshotShutdown {
+            state: Arc::clone(&self.shutdown),
+        }
+    }
+
     pub fn drain_suppression_summary(&self) -> Option<SnapshotSuppressionSummary> {
         let summary = SnapshotSuppressionSummary {
             queue_full: self
@@ -559,8 +599,22 @@ impl SnapshotOwner {
     }
 
     pub async fn run(mut self) {
-        while let Some(request) = self.receiver.recv().await {
-            let _ = self.process(request);
+        let mut stopping = false;
+        loop {
+            if !stopping && self.shutdown.requested.load(Ordering::Acquire) {
+                self.receiver.close();
+                stopping = true;
+            }
+            tokio::select! {
+                biased;
+                request = self.receiver.recv() => {
+                    let Some(request) = request else {
+                        return;
+                    };
+                    let _ = self.process(request);
+                }
+                () = self.shutdown.wake.notified(), if !stopping => {}
+            }
         }
     }
 

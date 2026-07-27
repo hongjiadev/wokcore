@@ -1,5 +1,6 @@
 use std::{
     ffi::{OsStr, OsString},
+    fmt,
     fs::File,
     io::{Read, Seek, SeekFrom},
     path::{Component, Path, PathBuf},
@@ -123,6 +124,34 @@ impl SessionDirectoryLease {
         after: Option<&OsStr>,
         maximum_entries: usize,
     ) -> Result<(Vec<SessionDirectoryEntry>, bool), SessionError> {
+        self.entries_page_inner(after, maximum_entries)
+    }
+
+    pub fn entries_page_keyed(
+        &self,
+        after: Option<&SessionDirectoryPageKey>,
+        maximum_entries: usize,
+    ) -> Result<SessionDirectoryPage, SessionError> {
+        let (entries, has_more) =
+            self.entries_page_inner(after.map(|key| key.name.as_os_str()), maximum_entries)?;
+        let next_page_key = has_more.then(|| SessionDirectoryPageKey {
+            name: entries
+                .last()
+                .expect("a directory page with more entries is not empty")
+                .name
+                .clone(),
+        });
+        Ok(SessionDirectoryPage {
+            entries,
+            next_page_key,
+        })
+    }
+
+    fn entries_page_inner(
+        &self,
+        after: Option<&OsStr>,
+        maximum_entries: usize,
+    ) -> Result<(Vec<SessionDirectoryEntry>, bool), SessionError> {
         if maximum_entries == 0 {
             return Err(SessionError::EnumerationLimitExceeded);
         }
@@ -192,6 +221,37 @@ impl SessionDirectoryLease {
     }
 }
 
+#[derive(Clone, Eq, PartialEq)]
+pub struct SessionDirectoryPageKey {
+    name: OsString,
+}
+
+impl fmt::Debug for SessionDirectoryPageKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SessionDirectoryPageKey([redacted])")
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionDirectoryPage {
+    entries: Vec<SessionDirectoryEntry>,
+    next_page_key: Option<SessionDirectoryPageKey>,
+}
+
+impl SessionDirectoryPage {
+    pub fn entries(&self) -> &[SessionDirectoryEntry] {
+        &self.entries
+    }
+
+    pub fn next_page_key(&self) -> Option<&SessionDirectoryPageKey> {
+        self.next_page_key.as_ref()
+    }
+
+    pub fn into_parts(self) -> (Vec<SessionDirectoryEntry>, Option<SessionDirectoryPageKey>) {
+        (self.entries, self.next_page_key)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionDirectoryEntry {
     name: OsString,
@@ -199,6 +259,12 @@ pub struct SessionDirectoryEntry {
 }
 
 impl SessionDirectoryEntry {
+    pub fn resume_key(&self) -> SessionDirectoryPageKey {
+        SessionDirectoryPageKey {
+            name: self.name.clone(),
+        }
+    }
+
     pub fn name(&self) -> &OsStr {
         &self.name
     }

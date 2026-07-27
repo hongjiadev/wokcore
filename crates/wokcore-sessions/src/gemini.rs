@@ -21,12 +21,17 @@ use wokcore_storage::{
     SessionAvailability, SessionBatch, SessionFileIdentity, SessionGenerationState,
     SessionIndexRecord, SessionScanCursor, SessionScanResultCode, SessionSourceErrorCode,
     SessionSourceKind, SessionSourcePageKey, SessionSourceStatus, SessionUsageRecord, StateStore,
-    StorageError,
+    StateStoreWriterClient, StorageError,
 };
 
 use crate::{
     cursor::{JsonlCursor, JsonlError, JsonlReader, JsonlRecordStatus},
-    discovery::DiscoveryLimits,
+    discovery::{
+        DiscoveryLimits, SessionDiscoveryClock, SessionDiscoveryCursor, SessionDiscoveryEntry,
+        SessionDiscoveryKind, SessionDiscoverySliceBudget, SessionDiscoverySliceError,
+        SessionDiscoverySliceOutcome, SessionDiscoverySourceFormat, SystemSessionDiscoveryClock,
+        discover_gemini_sessions_slice_with_clock,
+    },
     model::{
         ExternalSessionTitle, MAX_ACTIVE_MESSAGES, OpaqueStreamHash, SESSION_BATCH_ROW_TARGET,
         SessionScanControl, SessionScanOutcome, SessionScanSummary, SessionScannerMetrics,
@@ -34,6 +39,7 @@ use crate::{
         normalize_external_id, normalize_external_model, normalize_timestamp, opaque_hash,
         opaque_hex, opaque_platform_identity, system_time_utc,
     },
+    state::SessionState,
 };
 
 pub const MAX_LEGACY_JSON_PARSER_BYTES: usize = 256 * 1024;
@@ -102,6 +108,19 @@ pub(crate) struct DiscoveredGeminiSession {
 }
 
 impl DiscoveredGeminiSession {
+    fn from_slice(entry: &SessionDiscoveryEntry) -> Option<Self> {
+        let format = match entry.format() {
+            SessionDiscoverySourceFormat::GeminiCurrentJsonl => GeminiFormat::CurrentJsonl,
+            SessionDiscoverySourceFormat::GeminiLegacyJson => GeminiFormat::LegacyJson,
+            _ => return None,
+        };
+        Some(Self {
+            relative_path: entry.relative_path().to_path_buf(),
+            identity: entry.identity(),
+            format,
+        })
+    }
+
     pub(crate) fn open(&self, root: &SessionRootLease) -> Result<SessionFile, SessionError> {
         let maximum_size = match self.format {
             GeminiFormat::CurrentJsonl => MAX_GEMINI_CURRENT_JSONL_SOURCE_BYTES,
@@ -130,6 +149,105 @@ impl fmt::Debug for DiscoveredGeminiSession {
             .field("identity", &self.identity)
             .field("format", &self.format)
             .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum GeminiScannerSlicePhase {
+    Discovering,
+    Processing,
+}
+
+struct GeminiSliceCycle {
+    transition_at: String,
+    phase: GeminiScannerSlicePhase,
+    cursor: SessionDiscoveryCursor,
+    persisted_sources: HashSet<String>,
+    persisted_identities: HashMap<String, String>,
+    reserved_keys: HashMap<String, String>,
+    source_keys_by_identity: HashMap<String, String>,
+    current_sources: HashSet<String>,
+    processed_identities: HashSet<String>,
+}
+
+impl GeminiSliceCycle {
+    fn new(scanner: &GeminiScanner, transition_at: &str) -> Result<Self, GeminiScannerError> {
+        Ok(Self {
+            transition_at: transition_at.to_owned(),
+            phase: GeminiScannerSlicePhase::Discovering,
+            cursor: SessionDiscoveryCursor::with_limits(
+                SessionDiscoveryKind::Gemini,
+                scanner.discovery_limits,
+            )
+            .map_err(|_| GeminiScannerError::ResourceLimit)?,
+            persisted_sources: scanner.persisted_sources()?,
+            persisted_identities: scanner.persisted_identity_sources()?,
+            reserved_keys: HashMap::new(),
+            source_keys_by_identity: HashMap::new(),
+            current_sources: HashSet::new(),
+            processed_identities: HashSet::new(),
+        })
+    }
+
+    fn observe(
+        &mut self,
+        scanner: &GeminiScanner,
+        source: &DiscoveredGeminiSession,
+    ) -> Result<(), GeminiScannerError> {
+        let identity = scanner.file_identity(source).as_str().to_owned();
+        if self.source_keys_by_identity.contains_key(&identity) {
+            return Ok(());
+        }
+        let source_key = if let Some(source_key) = self.persisted_identities.get(&identity) {
+            source_key.clone()
+        } else {
+            let path_key = scanner.source_key(source);
+            if !self.reserved_keys.contains_key(&path_key) {
+                path_key
+            } else {
+                let mut counter = 0u64;
+                loop {
+                    let candidate = opaque_hex(
+                        &scanner.domain_key,
+                        b"wokcore.gemini.source-collision.v1",
+                        &[
+                            &path_bytes(&canonical_relative_path(&source.relative_path)),
+                            identity.as_bytes(),
+                            &counter.to_be_bytes(),
+                        ],
+                    );
+                    if !self.reserved_keys.contains_key(&candidate)
+                        && !self.persisted_sources.contains(&candidate)
+                    {
+                        break candidate;
+                    }
+                    counter = counter.checked_add(1).ok_or(GeminiScannerError::Parse)?;
+                }
+            }
+        };
+        if self
+            .reserved_keys
+            .insert(source_key.clone(), identity.clone())
+            .is_some_and(|existing| existing != identity)
+        {
+            return Err(StorageError::StableRecordConflict {
+                record_kind: "Session source key",
+            }
+            .into());
+        }
+        self.current_sources.insert(source_key.clone());
+        self.source_keys_by_identity.insert(identity, source_key);
+        Ok(())
+    }
+}
+
+fn map_gemini_slice_error(error: SessionDiscoverySliceError) -> GeminiScannerError {
+    match error {
+        SessionDiscoverySliceError::Discovery(crate::discovery::DiscoveryError::Limit) => {
+            GeminiScannerError::ResourceLimit
+        }
+        SessionDiscoverySliceError::CursorKindMismatch
+        | SessionDiscoverySliceError::Discovery(_) => GeminiScannerError::Discovery,
     }
 }
 
@@ -181,10 +299,11 @@ impl GeminiAggregate {
 
 pub struct GeminiScanner {
     root: SessionRootLease,
-    state: StateStore,
+    state: SessionState,
     domain_key: [u8; 32],
     discovery_limits: DiscoveryLimits,
     metrics: SessionScannerMetrics,
+    slice_cycle: Option<GeminiSliceCycle>,
 }
 
 impl GeminiScanner {
@@ -193,19 +312,284 @@ impl GeminiScanner {
         state_path: impl AsRef<Path>,
         domain_key: [u8; 32],
     ) -> Result<Self, GeminiScannerError> {
+        Self::open_internal(root_path, state_path, domain_key, None)
+    }
+
+    pub fn open_with_writer(
+        root_path: impl AsRef<Path>,
+        state_path: impl AsRef<Path>,
+        domain_key: [u8; 32],
+        writer: StateStoreWriterClient,
+    ) -> Result<Self, GeminiScannerError> {
+        Self::open_internal(root_path, state_path, domain_key, Some(writer))
+    }
+
+    fn open_internal(
+        root_path: impl AsRef<Path>,
+        state_path: impl AsRef<Path>,
+        domain_key: [u8; 32],
+        writer: Option<StateStoreWriterClient>,
+    ) -> Result<Self, GeminiScannerError> {
         let root = SessionRootLease::open(root_path).map_err(|_| GeminiScannerError::Root)?;
-        let state = StateStore::open(state_path)?;
+        let state = SessionState::open(state_path, writer)?;
         Ok(Self {
             root,
             state,
             domain_key,
             discovery_limits: DiscoveryLimits::default(),
             metrics: SessionScannerMetrics::default(),
+            slice_cycle: None,
         })
     }
 
     pub fn state(&self) -> &StateStore {
-        &self.state
+        self.state.reader()
+    }
+
+    pub fn scan_slice(
+        &mut self,
+        transition_at: &str,
+        control: SessionScanControl,
+        budget: SessionDiscoverySliceBudget,
+    ) -> Result<SessionScanSummary, GeminiScannerError> {
+        self.scan_slice_with_clock(transition_at, control, budget, &SystemSessionDiscoveryClock)
+    }
+
+    pub fn scan_slice_with_clock<C>(
+        &mut self,
+        transition_at: &str,
+        control: SessionScanControl,
+        budget: SessionDiscoverySliceBudget,
+        clock: &C,
+    ) -> Result<SessionScanSummary, GeminiScannerError>
+    where
+        C: SessionDiscoveryClock + ?Sized,
+    {
+        self.metrics = SessionScannerMetrics::default();
+        let mut cycle = match self.slice_cycle.take() {
+            Some(cycle) => cycle,
+            None => GeminiSliceCycle::new(self, transition_at)?,
+        };
+        let result = self.scan_slice_cycle(&mut cycle, control, budget, clock);
+        match result {
+            Ok((summary, complete)) => {
+                if !complete {
+                    self.slice_cycle = Some(cycle);
+                }
+                Ok(summary)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn scan_slice_cycle<C>(
+        &mut self,
+        cycle: &mut GeminiSliceCycle,
+        control: SessionScanControl,
+        budget: SessionDiscoverySliceBudget,
+        clock: &C,
+    ) -> Result<(SessionScanSummary, bool), GeminiScannerError>
+    where
+        C: SessionDiscoveryClock + ?Sized,
+    {
+        match cycle.phase {
+            GeminiScannerSlicePhase::Discovering => {
+                let slice = discover_gemini_sessions_slice_with_clock(
+                    &self.root,
+                    &mut cycle.cursor,
+                    budget,
+                    clock,
+                )
+                .map_err(map_gemini_slice_error)?;
+                for entry in &slice.entries {
+                    let Some(source) = DiscoveredGeminiSession::from_slice(entry) else {
+                        continue;
+                    };
+                    cycle.observe(self, &source)?;
+                }
+                let mut deleted_sources = 0;
+                if slice.outcome == SessionDiscoverySliceOutcome::Complete {
+                    for source_key in cycle.persisted_sources.difference(&cycle.current_sources) {
+                        let _ = self.state.mark_source_unavailable(
+                            source_key,
+                            SessionSourceErrorCode::SourceSessionsAbsent,
+                            &cycle.transition_at,
+                        )?;
+                        deleted_sources += 1;
+                    }
+                    cycle.phase = GeminiScannerSlicePhase::Processing;
+                    cycle.cursor = SessionDiscoveryCursor::with_limits(
+                        SessionDiscoveryKind::Gemini,
+                        self.discovery_limits,
+                    )
+                    .map_err(|_| GeminiScannerError::ResourceLimit)?;
+                    cycle.persisted_sources = HashSet::new();
+                    cycle.persisted_identities = HashMap::new();
+                    cycle.reserved_keys = HashMap::new();
+                    cycle.current_sources = HashSet::new();
+                }
+                Ok((
+                    SessionScanSummary {
+                        outcome: SessionScanOutcome::Interrupted,
+                        advanced_sources: 0,
+                        unchanged_sources: 0,
+                        deleted_sources,
+                        sources: Vec::new(),
+                        metrics: self.metrics.clone(),
+                    },
+                    false,
+                ))
+            }
+            GeminiScannerSlicePhase::Processing => {
+                let slice = discover_gemini_sessions_slice_with_clock(
+                    &self.root,
+                    &mut cycle.cursor,
+                    budget,
+                    clock,
+                )
+                .map_err(map_gemini_slice_error)?;
+                let mut summaries = Vec::new();
+                let mut advanced_sources = 0;
+                let mut unchanged_sources = 0;
+                let mut committed_batches = 0;
+                let mut restart_processing = false;
+                for entry in &slice.entries {
+                    let Some(source) = DiscoveredGeminiSession::from_slice(entry) else {
+                        continue;
+                    };
+                    let identity = self.file_identity(&source).as_str().to_owned();
+                    if cycle.processed_identities.contains(&identity) {
+                        continue;
+                    }
+                    let Some(source_key) = cycle.source_keys_by_identity.get(&identity).cloned()
+                    else {
+                        continue;
+                    };
+                    let (summary, process) = self.process_slice_source(
+                        &source,
+                        source_key,
+                        &cycle.transition_at,
+                        control,
+                        &mut committed_batches,
+                    )?;
+                    match process {
+                        Some(ProcessOutcome::Advanced) => advanced_sources += 1,
+                        Some(ProcessOutcome::Unchanged) => unchanged_sources += 1,
+                        Some(ProcessOutcome::Interrupted) => restart_processing = true,
+                        None => {}
+                    }
+                    summaries.push(summary);
+                    if restart_processing {
+                        break;
+                    }
+                    cycle.processed_identities.insert(identity);
+                }
+                if restart_processing {
+                    cycle.cursor = SessionDiscoveryCursor::with_limits(
+                        SessionDiscoveryKind::Gemini,
+                        self.discovery_limits,
+                    )
+                    .map_err(|_| GeminiScannerError::ResourceLimit)?;
+                }
+                let complete =
+                    slice.outcome == SessionDiscoverySliceOutcome::Complete && !restart_processing;
+                Ok((
+                    SessionScanSummary {
+                        outcome: if complete {
+                            SessionScanOutcome::Complete
+                        } else {
+                            SessionScanOutcome::Interrupted
+                        },
+                        advanced_sources,
+                        unchanged_sources,
+                        deleted_sources: 0,
+                        sources: summaries,
+                        metrics: self.metrics.clone(),
+                    },
+                    complete,
+                ))
+            }
+        }
+    }
+
+    fn process_slice_source(
+        &mut self,
+        source: &DiscoveredGeminiSession,
+        source_key: String,
+        transition_at: &str,
+        control: SessionScanControl,
+        committed_batches: &mut usize,
+    ) -> Result<(SessionSourceScanSummary, Option<ProcessOutcome>), GeminiScannerError> {
+        match self.process_source(
+            source,
+            &source_key,
+            transition_at,
+            control,
+            committed_batches,
+        ) {
+            Ok(result) => Ok((result.summary, Some(result.process))),
+            Err(
+                error @ (GeminiScannerError::Read
+                | GeminiScannerError::Parse
+                | GeminiScannerError::ResourceLimit),
+            ) => {
+                let code = match error {
+                    GeminiScannerError::Read => SessionSourceErrorCode::SourceIoFailed,
+                    GeminiScannerError::Parse => SessionSourceErrorCode::SourceParseInvalid,
+                    GeminiScannerError::ResourceLimit => {
+                        SessionSourceErrorCode::SourceRecordTooLarge
+                    }
+                    _ => unreachable!(),
+                };
+                self.record_failure(source, &source_key, code, transition_at)?;
+                let state = self.state.load_session_source(&source_key)?;
+                let current = self.state.load_current_session_scan_cursor(&source_key)?;
+                Ok((
+                    SessionSourceScanSummary {
+                        source_key,
+                        session_key: None,
+                        status: state.as_ref().map_or_else(
+                            || {
+                                if code == SessionSourceErrorCode::SourceRecordTooLarge {
+                                    SessionSourceStatus::ResourceLimited
+                                } else {
+                                    SessionSourceStatus::Unavailable
+                                }
+                            },
+                            |state| state.status,
+                        ),
+                        error_code: Some(code),
+                        complete_byte_offset: current
+                            .map_or(0, |cursor| cursor.complete_byte_offset),
+                    },
+                    None,
+                ))
+            }
+            Err(GeminiScannerError::CleanupPending) => {
+                let state = self.state.load_session_source(&source_key)?;
+                let current = self.state.load_current_session_scan_cursor(&source_key)?;
+                let session_key = self
+                    .state
+                    .load_current_session_index_page(&source_key, None, 1)?
+                    .items
+                    .into_iter()
+                    .next()
+                    .map(|index| index.session_key);
+                Ok((
+                    SessionSourceScanSummary {
+                        source_key,
+                        session_key,
+                        status: state
+                            .map_or(SessionSourceStatus::Unavailable, |state| state.status),
+                        error_code: Some(SessionSourceErrorCode::SourceCandidateInterrupted),
+                        complete_byte_offset: current
+                            .map_or(0, |cursor| cursor.complete_byte_offset),
+                    },
+                    Some(ProcessOutcome::Interrupted),
+                ))
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn record_aggregate_metrics(&mut self, aggregate: &GeminiAggregate) {
@@ -229,6 +613,7 @@ impl GeminiScanner {
         transition_at: &str,
         control: SessionScanControl,
     ) -> Result<SessionScanSummary, GeminiScannerError> {
+        self.slice_cycle = None;
         self.metrics = SessionScannerMetrics::default();
         let discovered = discover_gemini_sessions(&self.root, self.discovery_limits)?;
         let persisted = self.persisted_sources()?;

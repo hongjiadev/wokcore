@@ -10,6 +10,10 @@ use wokcore_platform::sessions::{
     SessionRootLease,
 };
 
+mod slice;
+
+pub use slice::*;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SessionLocation {
     Live,
@@ -41,6 +45,20 @@ pub struct DiscoveredSession {
 }
 
 impl DiscoveredSession {
+    pub(crate) fn from_slice(entry: &SessionDiscoveryEntry) -> Option<Self> {
+        let location = match entry.format() {
+            SessionDiscoverySourceFormat::CodexLiveJsonl => SessionLocation::Live,
+            SessionDiscoverySourceFormat::CodexArchiveJsonl => SessionLocation::Archive,
+            _ => return None,
+        };
+        Some(Self {
+            relative_path: entry.relative_path().to_path_buf(),
+            file_name: entry.file_name().to_owned(),
+            location,
+            identity: entry.identity(),
+        })
+    }
+
     pub fn file_name(&self) -> &str {
         &self.file_name
     }

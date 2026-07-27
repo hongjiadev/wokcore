@@ -1,5 +1,6 @@
 mod store;
 mod wal;
+mod writer;
 
 pub use store::{
     AttemptId, CandidateBeginOutcome, CheckpointResult, CleanupBatchOutcome, ClientTokenMetadata,
@@ -17,4 +18,10 @@ pub use store::{
     SessionUsagePageKey, SessionUsageRecord, StateHealth, StateStore, SupplementalBatchOutcome,
     SupplementalErrorCode, SupplementalFailoverDecision, SupplementalRetryDecision,
     SupplementalStorageStats, TraceId, WAL_CHECKPOINT_THRESHOLD_BYTES,
+};
+pub use writer::{
+    STATE_STORE_WRITER_QUEUE_CAPACITY, SUPPLEMENTAL_CLEANUP_INTERVAL, StateStoreWriteError,
+    StateStoreWriteReceipt, StateStoreWriter, StateStoreWriterClient,
+    StateStoreWriterShutdownError, StateStoreWriterShutdownHandle, StateStoreWriterShutdownReceipt,
+    StateStoreWriterSubmitError, state_store_writer,
 };
