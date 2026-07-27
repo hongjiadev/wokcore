@@ -236,6 +236,7 @@ pub struct ExecutionRequest<'a> {
     model: &'a str,
     candidates: &'a [ExecutionCandidate],
     authentication: AccountAuthentication,
+    accountless_account_id: Option<&'a AccountId>,
     affinity_account: Option<&'a AccountId>,
     body: PreparedRequestBody,
 }
@@ -257,7 +258,27 @@ impl<'a> ExecutionRequest<'a> {
             model,
             candidates,
             authentication,
+            accountless_account_id: None,
             affinity_account,
+            body,
+        }
+    }
+
+    pub fn new_accountless(
+        request_id: ExecutionRequestId,
+        provider_id: &'a ProviderId,
+        model: &'a str,
+        account_id: &'a AccountId,
+        body: PreparedRequestBody,
+    ) -> Self {
+        Self {
+            request_id,
+            provider_id,
+            model,
+            candidates: &[],
+            authentication: AccountAuthentication::Local,
+            accountless_account_id: Some(account_id),
+            affinity_account: None,
             body,
         }
     }
@@ -272,6 +293,7 @@ impl fmt::Debug for ExecutionRequest<'_> {
             .field("model", &self.model)
             .field("candidate_count", &self.candidates.len())
             .field("authentication", &self.authentication)
+            .field("accountless", &self.accountless_account_id.is_some())
             .field("has_affinity", &self.affinity_account.is_some())
             .field("body_length", &self.body.len())
             .finish()
@@ -445,21 +467,25 @@ where
                 return cancelled(history);
             }
             let now_ms = self.clock.now_ms();
-            let choice = match health.select_from(
-                request
-                    .candidates
-                    .iter()
-                    .map(ExecutionCandidate::as_account_candidate),
-                request.authentication,
-                request.affinity_account,
-                now_ms,
-            ) {
-                Ok(choice) => choice,
-                Err(SelectionError::NoEligibleAccount | SelectionError::AccountState(_)) => {
-                    return ExecutionOutcome::Failed(ExecutionFailure {
-                        terminal: ExecutionTerminal::NoEligibleAccount,
-                        history,
-                    });
+            let account_id = if let Some(account_id) = request.accountless_account_id {
+                account_id
+            } else {
+                match health.select_from(
+                    request
+                        .candidates
+                        .iter()
+                        .map(ExecutionCandidate::as_account_candidate),
+                    request.authentication,
+                    request.affinity_account,
+                    now_ms,
+                ) {
+                    Ok(choice) => choice.account_id(),
+                    Err(SelectionError::NoEligibleAccount | SelectionError::AccountState(_)) => {
+                        return ExecutionOutcome::Failed(ExecutionFailure {
+                            terminal: ExecutionTerminal::NoEligibleAccount,
+                            history,
+                        });
+                    }
                 }
             };
             let attempt_id = AttemptId::new(&request.request_id, ordinal);
@@ -467,7 +493,7 @@ where
                 request_id: &request.request_id,
                 attempt_id: attempt_id.clone(),
                 provider_id: request.provider_id,
-                account_id: choice.account_id(),
+                account_id,
                 model: request.model,
             };
             let attempt = self
@@ -482,13 +508,11 @@ where
 
             match result {
                 AttemptResult::Succeeded { output, boundary } => {
-                    let _ =
-                        health.observe(choice.account_id(), AccountObservation::Success, now_ms);
+                    if request.accountless_account_id.is_none() {
+                        let _ = health.observe(account_id, AccountObservation::Success, now_ms);
+                    }
                     history.push(AttemptDiagnostic::success(
-                        &request,
-                        choice.account_id(),
-                        attempt_id,
-                        boundary,
+                        &request, account_id, attempt_id, boundary,
                     ));
                     return ExecutionOutcome::Succeeded(ExecutionSuccess {
                         output,
@@ -497,13 +521,11 @@ where
                     });
                 }
                 AttemptResult::Failed { failure, boundary } => {
-                    observe_failure(health, choice.account_id(), failure, now_ms);
+                    if request.accountless_account_id.is_none() {
+                        observe_failure(health, account_id, failure, now_ms);
+                    }
                     history.push(AttemptDiagnostic::failure(
-                        &request,
-                        choice.account_id(),
-                        attempt_id,
-                        failure,
-                        boundary,
+                        &request, account_id, attempt_id, failure, boundary,
                     ));
                     let retry_delay = (boundary == AttemptBoundary::BeforeVisible
                         && ordinal < MAX_TOTAL_ATTEMPTS)

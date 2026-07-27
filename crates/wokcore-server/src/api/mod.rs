@@ -19,8 +19,8 @@ use axum::{
 use crate::ServerState;
 
 use crate::data_plane::{
-    IMAGE_MULTIPART_BODY_LIMIT, JSON_BODY_LIMIT, unsupported_json, unsupported_models,
-    unsupported_multipart,
+    IMAGE_MULTIPART_BODY_LIMIT, JSON_BODY_LIMIT, anthropic, chat, count_tokens, models_endpoint,
+    responses, unsupported_json, unsupported_multipart,
 };
 use export::diagnostics_export;
 use logs::logs;
@@ -104,21 +104,21 @@ pub fn build_router(state: ServerState) -> Router {
         )
         .route(
             "/v1/responses",
-            post(unsupported_json).layer(DefaultBodyLimit::max(JSON_BODY_LIMIT)),
+            post(responses).layer(DefaultBodyLimit::max(JSON_BODY_LIMIT)),
         )
         .route(
             "/v1/chat/completions",
-            post(unsupported_json).layer(DefaultBodyLimit::max(JSON_BODY_LIMIT)),
+            post(chat).layer(DefaultBodyLimit::max(JSON_BODY_LIMIT)),
         )
         .route(
             "/v1/messages",
-            post(unsupported_json).layer(DefaultBodyLimit::max(JSON_BODY_LIMIT)),
+            post(anthropic).layer(DefaultBodyLimit::max(JSON_BODY_LIMIT)),
         )
         .route(
             "/v1/messages/count_tokens",
-            post(unsupported_json).layer(DefaultBodyLimit::max(JSON_BODY_LIMIT)),
+            post(count_tokens).layer(DefaultBodyLimit::max(JSON_BODY_LIMIT)),
         )
-        .route("/v1/models", get(unsupported_models))
+        .route("/v1/models", get(models_endpoint))
         .route(
             "/v1/images/generations",
             post(unsupported_json).layer(DefaultBodyLimit::max(JSON_BODY_LIMIT)),

@@ -61,6 +61,8 @@ pub struct ProviderCapabilities {
     pub vision: bool,
     pub images: bool,
     pub reasoning: bool,
+    #[serde(default)]
+    pub count_tokens: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

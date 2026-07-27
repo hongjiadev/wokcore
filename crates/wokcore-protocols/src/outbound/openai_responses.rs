@@ -527,12 +527,17 @@ impl ResponsesCodec {
             }
         }
 
+        let (status, event_name) = if self.context.response.incomplete_details.is_some() {
+            ("incomplete", "response.incomplete")
+        } else {
+            ("completed", "response.completed")
+        };
         let response = self.response_value(
-            "completed",
+            status,
             output.iter().map(ResponsesOutput::value).collect(),
             usage,
         );
-        events.push(self.wire("response.completed", [("response", response)].into_iter()));
+        events.push(self.wire(event_name, [("response", response)].into_iter()));
         self.terminal = true;
         Ok(events)
     }

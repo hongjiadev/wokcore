@@ -384,6 +384,20 @@ impl AccountHealthTable {
         snapshots
     }
 
+    pub fn reconfigured(
+        &self,
+        accounts: &[AccountId],
+        now_ms: u64,
+    ) -> Result<Self, AccountStateError> {
+        let retained = accounts.iter().collect::<BTreeSet<_>>();
+        let snapshots = self
+            .snapshots(now_ms)
+            .into_iter()
+            .filter(|snapshot| retained.contains(&snapshot.account_id))
+            .collect::<Vec<_>>();
+        Self::restore(self.policy, accounts, &snapshots, now_ms)
+    }
+
     pub fn select<'a>(
         &self,
         candidates: &'a [AccountCandidate<'a>],

@@ -182,12 +182,23 @@ fn request(
 }
 
 fn valid_body(path: &str) -> Body {
-    if path == "/v1/images/edits" {
-        Body::from(multipart_body(&[1]))
-    } else if path == "/v1/models" {
-        Body::empty()
-    } else {
-        Body::from("{}")
+    match path {
+        "/v1/responses" => {
+            Body::from(r#"{"model":"synthetic-model","input":"hello","stream":false}"#)
+        }
+        "/v1/chat/completions" => Body::from(
+            r#"{"model":"synthetic-model","messages":[{"role":"user","content":"hello"}],"stream":false}"#,
+        ),
+        "/v1/messages" => Body::from(
+            r#"{"model":"synthetic-model","max_tokens":16,"messages":[{"role":"user","content":"hello"}],"stream":false}"#,
+        ),
+        "/v1/messages/count_tokens" => Body::from(
+            r#"{"model":"synthetic-model","messages":[{"role":"user","content":"hello"}]}"#,
+        ),
+        "/v1/models" => Body::empty(),
+        "/v1/images/generations" => Body::from("{}"),
+        "/v1/images/edits" => Body::from(multipart_body(&[1])),
+        _ => unreachable!("data-plane route table is closed"),
     }
 }
 
@@ -227,13 +238,12 @@ async fn all_data_plane_routes_are_private_and_accept_only_proxy_scope() {
             ))
             .await
             .unwrap();
-        assert_protocol_error(
-            accepted,
-            path,
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "unsupported_capability",
-        )
-        .await;
+        let (status, code) = if path.starts_with("/v1/images/") {
+            (StatusCode::UNPROCESSABLE_ENTITY, "unsupported_capability")
+        } else {
+            (StatusCode::NOT_IMPLEMENTED, "no_executor")
+        };
+        assert_protocol_error(accepted, path, status, code).await;
     }
 
     for token in &fixture.non_proxy {
@@ -386,11 +396,11 @@ async fn authority_origin_method_head_and_content_type_are_strict() {
             "/v1/responses",
             Some(&fixture.proxy),
             Some("application/json; charset=utf-8"),
-            Body::from("{}"),
+            valid_body("/v1/responses"),
         ))
         .await
         .unwrap();
-    assert_eq!(accepted_json.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(accepted_json.status(), StatusCode::NOT_IMPLEMENTED);
 
     for content_type in [None, Some("application/json"), Some("multipart/mixed")] {
         let response = fixture
@@ -450,7 +460,7 @@ async fn data_plane_and_management_body_limits_remain_separate() {
         ))
         .await
         .unwrap();
-    assert_eq!(accepted.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(accepted.status(), StatusCode::BAD_REQUEST);
 
     let oversized_json = format!("\"{}\"", "a".repeat(JSON_BODY_LIMIT - 1));
     let oversized = fixture
@@ -647,11 +657,11 @@ async fn admission_guard_covers_normal_decode_disconnect_cancellation_and_panic(
             "/v1/responses",
             Some(&fixture.proxy),
             Some("application/json"),
-            Body::from("{}"),
+            valid_body("/v1/responses"),
         ))
         .await
         .unwrap();
-    assert_eq!(normal.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(normal.status(), StatusCode::NOT_IMPLEMENTED);
     assert_eq!(fixture.lifecycle.snapshot().active_requests, 1);
     response_json(normal).await;
     assert_eq!(fixture.lifecycle.snapshot().active_requests, 0);

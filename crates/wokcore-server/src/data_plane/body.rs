@@ -16,7 +16,13 @@ pub(crate) const JSON_BODY_LIMIT: usize = 16 * 1024 * 1024;
 pub(crate) const IMAGE_PART_BODY_LIMIT: usize = 20 * 1024 * 1024;
 pub(crate) const IMAGE_MULTIPART_BODY_LIMIT: usize = 50 * 1024 * 1024;
 
-pub(crate) struct ValidatedJsonBody;
+pub(crate) struct ValidatedJsonBody(Bytes);
+
+impl ValidatedJsonBody {
+    pub(crate) fn into_bytes(self) -> Bytes {
+        self.0
+    }
+}
 
 impl<S> FromRequest<S> for ValidatedJsonBody
 where
@@ -35,9 +41,7 @@ where
                     invalid_body(request_id, protocol)
                 }
             })?;
-        serde_json::from_slice::<serde_json::Value>(&body)
-            .map_err(|_| invalid_request(request_id, protocol))?;
-        Ok(Self)
+        Ok(Self(body))
     }
 }
 

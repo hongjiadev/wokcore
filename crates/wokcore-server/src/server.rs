@@ -5,10 +5,12 @@ use std::{
 
 use tokio::{net::TcpListener, sync::watch, task::JoinHandle};
 use uuid::Uuid;
+use wokcore_engine::accounts::AccountHealthTable;
 
 use crate::{
     api::build_router,
     auth::{AuthRegistry, EntropySource, OsEntropy},
+    data_plane::UpstreamExecutor,
     lifecycle::ServiceLifecycle,
     observability::{DiagnosticWriterHandle, SchedulerHandle, StateWriterHandle},
     providers::ProviderManagement,
@@ -29,6 +31,8 @@ pub struct ServerState {
     pub(crate) state_writer: Option<StateWriterHandle>,
     pub(crate) query: Option<QueryRuntime>,
     pub(crate) providers: Option<Arc<ProviderManagement>>,
+    pub(crate) upstream_executor: Option<Arc<dyn UpstreamExecutor>>,
+    pub(crate) account_health: Option<Arc<AccountHealthTable>>,
     shutdown: watch::Sender<bool>,
     coordinated_shutdown: bool,
 }
@@ -88,6 +92,8 @@ impl ServerState {
             state_writer: None,
             query: None,
             providers: None,
+            upstream_executor: None,
+            account_health: None,
             shutdown,
             coordinated_shutdown: false,
         }
@@ -114,7 +120,24 @@ impl ServerState {
     }
 
     pub fn with_provider_management(mut self, providers: Arc<ProviderManagement>) -> Self {
+        if let Some(account_health) = self.account_health.take() {
+            providers.attach_account_health(account_health);
+        }
         self.providers = Some(providers);
+        self
+    }
+
+    pub fn with_upstream_executor(
+        mut self,
+        executor: Arc<dyn UpstreamExecutor>,
+        account_health: Arc<AccountHealthTable>,
+    ) -> Self {
+        if let Some(providers) = self.providers.as_ref() {
+            providers.attach_account_health(Arc::clone(&account_health));
+        } else {
+            self.account_health = Some(account_health);
+        }
+        self.upstream_executor = Some(executor);
         self
     }
 

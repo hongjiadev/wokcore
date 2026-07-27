@@ -1,18 +1,22 @@
 use std::{
     path::PathBuf,
     sync::{Arc, RwLock},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
+use arc_swap::ArcSwap;
 use secrecy::SecretString;
 use tokio::sync::Mutex;
 use wokcore_core::{
     config::{AccountAuthConfig, ProviderConfig, RoutingConfig},
+    id::AccountId,
     secret::{SecretRef, SecretScope},
 };
 use wokcore_engine::{
+    accounts::{AccountHealthPolicy, AccountHealthTable},
     catalog::ProviderCatalog,
     models::PublicModelMetadata,
-    snapshot::{RuntimeSnapshot, SnapshotPublisher},
+    snapshot::RuntimeSnapshot,
 };
 use wokcore_storage::{
     AppConfig, ConfigStore, SecretStore, ServerConfig, StorageError, VersionedConfig,
@@ -70,12 +74,17 @@ struct ActiveConfiguration {
     candidate: ProviderCandidate,
 }
 
+pub(crate) struct ProviderExecutionSnapshot {
+    pub(crate) snapshot: Arc<RuntimeSnapshot>,
+    pub(crate) account_health: Arc<AccountHealthTable>,
+}
+
 #[derive(Clone)]
 pub struct ProviderManagement {
     catalog: Arc<ProviderCatalog>,
     store: ConfigStore,
     secrets: Arc<dyn SecretStore>,
-    publisher: Arc<SnapshotPublisher>,
+    execution: Arc<ArcSwap<ProviderExecutionSnapshot>>,
     active: Arc<RwLock<ActiveConfiguration>>,
     protected_secrets: Arc<RwLock<Vec<SecretRef>>>,
     mutation: Arc<Mutex<()>>,
@@ -103,11 +112,19 @@ impl ProviderManagement {
             routing: loaded.config.routing.clone(),
         };
         let snapshot = build_snapshot(&catalog, &candidate)?;
+        let account_health = AccountHealthTable::new(
+            default_account_health_policy(),
+            &active_account_ids(&candidate),
+        )
+        .map_err(|_| ProviderManagementError::InvalidConfiguration)?;
         Ok(Self {
             catalog: Arc::new(catalog),
             store,
             secrets,
-            publisher: Arc::new(SnapshotPublisher::new(snapshot)),
+            execution: Arc::new(ArcSwap::from_pointee(ProviderExecutionSnapshot {
+                snapshot: Arc::new(snapshot),
+                account_health: Arc::new(account_health),
+            })),
             active: Arc::new(RwLock::new(ActiveConfiguration {
                 revision: loaded.revision,
                 snapshot_revision: loaded.revision,
@@ -167,7 +184,8 @@ impl ProviderManagement {
             .active
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let snapshot = self.publisher.load();
+        let execution = self.execution.load();
+        let snapshot = &execution.snapshot;
         ProviderRuntimeStatus {
             revision: active.revision,
             snapshot_revision: active.snapshot_revision,
@@ -180,11 +198,45 @@ impl ProviderManagement {
     }
 
     pub fn models(&self) -> Vec<PublicModelMetadata> {
-        self.publisher.load().public_models().to_vec()
+        self.execution.load().snapshot.public_models().to_vec()
     }
 
     pub fn snapshot(&self) -> Arc<RuntimeSnapshot> {
-        self.publisher.load()
+        Arc::clone(&self.execution.load().snapshot)
+    }
+
+    pub(crate) fn execution_snapshot(&self) -> Arc<ProviderExecutionSnapshot> {
+        self.execution.load_full()
+    }
+
+    pub(crate) fn attach_account_health(&self, account_health: Arc<AccountHealthTable>) {
+        let active = self
+            .active
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current = self.execution.load_full();
+        let account_ids = active_account_ids(&active.candidate);
+        let now_ms = now_ms();
+        let snapshots = account_health.snapshots(now_ms);
+        let matches_active_accounts = snapshots.len() == account_ids.len()
+            && account_ids.iter().all(|account_id| {
+                snapshots
+                    .iter()
+                    .any(|snapshot| &snapshot.account_id == account_id)
+            });
+        let account_health = if matches_active_accounts {
+            account_health
+        } else {
+            Arc::new(
+                account_health
+                    .reconfigured(&account_ids, now_ms)
+                    .expect("validated Provider accounts fit the health table"),
+            )
+        };
+        self.execution.store(Arc::new(ProviderExecutionSnapshot {
+            snapshot: Arc::clone(&current.snapshot),
+            account_health,
+        }));
     }
 
     pub fn validate(
@@ -422,7 +474,16 @@ impl ProviderManagement {
             .active
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let published = self.publisher.publish(snapshot);
+        let current = self.execution.load_full();
+        let account_health = current
+            .account_health
+            .reconfigured(&active_account_ids(&candidate), now_ms())
+            .expect("validated Provider accounts fit the health table");
+        let published = Arc::new(snapshot);
+        self.execution.store(Arc::new(ProviderExecutionSnapshot {
+            snapshot: Arc::clone(&published),
+            account_health: Arc::new(account_health),
+        }));
         *active = ActiveConfiguration {
             revision: loaded.revision,
             snapshot_revision: loaded.revision,
@@ -519,6 +580,30 @@ fn auth_references(auth: &AccountAuthConfig, secret_ref: &SecretRef) -> bool {
     }
 }
 
+fn active_account_ids(candidate: &ProviderCandidate) -> Vec<AccountId> {
+    candidate
+        .providers
+        .accounts
+        .iter()
+        .filter(|account| account.enabled)
+        .map(|account| account.id.clone())
+        .collect()
+}
+
+fn default_account_health_policy() -> AccountHealthPolicy {
+    AccountHealthPolicy::new(1_000, 60_000)
+        .expect("the default account health policy is compile-time valid")
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
 fn build_snapshot(
     catalog: &ProviderCatalog,
     candidate: &ProviderCandidate,
@@ -575,4 +660,73 @@ pub enum ProviderManagementError {
     ReadOnlySecretStore,
     #[error("the Provider management storage operation failed")]
     StorageFailure,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        sync::{Arc, Barrier},
+        thread,
+    };
+
+    use wokcore_core::config::{ProviderConfig, RoutingConfig};
+    use wokcore_storage::{AppConfig, MemorySecretStore};
+
+    use super::*;
+
+    #[test]
+    fn concurrent_health_attachment_cannot_replace_a_newer_execution_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let management = ProviderManagement::from_loaded(
+            ConfigStore::new(directory.path().join("config.toml")),
+            VersionedConfig {
+                revision: 0,
+                config: AppConfig::default(),
+            },
+            Arc::new(MemorySecretStore::default()),
+        )
+        .unwrap();
+        let original = management.execution.load_full();
+        let original_references = Arc::strong_count(&original);
+        let active = management
+            .active
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let start = Arc::new(Barrier::new(2));
+        let attach_start = Arc::clone(&start);
+        let attach = management.clone();
+        let task = thread::spawn(move || {
+            attach_start.wait();
+            attach.attach_account_health(Arc::new(
+                AccountHealthTable::new(default_account_health_policy(), &[]).unwrap(),
+            ));
+        });
+
+        start.wait();
+        for _ in 0..100_000 {
+            if Arc::strong_count(&original) > original_references {
+                break;
+            }
+            thread::yield_now();
+        }
+
+        let candidate = ProviderCandidate {
+            providers: ProviderConfig::default(),
+            routing: RoutingConfig::default(),
+        };
+        let replacement = Arc::new(build_snapshot(&management.catalog, &candidate).unwrap());
+        management
+            .execution
+            .store(Arc::new(ProviderExecutionSnapshot {
+                snapshot: Arc::clone(&replacement),
+                account_health: Arc::new(
+                    AccountHealthTable::new(default_account_health_policy(), &[]).unwrap(),
+                ),
+            }));
+        drop(active);
+        task.join().unwrap();
+
+        let published = management.execution.load_full();
+        assert!(Arc::ptr_eq(&published.snapshot, &replacement));
+    }
 }

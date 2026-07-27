@@ -97,7 +97,7 @@ pub(crate) async fn enforce_request_security(
                         "The request is not authorized.",
                     );
                 };
-                if state.auth.validate_client_scope(candidate, scope).is_none() {
+                let Some(authorized) = state.auth.validate_client_scope(candidate, scope) else {
                     if state.auth.validate_any_client(candidate).is_some() {
                         return protocol_auth_error(
                             protocol,
@@ -114,7 +114,8 @@ pub(crate) async fn enforce_request_security(
                         "unauthorized",
                         "The request is not authorized.",
                     );
-                }
+                };
+                request.extensions_mut().insert(authorized);
             }
         }
         if let Some(protocol) = protocol {

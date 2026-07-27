@@ -52,7 +52,7 @@ endpoint_policy = "public_https"
 model_source = "static"
 aliases = []
 models = ["claude-fable-5", "claude-sonnet-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"]
-capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true }
+capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true, count_tokens = true }
 
 [[providers]]
 id = "anthropic-apikey"
@@ -64,7 +64,7 @@ endpoint_policy = "public_https"
 model_source = "hybrid"
 aliases = []
 models = ["claude-fable-5", "claude-sonnet-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"]
-capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true }
+capabilities = { text = true, streaming = true, tools = true, vision = true, images = false, reasoning = true, count_tokens = true }
 
 [[providers]]
 id = "kimi"
