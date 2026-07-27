@@ -1940,7 +1940,7 @@ mod tests {
 
     use super::{
         DIAGNOSTIC_DELETE_TOMBSTONE_PREFIX, DeleteSynchronizationPoint, DiagnosticDirectory,
-        SessionFileIdentity,
+        PinnedExportDestination, SessionFileIdentity,
         delete_synchronization_tests::{self, HookWindow},
     };
 
@@ -2002,11 +2002,23 @@ mod tests {
         let directory = DiagnosticDirectory::open(&root).unwrap_or_else(|error| {
             panic!("macOS diagnostic directory failed after parent lock verification: {error:?}")
         });
-        directory
-            .create_new(OsStr::new("segment-00000000000000000001.jsonl"), b"", 1024)
+        let name = OsStr::new("segment-00000000000000000001.jsonl");
+        let parent = directory.root.clone_chain().unwrap();
+        let mut destination = PinnedExportDestination::create_in_directory(parent, name)
             .unwrap_or_else(|error| {
-                panic!("macOS diagnostic segment publication failed: {error:?}")
+                panic!("macOS diagnostic temporary creation failed: {error:?}")
             });
+        destination
+            .write_all(b"")
+            .unwrap_or_else(|error| panic!("macOS diagnostic temporary write failed: {error:?}"));
+        destination
+            .validate_frozen_regular_file(1024)
+            .unwrap_or_else(|error| {
+                panic!("macOS diagnostic temporary verification failed: {error:?}")
+            });
+        destination
+            .commit_pinned()
+            .unwrap_or_else(|error| panic!("macOS diagnostic publication failed: {error:?}"));
     }
 
     #[cfg(target_os = "macos")]
