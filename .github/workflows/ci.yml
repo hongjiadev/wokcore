@@ -71,7 +71,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: powershell
         run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/scripts/run-fixed-test-host.tests.ps1
-      - name: Verify macOS diagnostic parent lock
+      - name: Verify macOS diagnostic startup
         if: runner.os == 'macOS'
         run: >-
           cargo test
@@ -80,7 +80,7 @@ jobs:
           --all-features
           --locked
           --target ${{ matrix.target }}
-          diagnostics::tests::macos_parent_lock_opens_on_a_private_directory
+          diagnostics::tests::macos_diagnostic_directory_opens_and_publishes_on_private_system_temp_path
           -- --exact --nocapture
       - name: Test native workspace
         if: runner.os != 'Windows'

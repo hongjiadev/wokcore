@@ -1985,7 +1985,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_parent_lock_opens_on_a_private_directory() {
+    fn macos_diagnostic_directory_opens_and_publishes_on_private_system_temp_path() {
         let fixture = tempdir().unwrap();
         let root = fixture.path().join("diagnostics");
         fs::create_dir(&root).unwrap();
@@ -1999,9 +1999,14 @@ mod tests {
         };
         drop(parent_lock);
 
-        if let Err(error) = DiagnosticDirectory::open(&root) {
-            panic!("macOS diagnostic directory failed after parent lock verification: {error:?}");
-        }
+        let directory = DiagnosticDirectory::open(&root).unwrap_or_else(|error| {
+            panic!("macOS diagnostic directory failed after parent lock verification: {error:?}")
+        });
+        directory
+            .create_new(OsStr::new("segment-00000000000000000001.jsonl"), b"", 1024)
+            .unwrap_or_else(|error| {
+                panic!("macOS diagnostic segment publication failed: {error:?}")
+            });
     }
 
     #[cfg(target_os = "macos")]
