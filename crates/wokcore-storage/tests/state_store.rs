@@ -36,7 +36,7 @@ fn first_open_applies_initial_schema_and_disables_automatic_checkpointing() {
     let directory = tempfile::tempdir().unwrap();
     let store = StateStore::open(directory.path().join("state.db")).unwrap();
 
-    assert_eq!(store.health().unwrap().schema_version, 3);
+    assert_eq!(store.health().unwrap().schema_version, 4);
     assert_eq!(store.pragma_foreign_keys().unwrap(), 1);
     assert_eq!(store.pragma_journal_mode().unwrap(), "wal");
     assert_eq!(store.pragma_busy_timeout().unwrap(), 5_000);
@@ -62,7 +62,7 @@ fn concurrent_first_opens_commit_exactly_one_valid_initial_migration() {
         .collect::<Vec<_>>();
 
     for handle in handles {
-        assert_eq!(handle.join().unwrap().schema_version, 3);
+        assert_eq!(handle.join().unwrap().schema_version, 4);
     }
 
     let connection = rusqlite::Connection::open(path).unwrap();
@@ -73,13 +73,13 @@ fn concurrent_first_opens_commit_exactly_one_valid_initial_migration() {
         .unwrap();
     let tables = connection
         .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('accounts', 'quota_windows', 'thread_affinities', 'request_metrics', 'orphan_secrets')",
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('accounts', 'request_metrics', 'orphan_secrets', 'provider_runtime_metadata', 'account_runtime_metadata')",
             [],
             |row| row.get::<_, i64>(0),
         )
         .unwrap();
 
-    assert_eq!(versions, 3);
+    assert_eq!(versions, 4);
     assert_eq!(tables, 5);
 }
 

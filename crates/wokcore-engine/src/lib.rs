@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+pub mod accounts;
+pub mod affinity;
 pub mod catalog;
 pub mod config;
 pub mod models;

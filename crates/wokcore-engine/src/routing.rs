@@ -7,7 +7,10 @@ use wokcore_core::{
     id::{AccountId, ClientId, ProviderId},
 };
 
-use crate::catalog::{AdapterFamily, AuthKind, ProviderCapabilities};
+use crate::{
+    accounts::AccountAuthentication,
+    catalog::{AdapterFamily, AuthKind, ProviderCapabilities},
+};
 
 const STANDARD_REASONING_EFFORTS: &[&str] =
     &["none", "minimal", "low", "medium", "high", "xhigh", "max"];
@@ -44,6 +47,15 @@ impl RouteAccount {
 
     pub fn auth(&self) -> &AccountAuthConfig {
         &self.auth
+    }
+
+    pub const fn authentication(&self) -> AccountAuthentication {
+        match self.auth {
+            AccountAuthConfig::Forward { .. } => AccountAuthentication::Forward,
+            AccountAuthConfig::Oauth { .. } => AccountAuthentication::Oauth,
+            AccountAuthConfig::ApiKey { .. } => AccountAuthentication::ApiKey,
+            AccountAuthConfig::Local => AccountAuthentication::Local,
+        }
     }
 }
 

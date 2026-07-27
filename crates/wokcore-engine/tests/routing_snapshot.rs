@@ -9,6 +9,7 @@ use wokcore_core::{
     secret::SecretRef,
 };
 use wokcore_engine::{
+    accounts::AccountAuthentication,
     catalog::ProviderCatalog,
     routing::{RouteError, RouteOrigin, RouteRequest},
     snapshot::{RuntimeSnapshot, SnapshotBuilder, SnapshotError, SnapshotPublisher},
@@ -265,6 +266,10 @@ fn builder_is_deterministic_and_candidates_borrow_only_enabled_accounts() {
     assert_eq!(
         candidates[0].account().expect("account").id().as_str(),
         "primary-key"
+    );
+    assert_eq!(
+        candidates[0].account().expect("account").authentication(),
+        AccountAuthentication::ApiKey
     );
     assert!(candidates.iter().all(|candidate| {
         candidate.provider().id().as_str() != "disabled-provider"

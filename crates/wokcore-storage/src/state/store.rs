@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fmt,
     fs::{self, OpenOptions},
     io,
@@ -8,7 +9,10 @@ use std::{
 
 use fs4::fs_std::FileExt;
 use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, TransactionBehavior, params};
-use wokcore_core::{id::ClientId, secret::SecretRef};
+use wokcore_core::{
+    id::{AccountId, ClientId, ProviderId},
+    secret::SecretRef,
+};
 
 use crate::StorageError;
 
@@ -18,7 +22,9 @@ const INITIAL_MIGRATION: &str = include_str!("../../migrations/0001_initial.sql"
 const RUNTIME_AUTH_MIGRATION: &str = include_str!("../../migrations/0002_runtime_auth.sql");
 const SESSION_DIAGNOSTICS_MIGRATION: &str =
     include_str!("../../migrations/0003_session_diagnostics.sql");
-const LATEST_SCHEMA_VERSION: i64 = 3;
+const PROVIDER_METADATA_MIGRATION: &str =
+    include_str!("../../migrations/0004_provider_metadata.sql");
+const LATEST_SCHEMA_VERSION: i64 = 4;
 const GLOBAL_CURRENT_SESSION_INDEX_FIRST_PAGE_SQL: &str =
     "SELECT i.session_key, i.source_key, i.generation, i.source_kind,
             i.created_at, i.last_active_at, i.message_count,
@@ -92,6 +98,68 @@ pub struct RequestMetric {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StateHealth {
     pub schema_version: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AccountRuntimeHealth {
+    Healthy,
+    CoolingDown,
+    Quarantined,
+}
+
+impl AccountRuntimeHealth {
+    const fn as_database(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::CoolingDown => "cooling_down",
+            Self::Quarantined => "quarantined",
+        }
+    }
+
+    fn from_database(value: &str) -> Result<Self, StorageError> {
+        match value {
+            "healthy" => Ok(Self::Healthy),
+            "cooling_down" => Ok(Self::CoolingDown),
+            "quarantined" => Ok(Self::Quarantined),
+            _ => Err(StorageError::StateDatabaseCorrupt {
+                message: "Provider account metadata contains an invalid health state".to_owned(),
+            }),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderRuntimeMetadata {
+    pub provider_id: ProviderId,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AccountRuntimeMetadata {
+    pub provider_id: ProviderId,
+    pub account_id: AccountId,
+    pub health: AccountRuntimeHealth,
+    pub consecutive_failures: u8,
+    pub cooldown_until_ms: Option<u64>,
+    pub quota_remaining: Option<u64>,
+    pub quota_resets_at_ms: Option<u64>,
+    pub selection_count: u64,
+    pub last_selected_sequence: u64,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ProviderMetadataBatch {
+    pub providers: Vec<ProviderRuntimeMetadata>,
+    pub accounts: Vec<AccountRuntimeMetadata>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ProviderMetadataBatchOutcome {
+    pub provider_rows_written: usize,
+    pub account_rows_written: usize,
+    pub provider_rows_deleted: usize,
+    pub account_rows_deleted: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1041,6 +1109,8 @@ pub const MAX_CODEX_REPLAY_SIGNATURES: u64 = 262_144;
 pub const MAX_SUPPLEMENTAL_ROW_BYTES: usize = 2 * 1024;
 pub const MAX_SUPPLEMENTAL_ROWS: usize = 32_768;
 pub const MAX_SUPPLEMENTAL_BYTES: usize = 64 * 1024 * 1024;
+const MAX_PROVIDER_METADATA_PROVIDERS: usize = 64;
+const MAX_PROVIDER_METADATA_ACCOUNTS: usize = 256;
 
 #[derive(Debug)]
 pub struct StateStore {
@@ -1099,7 +1169,7 @@ impl ReadOnlyStateStore {
 
     pub fn health(&self) -> Result<StateHealth, StorageError> {
         let versions = schema_versions(&self.connection)?;
-        if versions != [1, 2, LATEST_SCHEMA_VERSION] {
+        if versions != [1, 2, 3, LATEST_SCHEMA_VERSION] {
             return Err(StorageError::StateDatabaseCorrupt {
                 message: "state database has an incompatible migration history".to_owned(),
             });
@@ -1107,6 +1177,13 @@ impl ReadOnlyStateStore {
         Ok(StateHealth {
             schema_version: LATEST_SCHEMA_VERSION,
         })
+    }
+
+    pub fn load_provider_metadata(
+        &self,
+        now_ms: u64,
+    ) -> Result<ProviderMetadataBatch, StorageError> {
+        load_provider_metadata(&self.connection, now_ms)
     }
 
     pub fn runtime_secret_binding(
@@ -1171,7 +1248,7 @@ impl StateStore {
                  PRAGMA query_only = ON;",
             )
             .map_err(map_database_error)?;
-        if schema_versions(&connection)? != [1, 2, LATEST_SCHEMA_VERSION] {
+        if schema_versions(&connection)? != [1, 2, 3, LATEST_SCHEMA_VERSION] {
             return Err(StorageError::StateDatabaseCorrupt {
                 message: "state database has an incompatible migration history".to_owned(),
             });
@@ -1222,6 +1299,177 @@ impl StateStore {
             .map_err(map_database_error)?
             .unwrap_or_default();
         Ok(StateHealth { schema_version })
+    }
+
+    pub fn load_provider_metadata(
+        &self,
+        now_ms: u64,
+    ) -> Result<ProviderMetadataBatch, StorageError> {
+        load_provider_metadata(&self.connection, now_ms)
+    }
+
+    pub fn record_provider_metadata_batch(
+        &mut self,
+        batch: &ProviderMetadataBatch,
+    ) -> Result<ProviderMetadataBatchOutcome, StorageError> {
+        validate_provider_metadata_batch(batch)?;
+        let existing = load_provider_metadata(&self.connection, 0)?;
+        let known_providers = batch
+            .providers
+            .iter()
+            .map(|provider| &provider.provider_id)
+            .collect::<BTreeSet<_>>();
+        if batch
+            .accounts
+            .iter()
+            .any(|account| !known_providers.contains(&account.provider_id))
+        {
+            return Err(invalid_state(
+                "Provider account metadata references an unknown Provider",
+            ));
+        }
+        let provider_rows = batch
+            .providers
+            .iter()
+            .filter(|provider| {
+                existing
+                    .providers
+                    .iter()
+                    .find(|current| current.provider_id == provider.provider_id)
+                    != Some(*provider)
+            })
+            .collect::<Vec<_>>();
+        let provider_deletions = existing
+            .providers
+            .iter()
+            .filter(|provider| {
+                !batch
+                    .providers
+                    .iter()
+                    .any(|current| current.provider_id == provider.provider_id)
+            })
+            .collect::<Vec<_>>();
+        let account_rows = batch
+            .accounts
+            .iter()
+            .filter(|account| {
+                existing
+                    .accounts
+                    .iter()
+                    .find(|current| current.account_id == account.account_id)
+                    != Some(*account)
+            })
+            .collect::<Vec<_>>();
+        let account_deletions = existing
+            .accounts
+            .iter()
+            .filter(|account| {
+                !batch
+                    .accounts
+                    .iter()
+                    .any(|current| current.account_id == account.account_id)
+            })
+            .collect::<Vec<_>>();
+        let outcome = ProviderMetadataBatchOutcome {
+            provider_rows_written: provider_rows.len(),
+            account_rows_written: account_rows.len(),
+            provider_rows_deleted: provider_deletions.len(),
+            account_rows_deleted: account_deletions.len(),
+        };
+        if outcome == ProviderMetadataBatchOutcome::default() {
+            return Ok(outcome);
+        }
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_database_error)?;
+        {
+            let mut statement = transaction
+                .prepare("DELETE FROM account_runtime_metadata WHERE account_id = ?1")
+                .map_err(map_database_error)?;
+            for account in account_deletions {
+                statement
+                    .execute([account.account_id.as_str()])
+                    .map_err(map_database_error)?;
+            }
+        }
+        {
+            let mut statement = transaction
+                .prepare("DELETE FROM provider_runtime_metadata WHERE provider_id = ?1")
+                .map_err(map_database_error)?;
+            for provider in provider_deletions {
+                statement
+                    .execute([provider.provider_id.as_str()])
+                    .map_err(map_database_error)?;
+            }
+        }
+        {
+            let mut statement = transaction
+                .prepare(
+                    "INSERT INTO provider_runtime_metadata(provider_id, updated_at_ms)
+                     VALUES (?1, ?2)
+                     ON CONFLICT(provider_id) DO UPDATE SET
+                       updated_at_ms = excluded.updated_at_ms",
+                )
+                .map_err(map_database_error)?;
+            for provider in provider_rows {
+                statement
+                    .execute(params![
+                        provider.provider_id.as_str(),
+                        to_i64(provider.updated_at_ms, "Provider metadata timestamp")?,
+                    ])
+                    .map_err(map_database_error)?;
+            }
+        }
+        {
+            let mut statement = transaction
+                .prepare(
+                    "INSERT INTO account_runtime_metadata(
+                       account_id, provider_id, health_state, consecutive_failures,
+                       cooldown_until_ms, quota_remaining, quota_resets_at_ms,
+                       selection_count, last_selected_sequence, updated_at_ms
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                     ON CONFLICT(account_id) DO UPDATE SET
+                       provider_id = excluded.provider_id,
+                       health_state = excluded.health_state,
+                       consecutive_failures = excluded.consecutive_failures,
+                       cooldown_until_ms = excluded.cooldown_until_ms,
+                       quota_remaining = excluded.quota_remaining,
+                       quota_resets_at_ms = excluded.quota_resets_at_ms,
+                       selection_count = excluded.selection_count,
+                       last_selected_sequence = excluded.last_selected_sequence,
+                       updated_at_ms = excluded.updated_at_ms",
+                )
+                .map_err(map_database_error)?;
+            for account in account_rows {
+                statement
+                    .execute(params![
+                        account.account_id.as_str(),
+                        account.provider_id.as_str(),
+                        account.health.as_database(),
+                        i64::from(account.consecutive_failures),
+                        account
+                            .cooldown_until_ms
+                            .map(|value| to_i64(value, "cooldown timestamp"))
+                            .transpose()?,
+                        account
+                            .quota_remaining
+                            .map(|value| to_i64(value, "quota remaining"))
+                            .transpose()?,
+                        account
+                            .quota_resets_at_ms
+                            .map(|value| to_i64(value, "quota reset timestamp"))
+                            .transpose()?,
+                        to_i64(account.selection_count, "selection count")?,
+                        to_i64(account.last_selected_sequence, "last selected sequence",)?,
+                        to_i64(account.updated_at_ms, "account metadata timestamp")?,
+                    ])
+                    .map_err(map_database_error)?;
+            }
+        }
+        transaction.commit().map_err(map_database_error)?;
+        Ok(outcome)
     }
 
     pub fn record_request_metrics(
@@ -4932,6 +5180,249 @@ fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
     sidecar.into()
 }
 
+fn validate_provider_metadata_batch(batch: &ProviderMetadataBatch) -> Result<(), StorageError> {
+    if batch.providers.len() > MAX_PROVIDER_METADATA_PROVIDERS
+        || batch.accounts.len() > MAX_PROVIDER_METADATA_ACCOUNTS
+    {
+        return Err(invalid_state("Provider metadata batch exceeds its bound"));
+    }
+    let mut providers = BTreeSet::new();
+    for provider in &batch.providers {
+        if !providers.insert(&provider.provider_id) {
+            return Err(invalid_state(
+                "Provider metadata batch contains a duplicate Provider",
+            ));
+        }
+        to_i64(provider.updated_at_ms, "Provider metadata timestamp")?;
+    }
+    let mut accounts = BTreeSet::new();
+    for account in &batch.accounts {
+        if !accounts.insert(&account.account_id) {
+            return Err(invalid_state(
+                "Provider metadata batch contains a duplicate account",
+            ));
+        }
+        if account.consecutive_failures > 64 {
+            return Err(invalid_state(
+                "Provider account failure count exceeds its bound",
+            ));
+        }
+        match (account.health, account.cooldown_until_ms) {
+            (AccountRuntimeHealth::CoolingDown, Some(until_ms))
+                if until_ms > account.updated_at_ms => {}
+            (AccountRuntimeHealth::CoolingDown, _) => {
+                return Err(invalid_state(
+                    "cooling Provider account metadata requires a future deadline",
+                ));
+            }
+            (_, None) => {}
+            (_, Some(_)) => {
+                return Err(invalid_state(
+                    "non-cooling Provider account metadata has a cooldown deadline",
+                ));
+            }
+        }
+        match (account.quota_remaining, account.quota_resets_at_ms) {
+            (None, None) => {}
+            (Some(_), Some(resets_at_ms)) if resets_at_ms > account.updated_at_ms => {}
+            _ => {
+                return Err(invalid_state(
+                    "Provider account quota metadata is inconsistent",
+                ));
+            }
+        }
+        if account.selection_count > account.last_selected_sequence
+            || (account.selection_count == 0 && account.last_selected_sequence != 0)
+        {
+            return Err(invalid_state(
+                "Provider account selection metadata is inconsistent",
+            ));
+        }
+        for (value, name) in [
+            (account.cooldown_until_ms, "cooldown timestamp"),
+            (account.quota_remaining, "quota remaining"),
+            (account.quota_resets_at_ms, "quota reset timestamp"),
+        ] {
+            if let Some(value) = value {
+                to_i64(value, name)?;
+            }
+        }
+        to_i64(account.selection_count, "selection count")?;
+        to_i64(account.last_selected_sequence, "last selected sequence")?;
+        to_i64(account.updated_at_ms, "account metadata timestamp")?;
+    }
+    Ok(())
+}
+
+fn load_provider_metadata(
+    connection: &Connection,
+    now_ms: u64,
+) -> Result<ProviderMetadataBatch, StorageError> {
+    let providers = {
+        let mut statement = connection
+            .prepare(
+                "SELECT provider_id, updated_at_ms
+                 FROM provider_runtime_metadata
+                 ORDER BY provider_id",
+            )
+            .map_err(map_database_error)?;
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(map_database_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_database_error)?
+            .into_iter()
+            .map(|(provider_id, updated_at_ms)| {
+                Ok(ProviderRuntimeMetadata {
+                    provider_id: ProviderId::new(provider_id).map_err(|_| {
+                        StorageError::StateDatabaseCorrupt {
+                            message: "Provider metadata contains an invalid Provider identifier"
+                                .to_owned(),
+                        }
+                    })?,
+                    updated_at_ms: provider_metadata_u64(updated_at_ms, "Provider timestamp")?,
+                })
+            })
+            .collect::<Result<Vec<_>, StorageError>>()?
+    };
+    let accounts = {
+        let mut statement = connection
+            .prepare(
+                "SELECT provider_id, account_id, health_state, consecutive_failures,
+                        cooldown_until_ms, quota_remaining, quota_resets_at_ms,
+                        selection_count, last_selected_sequence, updated_at_ms
+                 FROM account_runtime_metadata
+                 ORDER BY account_id",
+            )
+            .map_err(map_database_error)?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, i64>(9)?,
+                ))
+            })
+            .map_err(map_database_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_database_error)?
+            .into_iter()
+            .map(
+                |(
+                    provider_id,
+                    account_id,
+                    health,
+                    consecutive_failures,
+                    cooldown_until_ms,
+                    quota_remaining,
+                    quota_resets_at_ms,
+                    selection_count,
+                    last_selected_sequence,
+                    updated_at_ms,
+                )| {
+                    let consecutive_failures =
+                        u8::try_from(consecutive_failures).map_err(|_| {
+                            StorageError::StateDatabaseCorrupt {
+                                message:
+                                    "Provider account metadata contains an invalid failure count"
+                                        .to_owned(),
+                            }
+                        })?;
+                    let mut metadata = AccountRuntimeMetadata {
+                        provider_id: ProviderId::new(provider_id).map_err(|_| {
+                            StorageError::StateDatabaseCorrupt {
+                                message:
+                                    "Provider account metadata contains an invalid Provider identifier"
+                                        .to_owned(),
+                            }
+                        })?,
+                        account_id: AccountId::new(account_id).map_err(|_| {
+                            StorageError::StateDatabaseCorrupt {
+                                message:
+                                    "Provider account metadata contains an invalid account identifier"
+                                        .to_owned(),
+                            }
+                        })?,
+                        health: AccountRuntimeHealth::from_database(&health)?,
+                        consecutive_failures,
+                        cooldown_until_ms: provider_metadata_optional_u64(
+                            cooldown_until_ms,
+                            "cooldown timestamp",
+                        )?,
+                        quota_remaining: provider_metadata_optional_u64(
+                            quota_remaining,
+                            "quota remaining",
+                        )?,
+                        quota_resets_at_ms: provider_metadata_optional_u64(
+                            quota_resets_at_ms,
+                            "quota reset timestamp",
+                        )?,
+                        selection_count: provider_metadata_u64(
+                            selection_count,
+                            "selection count",
+                        )?,
+                        last_selected_sequence: provider_metadata_u64(
+                            last_selected_sequence,
+                            "last selected sequence",
+                        )?,
+                        updated_at_ms: provider_metadata_u64(
+                            updated_at_ms,
+                            "account timestamp",
+                        )?,
+                    };
+                    normalize_provider_metadata(&mut metadata, now_ms);
+                    Ok(metadata)
+                },
+            )
+            .collect::<Result<Vec<_>, StorageError>>()?
+    };
+    Ok(ProviderMetadataBatch {
+        providers,
+        accounts,
+    })
+}
+
+fn normalize_provider_metadata(metadata: &mut AccountRuntimeMetadata, now_ms: u64) {
+    if metadata
+        .cooldown_until_ms
+        .is_some_and(|until_ms| until_ms <= now_ms)
+    {
+        metadata.health = AccountRuntimeHealth::Healthy;
+        metadata.cooldown_until_ms = None;
+    }
+    if metadata
+        .quota_resets_at_ms
+        .is_some_and(|resets_at_ms| resets_at_ms <= now_ms)
+    {
+        metadata.quota_remaining = None;
+        metadata.quota_resets_at_ms = None;
+    }
+}
+
+fn provider_metadata_u64(value: i64, name: &str) -> Result<u64, StorageError> {
+    u64::try_from(value).map_err(|_| StorageError::StateDatabaseCorrupt {
+        message: format!("Provider metadata contains an invalid {name}"),
+    })
+}
+
+fn provider_metadata_optional_u64(
+    value: Option<i64>,
+    name: &str,
+) -> Result<Option<u64>, StorageError> {
+    value
+        .map(|value| provider_metadata_u64(value, name))
+        .transpose()
+}
+
 fn apply_ordered_migrations(connection: &mut Connection) -> Result<(), StorageError> {
     let versions = schema_versions(connection)?;
     if versions
@@ -4951,6 +5442,7 @@ fn apply_ordered_migrations(connection: &mut Connection) -> Result<(), StorageEr
         (1, INITIAL_MIGRATION),
         (2, RUNTIME_AUTH_MIGRATION),
         (3, SESSION_DIAGNOSTICS_MIGRATION),
+        (4, PROVIDER_METADATA_MIGRATION),
     ] {
         if versions.contains(&version) {
             continue;

@@ -31,7 +31,7 @@ fn token(token_id: &str, client_id: &str, digest_byte: u8) -> ClientTokenMetadat
 }
 
 #[test]
-fn existing_schema_one_upgrades_to_schema_three_without_losing_data() {
+fn existing_schema_one_upgrades_to_schema_four_without_losing_data() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("state.db");
     create_schema_one(&path);
@@ -46,7 +46,7 @@ fn existing_schema_one_upgrades_to_schema_three_without_losing_data() {
 
     let store = StateStore::open(&path).unwrap();
 
-    assert_eq!(store.health().unwrap().schema_version, 3);
+    assert_eq!(store.health().unwrap().schema_version, 4);
     let connection = Connection::open(path).unwrap();
     assert_eq!(
         connection
@@ -61,17 +61,17 @@ fn existing_schema_one_upgrades_to_schema_three_without_losing_data() {
     assert_eq!(
         connection
             .query_row(
-                "SELECT COUNT(*) FROM schema_migrations WHERE version IN (1, 2, 3)",
+                "SELECT COUNT(*) FROM schema_migrations WHERE version IN (1, 2, 3, 4)",
                 [],
                 |row| row.get::<_, i64>(0),
             )
             .unwrap(),
-        3
+        4
     );
 }
 
 #[test]
-fn concurrent_schema_one_opens_apply_schema_three_once() {
+fn concurrent_schema_one_opens_apply_schema_four_once() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("state.db");
     create_schema_one(&path);
@@ -89,14 +89,14 @@ fn concurrent_schema_one_opens_apply_schema_three_once() {
         .collect::<Vec<_>>();
 
     for handle in handles {
-        assert_eq!(handle.join().unwrap().schema_version, 3);
+        assert_eq!(handle.join().unwrap().schema_version, 4);
     }
 
     let connection = Connection::open(path).unwrap();
     assert_eq!(
         connection
             .query_row(
-                "SELECT COUNT(*) FROM schema_migrations WHERE version = 3",
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = 4",
                 [],
                 |row| row.get::<_, i64>(0),
             )
@@ -368,7 +368,7 @@ fn read_only_inspection_reads_health_and_management_binding_without_writes() {
     let before = directory_snapshot(directory.path());
 
     let read_only = ReadOnlyStateStore::open(&path).unwrap();
-    assert_eq!(read_only.health().unwrap().schema_version, 3);
+    assert_eq!(read_only.health().unwrap().schema_version, 4);
     assert_eq!(
         read_only
             .runtime_secret_binding("management")
@@ -387,13 +387,13 @@ fn read_only_inspection_sees_a_valid_committed_crash_wal_without_writes() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("state.db");
     create_schema_one_main_with_wal(&path);
-    run_crash_wal_helper(&path, "migrate-three");
+    run_crash_wal_helper(&path, "migrate-four");
     assert!(fs::metadata(path.with_extension("db-wal")).unwrap().len() > 0);
     let before = directory_snapshot(directory.path());
 
     let read_only = ReadOnlyStateStore::open(&path).unwrap();
 
-    assert_eq!(read_only.health().unwrap().schema_version, 3);
+    assert_eq!(read_only.health().unwrap().schema_version, 4);
     drop(read_only);
     assert_snapshot_unchanged(directory.path(), &before);
 }
@@ -403,13 +403,13 @@ fn read_only_inspection_rebuilds_a_missing_crash_wal_index_in_memory() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("state.db");
     create_schema_one_main_with_wal(&path);
-    run_crash_wal_helper(&path, "migrate-three");
+    run_crash_wal_helper(&path, "migrate-four");
     fs::remove_file(path.with_extension("db-shm")).unwrap();
     let before = directory_snapshot(directory.path());
 
     let read_only = ReadOnlyStateStore::open(&path).unwrap();
 
-    assert_eq!(read_only.health().unwrap().schema_version, 3);
+    assert_eq!(read_only.health().unwrap().schema_version, 4);
     drop(read_only);
     assert_snapshot_unchanged(directory.path(), &before);
 }
@@ -419,7 +419,7 @@ fn read_only_inspection_rebuilds_a_corrupt_crash_wal_index_in_memory() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("state.db");
     create_schema_one_main_with_wal(&path);
-    run_crash_wal_helper(&path, "migrate-three");
+    run_crash_wal_helper(&path, "migrate-four");
     let shm_path = path.with_extension("db-shm");
     let mut shm = fs::read(&shm_path).unwrap();
     shm[0] ^= 0x01;
@@ -428,7 +428,7 @@ fn read_only_inspection_rebuilds_a_corrupt_crash_wal_index_in_memory() {
 
     let read_only = ReadOnlyStateStore::open(&path).unwrap();
 
-    assert_eq!(read_only.health().unwrap().schema_version, 3);
+    assert_eq!(read_only.health().unwrap().schema_version, 4);
     drop(read_only);
     assert_snapshot_unchanged(directory.path(), &before);
 }
@@ -438,7 +438,7 @@ fn read_only_inspection_reports_a_corrupt_crash_wal_without_writes() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("state.db");
     create_schema_one_main_with_wal(&path);
-    run_crash_wal_helper(&path, "migrate-three");
+    run_crash_wal_helper(&path, "migrate-four");
     let wal_path = path.with_extension("db-wal");
     let mut wal = fs::read(&wal_path).unwrap();
     *wal.last_mut().unwrap() ^= 0x01;
@@ -502,12 +502,15 @@ fn crash_wal_writer_helper() {
         .execute_batch("PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0;")
         .unwrap();
     match mode.as_str() {
-        "migrate-three" => {
+        "migrate-four" => {
             connection
                 .execute_batch(include_str!("../migrations/0002_runtime_auth.sql"))
                 .unwrap();
             connection
                 .execute_batch(include_str!("../migrations/0003_session_diagnostics.sql"))
+                .unwrap();
+            connection
+                .execute_batch(include_str!("../migrations/0004_provider_metadata.sql"))
                 .unwrap();
         }
         _ => panic!("unexpected crash WAL helper mode"),

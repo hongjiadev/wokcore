@@ -3,12 +3,14 @@ mod wal;
 mod writer;
 
 pub use store::{
-    AttemptId, CandidateBeginOutcome, CheckpointResult, CleanupBatchOutcome, ClientTokenMetadata,
-    ClientTokenScope, ClientTokenScopeParseError, CodexReplaySignature, CodexReplaySignaturePage,
+    AccountRuntimeHealth, AccountRuntimeMetadata, AttemptId, CandidateBeginOutcome,
+    CheckpointResult, CleanupBatchOutcome, ClientTokenMetadata, ClientTokenScope,
+    ClientTokenScopeParseError, CodexReplaySignature, CodexReplaySignaturePage,
     GlobalSessionIndexPage, GlobalSessionIndexPageKey, GlobalSessionUsagePage,
     GlobalSessionUsagePageKey, MAX_CODEX_REPLAY_SIGNATURES, MAX_PARSER_CHECKPOINT_BYTES,
     MAX_SESSION_BATCH_BYTES, MAX_SESSION_BATCH_ROWS, MAX_SUPPLEMENTAL_BYTES,
     MAX_SUPPLEMENTAL_ROW_BYTES, MAX_SUPPLEMENTAL_ROWS, OpaqueFingerprint, ParserCheckpoint,
+    ProviderMetadataBatch, ProviderMetadataBatchOutcome, ProviderRuntimeMetadata,
     ReadOnlyStateStore, ReplaySignaturePageKey, RequestId, RequestMetric,
     RequestSupplementalMetadata, RuntimeSecretBinding, ScopedClientTokenMetadata,
     SessionAvailability, SessionBatch, SessionFileIdentity, SessionGenerationState,

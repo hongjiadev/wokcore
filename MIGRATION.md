@@ -310,3 +310,18 @@ Private pre-rewrite recovery material is excluded from this public repository.
   - fixed-host `wokcore-engine` routing snapshot tests;
   - complete Windows workspace suite through `E:/Projects/wokcore/target/wokcore-test-host.exe`;
   - `cargo +1.97.1 clippy -p wokcore-engine --all-targets --offline -- -D warnings`.
+
+## Runtime foundation 14: account runtime state and schema 4
+
+- Original WokCore implementation; no external account-selection or persistence code is imported.
+- Account health is held in 64 bounded shards. Weighted least-use selection, success recovery, quota windows, bounded exponential cooldowns, bounded server retry hints, and immediate invalid-credential quarantine operate without a global request lock or proxy concurrency semaphore.
+- Thread affinity is memory-only, split across bounded shards, expires automatically, stores a domain-separated keyed SHA-256 digest rather than the caller's thread key, and returns shared account identifiers without per-lookup string allocation.
+- SQLite schema 4 removes the unused schema-1 `thread_affinities` and `quota_windows` tables. Secure deletion is enabled for the one-time removal so legacy raw affinity bytes are cleared; the setting is disabled again before normal operation.
+- Replacement batches persist only bounded Provider/account identifiers, health codes, cooldown/quota timestamps, selection counters, and update timestamps. They contain no thread key, prompt, response, tool payload, authorization value, cookie, or credential.
+- Batches are validated before a transaction, run through the existing bounded single-writer queue, delete stale rows, update only changed rows, and skip the transaction entirely when the complete state is unchanged. No request or stream event performs a durable write.
+- Restart loading preserves active quarantine/cooldown/quota state and clears windows whose explicit deadlines have passed. Invalid or inconsistent rows fail closed.
+- Verification:
+  - eight fixed-host account-selection, health, quota, affinity, concurrent-observation, and restart tests;
+  - seven fixed-host schema-4 migration, atomic batch, zero-WAL replay, bounded replacement, privacy, and writer-queue tests;
+  - complete Windows workspace suite through `E:/Projects/wokcore/target/wokcore-test-host.exe`;
+  - engine/storage Clippy with `-D warnings`, rustfmt, locked offline metadata, and public repository hygiene checks.

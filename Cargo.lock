@@ -2385,6 +2385,7 @@ dependencies = [
  "arc-swap",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
  "toml_edit",
  "url",

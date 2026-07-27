@@ -361,13 +361,13 @@ fn external_crate_can_rebuild_every_page_key_from_validated_components() {
 }
 
 #[test]
-fn ordered_migration_history_reaches_schema_three() {
+fn ordered_migration_history_reaches_schema_four() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("state.db");
 
     let store = StateStore::open(&path).unwrap();
 
-    assert_eq!(store.health().unwrap().schema_version, 3);
+    assert_eq!(store.health().unwrap().schema_version, 4);
     let connection = Connection::open(path).unwrap();
     let versions = connection
         .prepare("SELECT version FROM schema_migrations ORDER BY version")
@@ -376,7 +376,7 @@ fn ordered_migration_history_reaches_schema_three() {
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(versions, [1, 2, 3]);
+    assert_eq!(versions, [1, 2, 3, 4]);
 }
 
 #[test]
@@ -521,7 +521,14 @@ fn schema_three_has_only_required_keyset_indexes() {
     let indexes = connection
         .prepare(
             "SELECT name FROM sqlite_schema
-             WHERE type = 'index' AND name NOT LIKE 'sqlite_autoindex_%'
+             WHERE type = 'index'
+               AND name NOT LIKE 'sqlite_autoindex_%'
+               AND tbl_name IN (
+                 'codex_replay_signatures',
+                 'request_supplemental_metadata',
+                 'session_index',
+                 'session_usage_records'
+               )
              ORDER BY name",
         )
         .unwrap()
@@ -631,7 +638,7 @@ fn schema_two_migration_is_transactional_concurrent_and_preserves_data() {
         .collect::<Vec<_>>();
 
     for handle in handles {
-        assert_eq!(handle.join().unwrap().schema_version, 3);
+        assert_eq!(handle.join().unwrap().schema_version, 4);
     }
     let connection = Connection::open(path).unwrap();
     assert_eq!(
@@ -647,12 +654,12 @@ fn schema_two_migration_is_transactional_concurrent_and_preserves_data() {
     assert_eq!(
         connection
             .query_row(
-                "SELECT COUNT(*) FROM schema_migrations WHERE version = 3",
+                "SELECT COUNT(*) FROM schema_migrations WHERE version IN (3, 4)",
                 [],
                 |row| row.get::<_, i64>(0),
             )
             .unwrap(),
-        1
+        2
     );
 }
 
@@ -2086,21 +2093,21 @@ fn replay_rollout_hard_limit_rejects_one_more_signature() {
 }
 
 #[test]
-fn schema_three_offline_and_live_read_only_inspection_do_not_write() {
+fn schema_four_offline_and_live_read_only_inspection_do_not_write() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("state.db");
     let store = StateStore::open(&path).unwrap();
     let before_live = directory_snapshot(directory.path());
 
     let live = ReadOnlyStateStore::open_live(&path).unwrap();
-    assert_eq!(live.health().unwrap().schema_version, 3);
+    assert_eq!(live.health().unwrap().schema_version, 4);
     drop(live);
     assert_eq!(directory_snapshot(directory.path()), before_live);
     drop(store);
     let before_offline = directory_snapshot(directory.path());
 
     let offline = ReadOnlyStateStore::open(&path).unwrap();
-    assert_eq!(offline.health().unwrap().schema_version, 3);
+    assert_eq!(offline.health().unwrap().schema_version, 4);
     drop(offline);
     assert_eq!(directory_snapshot(directory.path()), before_offline);
 }

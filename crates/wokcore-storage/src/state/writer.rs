@@ -9,8 +9,9 @@ use tokio::sync::{mpsc, oneshot};
 use crate::StorageError;
 
 use super::{
-    MAX_SESSION_BATCH_ROWS, RequestSupplementalMetadata, SessionBatch, StateStore,
-    SupplementalBatchOutcome, WAL_CHECKPOINT_THRESHOLD_BYTES,
+    MAX_SESSION_BATCH_ROWS, ProviderMetadataBatch, ProviderMetadataBatchOutcome,
+    RequestSupplementalMetadata, SessionBatch, StateStore, SupplementalBatchOutcome,
+    WAL_CHECKPOINT_THRESHOLD_BYTES,
 };
 
 pub const STATE_STORE_WRITER_QUEUE_CAPACITY: usize = 4;
@@ -155,6 +156,14 @@ impl StateStoreWriterClient {
         batch: SessionBatch,
     ) -> Result<StateStoreWriteReceipt<SupplementalBatchOutcome>, StateStoreWriterSubmitError> {
         self.try_execute(move |store| store.commit_candidate_batch(&batch))
+    }
+
+    pub fn try_record_provider_metadata_batch(
+        &self,
+        batch: ProviderMetadataBatch,
+    ) -> Result<StateStoreWriteReceipt<ProviderMetadataBatchOutcome>, StateStoreWriterSubmitError>
+    {
+        self.try_execute(move |store| store.record_provider_metadata_batch(&batch))
     }
 
     pub fn try_record_request_supplemental_batch(
