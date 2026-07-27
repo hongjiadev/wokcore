@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{str::FromStr, time::Duration};
 
 use axum::{
     Json,
@@ -10,7 +10,9 @@ use axum::{
 };
 use secrecy::ExposeSecret;
 use wokcore_core::id::ClientId;
+use wokcore_diagnostics::event::StateTransition;
 use wokcore_protocols::IMPLEMENTED_PROVIDER_PROTOCOLS;
+use wokcore_storage::ClientTokenScope;
 
 use crate::ServerState;
 
@@ -20,7 +22,7 @@ use super::{
         AuthorizeRequest, AuthorizeResponse, CapabilitiesResponse, HealthResponse,
         LifecycleResponse, RevokeResponse,
     },
-    request_id::RequestId,
+    request_id::{RequestId, record_lifecycle_diagnostic},
 };
 
 pub(crate) async fn health(State(state): State<ServerState>) -> Json<HealthResponse> {
@@ -33,9 +35,14 @@ pub(crate) async fn health(State(state): State<ServerState>) -> Json<HealthRespo
 const CAPABILITIES: &[&str] = &[
     "client_token.issue",
     "client_token.revoke",
+    "diagnostics.events.v1",
+    "diagnostics.export.v1",
     "discovery.v1",
     "service.drain",
     "service.status",
+    "sessions.index.v1",
+    "sessions.messages.v1",
+    "usage.session.v1",
 ];
 
 pub(crate) async fn capabilities(State(state): State<ServerState>) -> Json<CapabilitiesResponse> {
@@ -59,11 +66,21 @@ pub(crate) async fn drain(
     Extension(request_id): Extension<RequestId>,
     State(state): State<ServerState>,
 ) -> Result<Json<LifecycleResponse>, ApiError> {
+    let before = state.lifecycle.snapshot().phase;
     state
         .lifecycle
         .begin_drain(Duration::from_secs(30))
         .await
         .map_err(|_| ApiError::lifecycle_conflict(request_id))?;
+    let after = state.lifecycle.snapshot().phase;
+    if before == crate::lifecycle::LifecyclePhase::Running {
+        let transition = if after == crate::lifecycle::LifecyclePhase::AwaitingCancellation {
+            StateTransition::DrainingToAwaitingCancellation
+        } else {
+            StateTransition::ReadyToDraining
+        };
+        record_lifecycle_diagnostic(&state, request_id, transition);
+    }
     Ok(Json(lifecycle_response(state.lifecycle.snapshot())))
 }
 
@@ -71,10 +88,18 @@ pub(crate) async fn cancel_drain(
     Extension(request_id): Extension<RequestId>,
     State(state): State<ServerState>,
 ) -> Result<Json<LifecycleResponse>, ApiError> {
+    let before = state.lifecycle.snapshot().phase;
     let snapshot = state
         .lifecycle
         .cancel_drain()
         .map_err(|_| ApiError::lifecycle_conflict(request_id))?;
+    if matches!(
+        before,
+        crate::lifecycle::LifecyclePhase::Draining
+            | crate::lifecycle::LifecyclePhase::AwaitingCancellation
+    ) {
+        record_lifecycle_diagnostic(&state, request_id, StateTransition::DrainingToReady);
+    }
     Ok(Json(lifecycle_response(snapshot)))
 }
 
@@ -82,10 +107,14 @@ pub(crate) async fn stop(
     Extension(request_id): Extension<RequestId>,
     State(state): State<ServerState>,
 ) -> Result<Json<LifecycleResponse>, ApiError> {
+    let before = state.lifecycle.snapshot().phase;
     let snapshot = state
         .lifecycle
         .request_stop()
         .map_err(|_| ApiError::lifecycle_conflict(request_id))?;
+    if before != crate::lifecycle::LifecyclePhase::Stopping {
+        record_lifecycle_diagnostic(&state, request_id, StateTransition::ReadyToStopping);
+    }
     let response = lifecycle_response(snapshot);
     state.request_shutdown();
     Ok(Json(response))
@@ -103,6 +132,8 @@ pub(crate) async fn authorize(
         }
         Err(_) => return Err(ApiError::invalid_request_body(request_id)),
     };
+    let scopes = parse_authorize_scopes(request.scopes)
+        .ok_or_else(|| ApiError::invalid_request_body(request_id))?;
     let token_id = state
         .token_metadata
         .new_token_id()
@@ -113,7 +144,12 @@ pub(crate) async fn authorize(
         .map_err(|_| ApiError::internal_failure(request_id))?;
     let material = state
         .auth
-        .issue_client_token(token_id.clone(), request.client_id.clone(), issued_at)
+        .issue_client_token_with_scopes(
+            token_id.clone(),
+            request.client_id.clone(),
+            issued_at,
+            scopes.clone(),
+        )
         .await
         .map_err(|_| ApiError::storage_failure(request_id))?;
     let token = material.into_response_value();
@@ -123,8 +159,25 @@ pub(crate) async fn authorize(
             client_id: request.client_id,
             token_id,
             token: token.expose_secret().to_owned(),
+            scopes: scopes.into_iter().map(ClientTokenScope::as_str).collect(),
         }),
     ))
+}
+
+fn parse_authorize_scopes(scopes: Option<Vec<String>>) -> Option<Vec<ClientTokenScope>> {
+    let scopes = scopes.unwrap_or_else(|| vec![ClientTokenScope::ProxyUse.as_str().to_owned()]);
+    if scopes.is_empty() {
+        return None;
+    }
+    let mut parsed = scopes
+        .iter()
+        .map(|scope| ClientTokenScope::from_str(scope))
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    let original_len = parsed.len();
+    parsed.sort_unstable();
+    parsed.dedup();
+    (parsed.len() == original_len).then_some(parsed)
 }
 
 pub(crate) async fn revoke(

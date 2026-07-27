@@ -21,10 +21,18 @@ wokcore serve [--json]
 wokcore status [--json]
 wokcore stop [--json]
 wokcore doctor [--json]
-wokcore authorize --client <id> --json
+wokcore authorize --client <id> [--scope <scope> ...] --json
+wokcore sessions list [--source <codex|claude|gemini>] [--limit <n>] [--json]
+wokcore sessions show <session-key> [--cursor <cursor>] [--limit <n>] [--json]
+wokcore logs [--request-id <id>] [--level <level>] [--component <component>] [--since <utc>] [--jsonl]
+wokcore diagnostics export --output <path>
 ```
 
 `authorize` intentionally requires JSON output because its successful response contains a one-time proxy token. Tokens, Authorization values, credential paths, and secret references are never accepted as command-line arguments. `status` and `doctor` use read-only discovery, filesystem, SQLite, and loopback probes.
+
+Session discovery automatically detects Codex, Claude Code, and Gemini CLI stores for the current platform. External Session files remain read-only: WokCore indexes bounded metadata and usage, while message bodies are paged directly from their source only after an authenticated request. Timestamps are normalized to UTC from supported source offsets without a locale, language, or timezone selection.
+
+Session, usage, log, and diagnostic-export endpoints accept either the management token or a client token with the exact required scope. Diagnostic events are bounded and redacted; ordinary request events remain in the 16 MiB memory ring, while lifecycle events, warnings, and errors are batch-persisted into rotating segments. A diagnostic export is streamed with a 64 MiB hard bound, is create-new in the CLI, and never contains Session bodies, credentials, authorization headers, cookies, raw tokens, or absolute user paths.
 
 ## Development
 

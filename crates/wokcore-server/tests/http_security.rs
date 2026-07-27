@@ -387,6 +387,46 @@ async fn management_routes_reject_missing_malformed_wrong_and_proxy_bearer_token
 }
 
 #[tokio::test]
+async fn unknown_and_scoped_control_plane_routes_never_fall_through_as_public() {
+    for path in [
+        "/wokcore/v1/sessions",
+        "/wokcore/v1/usage",
+        "/wokcore/v1/logs",
+        "/wokcore/v1/diagnostics/export",
+        "/wokcore/v1/future-private-route",
+    ] {
+        let response = router()
+            .await
+            .oneshot(request_to(
+                "GET",
+                path,
+                Some(AUTHORITY),
+                None,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+        assert_eq!(error_code(response).await, "unauthorized", "{path}");
+    }
+
+    let mut authenticated = request_to(
+        "GET",
+        "/wokcore/v1/future-private-route",
+        Some(AUTHORITY),
+        None,
+        Body::empty(),
+    );
+    authenticated.headers_mut().insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {}", management_token())).unwrap(),
+    );
+    let response = router().await.oneshot(authenticated).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(error_code(response).await, "not_found");
+}
+
+#[tokio::test]
 async fn management_authentication_precedes_json_parsing() {
     let invalid_json = ["sensitive", "body", "canary"].join("-");
     let mut incoming = request_to(

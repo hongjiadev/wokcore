@@ -14,12 +14,15 @@ Independent local provider gateway for the Wok product family
 Usage: wokcore <COMMAND>
 
 Commands:
-  serve      Run the local WokCore service
-  status     Report local WokCore service status
-  stop       Gracefully stop the local WokCore service
-  doctor     Diagnose the local WokCore service
-  authorize  Issue a one-time proxy token for a client
-  help       Print this message or the help of the given subcommand(s)
+  serve        Run the local WokCore service
+  status       Report local WokCore service status
+  stop         Gracefully stop the local WokCore service
+  doctor       Diagnose the local WokCore service
+  authorize    Issue a one-time proxy token for a client
+  sessions     Read indexed local coding sessions
+  logs         Read redacted WokCore diagnostic events
+  diagnostics  Work with bounded diagnostic support packages
+  help         Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help     Print help
@@ -50,7 +53,7 @@ fn root_help_and_version_are_exact_and_deterministic() {
 }
 
 #[test]
-fn only_the_five_documented_commands_and_options_are_accepted() {
+fn only_the_documented_commands_and_options_are_accepted() {
     let cases = [
         (
             "serve",
@@ -70,7 +73,19 @@ fn only_the_five_documented_commands_and_options_are_accepted() {
         ),
         (
             "authorize",
-            "Issue a one-time proxy token for a client\n\nUsage: wokcore authorize --client <ID> --json\n\nOptions:\n      --client <ID>  Client identifier to authorize\n      --json         Emit the one-time token in a stable JSON object\n  -h, --help         Print help\n",
+            "Issue a one-time proxy token for a client\n\nUsage: wokcore authorize [OPTIONS] --client <ID> --json\n\nOptions:\n      --client <ID>    Client identifier to authorize\n      --scope <SCOPE>  Exact client-token scope; repeat to grant more than one\n      --json           Emit the one-time token in a stable JSON object\n  -h, --help           Print help\n",
+        ),
+        (
+            "sessions",
+            "Read indexed local coding sessions\n\nUsage: wokcore sessions <COMMAND>\n\nCommands:\n  list  List indexed sessions\n  show  Show messages from one indexed session\n  help  Print this message or the help of the given subcommand(s)\n\nOptions:\n  -h, --help  Print help\n",
+        ),
+        (
+            "logs",
+            "Read redacted WokCore diagnostic events\n\nUsage: wokcore logs [OPTIONS]\n\nOptions:\n      --request-id <REQUEST_ID>  Exact request correlation identifier\n      --level <LEVEL>            Minimum diagnostic level\n      --component <COMPONENT>    Exact diagnostic component\n      --since <SINCE>            Inclusive canonical UTC start timestamp\n      --jsonl                    Emit one JSON event per line\n  -h, --help                     Print help\n",
+        ),
+        (
+            "diagnostics",
+            "Work with bounded diagnostic support packages\n\nUsage: wokcore diagnostics <COMMAND>\n\nCommands:\n  export  Export a validated diagnostic support package\n  help    Print this message or the help of the given subcommand(s)\n\nOptions:\n  -h, --help  Print help\n",
         ),
     ];
 
@@ -88,6 +103,16 @@ fn only_the_five_documented_commands_and_options_are_accepted() {
         &["stop", "--authorization", "secret"],
         &["doctor", "--credential-path", "secret"],
         &["authorize", "--client", "wokrouter", "--token", "secret"],
+        &["sessions", "list", "--token", "secret"],
+        &["logs", "--authorization", "secret"],
+        &[
+            "diagnostics",
+            "export",
+            "--output",
+            "bundle.zip",
+            "--token",
+            "secret",
+        ],
     ] {
         assert!(!run(rejected).status.success(), "{rejected:?}");
     }
@@ -169,6 +194,8 @@ fn json_commands_report_path_discovery_failure_as_stable_json() {
         &["stop", "--json"],
         &["doctor", "--json"],
         &["authorize", "--client", "wokrouter", "--json"],
+        &["sessions", "list", "--json"],
+        &["logs", "--jsonl"],
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_wokcore"))
             .args(arguments)
@@ -194,6 +221,27 @@ fn json_commands_report_path_discovery_failure_as_stable_json() {
         );
         assert!(output.stderr.is_empty(), "{arguments:?}");
     }
+
+    let diagnostics = Command::new(env!("CARGO_BIN_EXE_wokcore"))
+        .args(["diagnostics", "export", "--output", "bundle.zip"])
+        .env_remove("APPDATA")
+        .env_remove("LOCALAPPDATA")
+        .env_remove("HOME")
+        .env_remove("USERPROFILE")
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("XDG_STATE_HOME")
+        .env_remove("XDG_RUNTIME_DIR")
+        .output()
+        .expect("wokcore binary should start");
+    assert_eq!(
+        diagnostics.status.code(),
+        Some(ExitCode::InvalidInput.as_i32())
+    );
+    assert!(diagnostics.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(diagnostics.stderr).unwrap(),
+        "WokCore application paths are unavailable.\n"
+    );
 }
 
 #[test]

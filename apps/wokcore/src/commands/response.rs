@@ -6,9 +6,16 @@ pub(super) const MAX_RESPONSE_BODY_BYTES: usize = 64 * 1024;
 pub(super) async fn read_bounded(
     mut response: Response,
 ) -> Result<Zeroizing<Vec<u8>>, ResponseBodyError> {
+    read_bounded_with_limit(&mut response, MAX_RESPONSE_BODY_BYTES).await
+}
+
+pub(super) async fn read_bounded_with_limit(
+    response: &mut Response,
+    maximum_bytes: usize,
+) -> Result<Zeroizing<Vec<u8>>, ResponseBodyError> {
     if response
         .content_length()
-        .is_some_and(|length| length > MAX_RESPONSE_BODY_BYTES as u64)
+        .is_some_and(|length| length > maximum_bytes as u64)
     {
         return Err(ResponseBodyError);
     }
@@ -22,7 +29,7 @@ pub(super) async fn read_bounded(
             .len()
             .checked_add(chunk.len())
             .ok_or(ResponseBodyError)?;
-        if length > MAX_RESPONSE_BODY_BYTES {
+        if length > maximum_bytes {
             return Err(ResponseBodyError);
         }
         body.extend_from_slice(&chunk);

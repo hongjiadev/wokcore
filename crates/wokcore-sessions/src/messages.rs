@@ -19,10 +19,10 @@ use crate::{
     model::{OpaqueStreamHash, normalize_timestamp, opaque_hash},
 };
 
-pub const MAX_MESSAGE_PAGE_MESSAGES: usize = 128;
-pub const MAX_MESSAGE_PAGE_UTF8_BYTES: usize = 256 * 1024;
+pub const MAX_MESSAGE_PAGE_MESSAGES: usize = 500;
+pub const MAX_MESSAGE_PAGE_UTF8_BYTES: usize = 1024 * 1024;
 pub const MAX_JSONL_PAGE_SOURCE_WORK_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_MESSAGE_ITEM_UTF8_BYTES: usize = 64 * 1024;
+const MAX_MESSAGE_ITEM_UTF8_BYTES: usize = MAX_MESSAGE_PAGE_UTF8_BYTES;
 const MAX_MESSAGE_TOOLS: usize = 32;
 const MAX_TOOL_NAME_UTF8_BYTES: usize = 256;
 const MAX_ACTIVE_PAGE_REFS: usize = 16_384;

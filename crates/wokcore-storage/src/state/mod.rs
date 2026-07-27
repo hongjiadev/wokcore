@@ -14,10 +14,12 @@ pub use store::{
     SessionAvailability, SessionBatch, SessionFileIdentity, SessionGenerationState,
     SessionIndexPage, SessionIndexPageKey, SessionIndexRecord, SessionScanCursor,
     SessionScanResultCode, SessionSourceErrorCode, SessionSourceKind, SessionSourcePage,
-    SessionSourcePageKey, SessionSourceState, SessionSourceStatus, SessionUsagePage,
-    SessionUsagePageKey, SessionUsageRecord, StateHealth, StateStore, SupplementalBatchOutcome,
-    SupplementalErrorCode, SupplementalFailoverDecision, SupplementalRetryDecision,
-    SupplementalStorageStats, TraceId, WAL_CHECKPOINT_THRESHOLD_BYTES,
+    SessionSourcePageKey, SessionSourceState, SessionSourceStatus, SessionUsageAggregateBucket,
+    SessionUsageAggregateFilter, SessionUsageAggregatePage, SessionUsageAggregatePageKey,
+    SessionUsageAggregateTotals, SessionUsageGroupBy, SessionUsagePage, SessionUsagePageKey,
+    SessionUsageRecord, StateHealth, StateStore, SupplementalBatchOutcome, SupplementalErrorCode,
+    SupplementalFailoverDecision, SupplementalRetryDecision, SupplementalStorageStats, TraceId,
+    WAL_CHECKPOINT_THRESHOLD_BYTES,
 };
 pub use writer::{
     STATE_STORE_WRITER_QUEUE_CAPACITY, SUPPLEMENTAL_CLEANUP_INTERVAL, StateStoreWriteError,

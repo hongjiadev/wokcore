@@ -31,7 +31,8 @@ use wokcore_server::{
     runtime::{TokenMetadataError, TokenMetadataSource},
 };
 use wokcore_storage::{
-    ClientTokenMetadata, MemorySecretStore, RuntimeSecretBinding, SecretStore, StorageError,
+    ClientTokenMetadata, ClientTokenScope, MemorySecretStore, RuntimeSecretBinding, SecretStore,
+    StorageError,
 };
 
 const AUTHORITY: &str = "127.0.0.1:43128";
@@ -147,6 +148,14 @@ impl AuthMetadataStore for TestMetadata {
         self.issue_gate.block_if_armed();
         self.active.lock().unwrap().push(token.clone());
         Ok(())
+    }
+
+    fn issue_client_token_with_scopes(
+        &self,
+        token: &ClientTokenMetadata,
+        _scopes: &[ClientTokenScope],
+    ) -> Result<(), StorageError> {
+        self.issue_client_token(token)
     }
 
     fn revoke_client_token(
@@ -312,9 +321,14 @@ async fn health_and_capabilities_are_public_minimal_and_versioned() {
         json!([
             "client_token.issue",
             "client_token.revoke",
+            "diagnostics.events.v1",
+            "diagnostics.export.v1",
             "discovery.v1",
             "service.drain",
-            "service.status"
+            "service.status",
+            "sessions.index.v1",
+            "sessions.messages.v1",
+            "usage.session.v1"
         ])
     );
     assert_eq!(
@@ -428,6 +442,52 @@ async fn authorize_returns_raw_proxy_once_and_revoke_removes_it() {
         .unwrap();
     assert_eq!(revoked.status(), StatusCode::OK);
     assert_eq!(json_body(revoked).await, json!({"revoked":true}));
+}
+
+#[tokio::test]
+async fn authorize_accepts_explicit_scopes_and_enforces_them_independently() {
+    let fixture = fixture().await;
+    let authorize = fixture
+        .app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/wokcore/v1/clients/authorize",
+            Some(&fixture.management),
+            Some(json!({
+                "client_id": "wokrouter",
+                "scopes": ["sessions.read", "diagnostics.read"]
+            })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(authorize.status(), StatusCode::CREATED);
+    let authorized = json_body(authorize).await;
+    assert_eq!(
+        authorized["scopes"],
+        json!(["sessions.read", "diagnostics.read"])
+    );
+    let token = authorized["token"].as_str().unwrap();
+
+    let sessions = fixture
+        .app
+        .clone()
+        .oneshot(request("GET", "/wokcore/v1/sessions", Some(token), None))
+        .await
+        .unwrap();
+    assert_eq!(sessions.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(json_body(sessions).await["error"]["code"], "query_busy");
+
+    let usage = fixture
+        .app
+        .oneshot(request("GET", "/wokcore/v1/usage", Some(token), None))
+        .await
+        .unwrap();
+    assert_eq!(usage.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        json_body(usage).await["error"]["code"],
+        "insufficient_scope"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -567,14 +627,26 @@ async fn malformed_dynamic_path_uses_the_stable_json_error_envelope() {
 #[tokio::test]
 async fn unknown_routes_and_wrong_methods_use_stable_errors() {
     let fixture = fixture().await;
-    for (method, path, status, code) in [
-        ("GET", "/wokcore/v1/missing", 404, "not_found"),
-        ("POST", "/wokcore/v1/health", 405, "method_not_allowed"),
+    for (method, path, management, status, code) in [
+        (
+            "GET",
+            "/wokcore/v1/missing",
+            Some(fixture.management.as_str()),
+            404,
+            "not_found",
+        ),
+        (
+            "POST",
+            "/wokcore/v1/health",
+            None,
+            405,
+            "method_not_allowed",
+        ),
     ] {
         let response = fixture
             .app
             .clone()
-            .oneshot(request(method, path, None, None))
+            .oneshot(request(method, path, management, None))
             .await
             .unwrap();
         assert_eq!(response.status().as_u16(), status);
@@ -590,7 +662,7 @@ async fn non_contract_revoke_like_paths_are_plain_not_found_routes() {
         .oneshot(request(
             "DELETE",
             "/wokcore/v1/clients/a/tokens/b/extra",
-            None,
+            Some(&fixture.management),
             None,
         ))
         .await

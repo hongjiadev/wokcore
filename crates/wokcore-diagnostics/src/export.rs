@@ -178,6 +178,10 @@ pub enum ExportCapability {
     DiagnosticsExport,
     #[serde(rename = "diagnostics.read")]
     DiagnosticsRead,
+    #[serde(rename = "diagnostics.events.v1")]
+    DiagnosticsEventsV1,
+    #[serde(rename = "diagnostics.export.v1")]
+    DiagnosticsExportV1,
     #[serde(rename = "discovery.v1")]
     DiscoveryV1,
     #[serde(rename = "service.drain")]
@@ -186,6 +190,12 @@ pub enum ExportCapability {
     ServiceStatus,
     #[serde(rename = "sessions.read")]
     SessionsRead,
+    #[serde(rename = "sessions.index.v1")]
+    SessionsIndexV1,
+    #[serde(rename = "sessions.messages.v1")]
+    SessionsMessagesV1,
+    #[serde(rename = "usage.session.v1")]
+    UsageSessionV1,
     #[serde(rename = "usage.read")]
     UsageRead,
 }

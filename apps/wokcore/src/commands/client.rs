@@ -90,6 +90,22 @@ impl ControlClient {
             .await
             .map_err(|_| ControlClientError::NotRunning)
     }
+
+    pub(super) async fn get(
+        &self,
+        path: &str,
+        management: &SecretString,
+    ) -> Result<Response, ControlClientError> {
+        use secrecy::ExposeSecret;
+
+        self.client
+            .get(format!("{}{path}", self.record.base_url))
+            .header(HOST, &self.authority)
+            .bearer_auth(management.expose_secret())
+            .send()
+            .await
+            .map_err(|_| ControlClientError::NotRunning)
+    }
 }
 
 pub(super) async fn response_body(

@@ -25,10 +25,15 @@ fn openapi_31_matches_the_exact_control_plane_contract_without_secret_examples()
             "delete",
         ),
         ("/wokcore/v1/health", "get"),
+        ("/wokcore/v1/diagnostics/export", "get"),
+        ("/wokcore/v1/logs", "get"),
         ("/wokcore/v1/service/drain", "post"),
         ("/wokcore/v1/service/drain/cancel", "post"),
         ("/wokcore/v1/service/status", "get"),
         ("/wokcore/v1/service/stop", "post"),
+        ("/wokcore/v1/sessions", "get"),
+        ("/wokcore/v1/sessions/{session_key}/messages", "get"),
+        ("/wokcore/v1/usage", "get"),
     ]);
     let paths = document["paths"].as_object().unwrap();
     assert_eq!(paths.len(), expected.len());
@@ -38,6 +43,18 @@ fn openapi_31_matches_the_exact_control_plane_contract_without_secret_examples()
         let security = operation["security"].clone();
         if matches!(path, "/wokcore/v1/health" | "/wokcore/v1/capabilities") {
             assert_eq!(security, json!([]));
+        } else if matches!(
+            path,
+            "/wokcore/v1/sessions"
+                | "/wokcore/v1/sessions/{session_key}/messages"
+                | "/wokcore/v1/usage"
+                | "/wokcore/v1/logs"
+                | "/wokcore/v1/diagnostics/export"
+        ) {
+            assert_eq!(
+                security,
+                json!([{"managementBearer":[]},{"clientBearer":[]}])
+            );
         } else {
             assert_eq!(security, json!([{"managementBearer":[]}]));
         }
@@ -52,7 +69,11 @@ fn openapi_31_matches_the_exact_control_plane_contract_without_secret_examples()
             .find(|(status, _)| status.starts_with('2'))
             .unwrap()
             .1;
-        assert_safe_headers(&success["headers"]);
+        if path == "/wokcore/v1/diagnostics/export" {
+            assert_export_headers(&success["headers"]);
+        } else {
+            assert_safe_headers(&success["headers"]);
+        }
     }
     assert_safe_headers(&document["components"]["responses"]["Error"]["headers"]);
     assert_eq!(
@@ -77,6 +98,18 @@ fn openapi_31_matches_the_exact_control_plane_contract_without_secret_examples()
         document["components"]["schemas"]["AuthorizeResponse"]["properties"]["token"]["readOnly"],
         true
     );
+    assert_eq!(
+        document["paths"]["/wokcore/v1/sessions"]["get"]["parameters"][3]["schema"],
+        json!({"type":"integer","minimum":1,"maximum":200,"default":50})
+    );
+    assert_eq!(
+        document["paths"]["/wokcore/v1/sessions/{session_key}/messages"]["get"]["parameters"][3]["schema"],
+        json!({"type":"integer","minimum":4096,"maximum":1048576,"default":262144})
+    );
+    assert_eq!(
+        document["paths"]["/wokcore/v1/diagnostics/export"]["get"]["parameters"][6]["schema"],
+        json!({"type":"integer","minimum":65536,"maximum":67108864,"default":16777216})
+    );
     let rendered = String::from_utf8(bytes).unwrap().to_ascii_lowercase();
     for forbidden in [
         "wok_admin_v1_",
@@ -88,6 +121,18 @@ fn openapi_31_matches_the_exact_control_plane_contract_without_secret_examples()
     ] {
         assert!(!rendered.contains(forbidden), "found {forbidden}");
     }
+}
+
+fn assert_export_headers(headers: &Value) {
+    assert_eq!(
+        headers,
+        &json!({
+            "X-Request-Id":{"$ref":"#/components/headers/XRequestId"},
+            "Cache-Control":{"$ref":"#/components/headers/CacheControl"},
+            "X-Content-Type-Options":{"$ref":"#/components/headers/XContentTypeOptions"},
+            "Content-Disposition":{"$ref":"#/components/headers/ContentDisposition"}
+        })
+    );
 }
 
 fn assert_safe_headers(headers: &Value) {

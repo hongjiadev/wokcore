@@ -13,7 +13,8 @@ use wokcore_core::{
     secret::{SecretRef, SecretScope},
 };
 use wokcore_storage::{
-    ClientTokenMetadata, RuntimeSecretBinding, SecretStore, StateStore, StorageError,
+    ClientTokenMetadata, ClientTokenScope, RuntimeSecretBinding, ScopedClientTokenMetadata,
+    SecretStore, StateStore, StorageError,
 };
 
 use super::token::{
@@ -44,6 +45,35 @@ pub trait AuthMetadataStore: Send + Sync {
     fn load_active_client_tokens(&self) -> Result<Vec<ClientTokenMetadata>, StorageError>;
 
     fn issue_client_token(&self, token: &ClientTokenMetadata) -> Result<(), StorageError>;
+
+    fn load_active_scoped_client_tokens(
+        &self,
+    ) -> Result<Vec<ScopedClientTokenMetadata>, StorageError> {
+        self.load_active_client_tokens().map(|tokens| {
+            tokens
+                .into_iter()
+                .map(|token| ScopedClientTokenMetadata {
+                    token,
+                    scopes: vec![ClientTokenScope::ProxyUse],
+                })
+                .collect()
+        })
+    }
+
+    fn issue_client_token_with_scopes(
+        &self,
+        token: &ClientTokenMetadata,
+        scopes: &[ClientTokenScope],
+    ) -> Result<(), StorageError> {
+        if scopes == [ClientTokenScope::ProxyUse] {
+            self.issue_client_token(token)
+        } else {
+            Err(StorageError::InvalidStateRecord {
+                message: "authentication metadata store does not support explicit scopes"
+                    .to_owned(),
+            })
+        }
+    }
 
     fn revoke_client_token(
         &self,
@@ -115,6 +145,20 @@ impl AuthMetadataStore for StateAuthMetadataStore {
         self.lock()?.issue_client_token(token)
     }
 
+    fn load_active_scoped_client_tokens(
+        &self,
+    ) -> Result<Vec<ScopedClientTokenMetadata>, StorageError> {
+        self.lock()?.load_active_scoped_client_tokens()
+    }
+
+    fn issue_client_token_with_scopes(
+        &self,
+        token: &ClientTokenMetadata,
+        scopes: &[ClientTokenScope],
+    ) -> Result<(), StorageError> {
+        self.lock()?.issue_client_token_with_scopes(token, scopes)
+    }
+
     fn revoke_client_token(
         &self,
         client_id: &ClientId,
@@ -136,6 +180,7 @@ pub struct AuthorizedClient {
 struct ActiveClient {
     token_id: String,
     client_id: ClientId,
+    scopes: Vec<ClientTokenScope>,
 }
 
 pub struct AuthRegistry {
@@ -245,7 +290,7 @@ impl AuthRegistry {
         };
 
         let active = run_metadata(Arc::clone(&metadata), |metadata| {
-            metadata.load_active_client_tokens()
+            metadata.load_active_scoped_client_tokens()
         })
         .await?;
         let clients = active_client_map(active)?;
@@ -271,6 +316,10 @@ impl AuthRegistry {
     }
 
     pub fn validate_client(&self, candidate: &str) -> Option<AuthorizedClient> {
+        self.validate_client_scope(candidate, ClientTokenScope::ProxyUse)
+    }
+
+    pub fn validate_any_client(&self, candidate: &str) -> Option<AuthorizedClient> {
         if !is_proxy_token(candidate) {
             return None;
         }
@@ -283,15 +332,52 @@ impl AuthRegistry {
         })
     }
 
+    pub fn validate_client_scope(
+        &self,
+        candidate: &str,
+        required_scope: ClientTokenScope,
+    ) -> Option<AuthorizedClient> {
+        if !is_proxy_token(candidate) {
+            return None;
+        }
+        let digest = TokenDigest::of(candidate);
+        let snapshot = self.state.clients.load();
+        let active = snapshot.get(&digest)?;
+        if !active.scopes.contains(&required_scope) {
+            return None;
+        }
+        Some(AuthorizedClient {
+            token_id: active.token_id.clone(),
+            client_id: active.client_id.clone(),
+        })
+    }
+
     pub async fn issue_client_token(
         &self,
         token_id: String,
         client_id: ClientId,
         issued_at: String,
     ) -> Result<TokenMaterial, AuthError> {
+        self.issue_client_token_with_scopes(
+            token_id,
+            client_id,
+            issued_at,
+            vec![ClientTokenScope::ProxyUse],
+        )
+        .await
+    }
+
+    pub async fn issue_client_token_with_scopes(
+        &self,
+        token_id: String,
+        client_id: ClientId,
+        issued_at: String,
+        scopes: Vec<ClientTokenScope>,
+    ) -> Result<TokenMaterial, AuthError> {
+        validate_scopes(&scopes)?;
         let state = Arc::clone(&self.state);
         await_mutation_task(task::spawn(async move {
-            Self::issue_client_token_owned(state, token_id, client_id, issued_at).await
+            Self::issue_client_token_owned(state, token_id, client_id, issued_at, scopes).await
         }))
         .await
     }
@@ -301,6 +387,7 @@ impl AuthRegistry {
         token_id: String,
         client_id: ClientId,
         issued_at: String,
+        scopes: Vec<ClientTokenScope>,
     ) -> Result<TokenMaterial, AuthError> {
         let _mutation = state.mutation.lock().await;
         let material = TokenMaterial::generate_proxy(state.entropy.as_ref())?;
@@ -311,8 +398,9 @@ impl AuthRegistry {
             digest: digest.into_bytes(),
             issued_at,
         };
+        let persisted_scopes = scopes.clone();
         run_metadata(Arc::clone(&state.metadata), move |store| {
-            store.issue_client_token(&metadata)
+            store.issue_client_token_with_scopes(&metadata, &persisted_scopes)
         })
         .await?;
 
@@ -322,6 +410,7 @@ impl AuthRegistry {
             ActiveClient {
                 token_id,
                 client_id,
+                scopes,
             },
         );
         state.clients.store(Arc::new(clients));
@@ -373,16 +462,19 @@ impl fmt::Debug for AuthRegistry {
 }
 
 fn active_client_map(
-    active: Vec<ClientTokenMetadata>,
+    active: Vec<ScopedClientTokenMetadata>,
 ) -> Result<HashMap<TokenDigest, ActiveClient>, AuthError> {
     let mut clients = HashMap::with_capacity(active.len());
-    for token in active {
+    for scoped in active {
+        validate_scopes(&scoped.scopes)?;
+        let token = scoped.token;
         if clients
             .insert(
                 TokenDigest::from(token.digest),
                 ActiveClient {
                     token_id: token.token_id,
                     client_id: token.client_id,
+                    scopes: scoped.scopes,
                 },
             )
             .is_some()
@@ -393,6 +485,18 @@ fn active_client_map(
         }
     }
     Ok(clients)
+}
+
+fn validate_scopes(scopes: &[ClientTokenScope]) -> Result<(), AuthError> {
+    if scopes.is_empty() {
+        return Err(AuthError::InvalidScopes);
+    }
+    let mut sorted = scopes.to_vec();
+    sorted.sort_unstable();
+    if sorted.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(AuthError::InvalidScopes);
+    }
+    Ok(())
 }
 
 async fn run_metadata<T>(
@@ -430,6 +534,8 @@ pub enum AuthError {
     BlockingTask,
     #[error("runtime authentication mutation task failed")]
     MutationTask,
+    #[error("client token scopes are empty or contain duplicates")]
+    InvalidScopes,
     #[error(transparent)]
     Token(#[from] TokenError),
 }

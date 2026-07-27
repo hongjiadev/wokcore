@@ -6,8 +6,8 @@ use std::{ffi::OsStr, fs};
 
 use tempfile::tempdir;
 use wokcore_platform::diagnostics::{
-    DiagnosticDirectory, DiagnosticStoreError, MAX_DIAGNOSTIC_DELETE_TOMBSTONES,
-    MAX_DIAGNOSTIC_WRITE_CHUNK_BYTES,
+    DIAGNOSTIC_EXPORT_TEMPORARY_PREFIX, DiagnosticDirectory, DiagnosticStoreError,
+    MAX_DIAGNOSTIC_DELETE_TOMBSTONES, MAX_DIAGNOSTIC_WRITE_CHUNK_BYTES,
 };
 
 #[test]
@@ -177,6 +177,33 @@ fn reserved_delete_tombstones_are_hidden_and_cannot_be_created_through_the_publi
         DiagnosticStoreError::UnsafePath
     );
     assert_eq!(fs::read(root.join(tombstone)).unwrap(), b"");
+}
+
+#[test]
+fn internal_export_directories_are_hidden_but_unrelated_directories_fail_closed() {
+    let fixture = tempdir().unwrap();
+    let root = fixture.path().join("diagnostics");
+    fs::create_dir(&root).unwrap();
+    let temporary = format!("{DIAGNOSTIC_EXPORT_TEMPORARY_PREFIX}owned");
+    fs::create_dir(root.join(&temporary)).unwrap();
+    fs::write(root.join("segment.jsonl"), b"safe").unwrap();
+    let directory = DiagnosticDirectory::open(&root).unwrap();
+
+    let entries = directory.entries(2).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].name(), OsStr::new("segment.jsonl"));
+    assert_eq!(
+        directory
+            .create_new(OsStr::new(&temporary), b"foreign", 64)
+            .unwrap_err(),
+        DiagnosticStoreError::UnsafePath
+    );
+
+    fs::create_dir(root.join("unexpected-directory")).unwrap();
+    assert_eq!(
+        directory.entries(4).unwrap_err(),
+        DiagnosticStoreError::UnsafePath
+    );
 }
 
 #[test]

@@ -227,6 +227,265 @@
         }
       }
     },
+    "/wokcore/v1/sessions": {
+      "get": {
+        "operationId": "listSessions",
+        "security": [
+          {"managementBearer": []},
+          {"clientBearer": []}
+        ],
+        "parameters": [
+          {
+            "name": "source",
+            "in": "query",
+            "schema": {"type": "string", "enum": ["codex", "claude", "gemini"]}
+          },
+          {
+            "name": "availability",
+            "in": "query",
+            "schema": {"type": "string", "enum": ["available", "unavailable"]}
+          },
+          {
+            "name": "before",
+            "in": "query",
+            "schema": {"type": "string", "minLength": 1}
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50}
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Bounded indexed Session page",
+            "headers": {
+              "X-Request-Id": {"$ref": "#/components/headers/XRequestId"},
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
+              "X-Content-Type-Options": {"$ref": "#/components/headers/XContentTypeOptions"}
+            },
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/SessionList"}
+              }
+            }
+          },
+          "default": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
+    "/wokcore/v1/sessions/{session_key}/messages": {
+      "get": {
+        "operationId": "listSessionMessages",
+        "security": [
+          {"managementBearer": []},
+          {"clientBearer": []}
+        ],
+        "parameters": [
+          {
+            "name": "session_key",
+            "in": "path",
+            "required": true,
+            "schema": {"$ref": "#/components/schemas/OpaqueKey"}
+          },
+          {
+            "name": "after",
+            "in": "query",
+            "schema": {"type": "string", "minLength": 1}
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {"type": "integer", "minimum": 1, "maximum": 500, "default": 100}
+          },
+          {
+            "name": "max_bytes",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 4096,
+              "maximum": 1048576,
+              "default": 262144
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Bounded source-ordered Session message page",
+            "headers": {
+              "X-Request-Id": {"$ref": "#/components/headers/XRequestId"},
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
+              "X-Content-Type-Options": {"$ref": "#/components/headers/XContentTypeOptions"}
+            },
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/SessionMessages"}
+              }
+            }
+          },
+          "default": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
+    "/wokcore/v1/usage": {
+      "get": {
+        "operationId": "getUsage",
+        "security": [
+          {"managementBearer": []},
+          {"clientBearer": []}
+        ],
+        "parameters": [
+          {
+            "name": "source",
+            "in": "query",
+            "schema": {"type": "string", "enum": ["codex", "claude", "gemini"]}
+          },
+          {
+            "name": "session_key",
+            "in": "query",
+            "schema": {"$ref": "#/components/schemas/OpaqueKey"}
+          },
+          {
+            "name": "since",
+            "in": "query",
+            "schema": {"$ref": "#/components/schemas/UtcTimestamp"}
+          },
+          {
+            "name": "until",
+            "in": "query",
+            "schema": {"$ref": "#/components/schemas/UtcTimestamp"}
+          },
+          {
+            "name": "group_by",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": ["day", "source", "model"],
+              "default": "day"
+            }
+          },
+          {
+            "name": "after",
+            "in": "query",
+            "schema": {"type": "string", "minLength": 1}
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {"type": "integer", "minimum": 1, "maximum": 500, "default": 100}
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Bounded Session-derived usage aggregates",
+            "headers": {
+              "X-Request-Id": {"$ref": "#/components/headers/XRequestId"},
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
+              "X-Content-Type-Options": {"$ref": "#/components/headers/XContentTypeOptions"}
+            },
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/UsageResponse"}
+              }
+            }
+          },
+          "default": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
+    "/wokcore/v1/logs": {
+      "get": {
+        "operationId": "listDiagnosticEvents",
+        "security": [
+          {"managementBearer": []},
+          {"clientBearer": []}
+        ],
+        "parameters": [
+          {"name": "request_id", "in": "query", "schema": {"type": "string", "maxLength": 256}},
+          {"name": "trace_id", "in": "query", "schema": {"type": "string", "maxLength": 256}},
+          {"name": "session_key", "in": "query", "schema": {"type": "string", "maxLength": 256}},
+          {
+            "name": "level_min",
+            "in": "query",
+            "schema": {"type": "string", "enum": ["debug", "info", "warn", "error"]}
+          },
+          {"name": "component", "in": "query", "schema": {"type": "string"}},
+          {"name": "since", "in": "query", "schema": {"$ref": "#/components/schemas/UtcTimestamp"}},
+          {"name": "until", "in": "query", "schema": {"$ref": "#/components/schemas/UtcTimestamp"}},
+          {
+            "name": "order",
+            "in": "query",
+            "schema": {"type": "string", "enum": ["asc", "desc"], "default": "desc"}
+          },
+          {"name": "after", "in": "query", "schema": {"type": "string", "minLength": 1}},
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 100}
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Bounded redacted diagnostic event page",
+            "headers": {
+              "X-Request-Id": {"$ref": "#/components/headers/XRequestId"},
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
+              "X-Content-Type-Options": {"$ref": "#/components/headers/XContentTypeOptions"}
+            },
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/DiagnosticLogs"}
+              }
+            }
+          },
+          "default": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
+    "/wokcore/v1/diagnostics/export": {
+      "get": {
+        "operationId": "exportDiagnostics",
+        "security": [
+          {"managementBearer": []},
+          {"clientBearer": []}
+        ],
+        "parameters": [
+          {"name": "request_id", "in": "query", "schema": {"type": "string", "maxLength": 256}},
+          {"name": "trace_id", "in": "query", "schema": {"type": "string", "maxLength": 256}},
+          {"name": "session_key", "in": "query", "schema": {"type": "string", "maxLength": 256}},
+          {"name": "since", "in": "query", "schema": {"$ref": "#/components/schemas/UtcTimestamp"}},
+          {"name": "until", "in": "query", "schema": {"$ref": "#/components/schemas/UtcTimestamp"}},
+          {"name": "include_snapshots", "in": "query", "schema": {"type": "boolean", "default": false}},
+          {
+            "name": "max_bytes",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 65536,
+              "maximum": 67108864,
+              "default": 16777216
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Validated streamed diagnostic support package",
+            "headers": {
+              "X-Request-Id": {"$ref": "#/components/headers/XRequestId"},
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
+              "X-Content-Type-Options": {"$ref": "#/components/headers/XContentTypeOptions"},
+              "Content-Disposition": {"$ref": "#/components/headers/ContentDisposition"}
+            },
+            "content": {
+              "application/zip": {
+                "schema": {"type": "string", "contentEncoding": "binary"}
+              }
+            }
+          },
+          "default": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
     "/wokcore/v1/clients/{client_id}/tokens/{token_id}": {
       "delete": {
         "operationId": "revokeClientToken",
@@ -299,6 +558,13 @@
           "type": "string",
           "const": "nosniff"
         }
+      },
+      "ContentDisposition": {
+        "description": "Sanitized UTC diagnostic package filename",
+        "schema": {
+          "type": "string",
+          "pattern": "^attachment; filename=\"wokcore-diagnostics-[0-9]{8}T[0-9]{6}Z\\.zip\"$"
+        }
       }
     },
     "securitySchemes": {
@@ -306,6 +572,11 @@
         "type": "http",
         "scheme": "bearer",
         "bearerFormat": "WokCore management token"
+      },
+      "clientBearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "Scoped WokCore client token"
       }
     },
     "responses": {
@@ -427,6 +698,9 @@
         "properties": {
           "client_id": {
             "$ref": "#/components/schemas/ClientId"
+          },
+          "scopes": {
+            "$ref": "#/components/schemas/ClientTokenScopes"
           }
         }
       },
@@ -436,7 +710,8 @@
         "required": [
           "client_id",
           "token_id",
-          "token"
+          "token",
+          "scopes"
         ],
         "properties": {
           "client_id": {
@@ -449,7 +724,231 @@
           "token": {
             "type": "string",
             "readOnly": true
+          },
+          "scopes": {
+            "$ref": "#/components/schemas/ClientTokenScopes"
           }
+        }
+      },
+      "ClientTokenScopes": {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 5,
+        "uniqueItems": true,
+        "items": {
+          "type": "string",
+          "enum": [
+            "proxy.use",
+            "sessions.read",
+            "usage.read",
+            "diagnostics.read",
+            "diagnostics.export"
+          ]
+        }
+      },
+      "OpaqueKey": {
+        "type": "string",
+        "pattern": "^[a-f0-9]{64}$"
+      },
+      "UtcTimestamp": {
+        "type": "string",
+        "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+      },
+      "SessionList": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["schema_version", "items", "next_cursor", "index_status"],
+        "properties": {
+          "schema_version": {"const": 1},
+          "items": {
+            "type": "array",
+            "maxItems": 200,
+            "items": {"$ref": "#/components/schemas/SessionListItem"}
+          },
+          "next_cursor": {"type": ["string", "null"]},
+          "index_status": {"$ref": "#/components/schemas/IndexStatus"}
+        }
+      },
+      "SessionListItem": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "session_key",
+          "source",
+          "created_at",
+          "last_active_at",
+          "availability",
+          "message_count",
+          "usage_event_count"
+        ],
+        "properties": {
+          "session_key": {"$ref": "#/components/schemas/OpaqueKey"},
+          "source": {"type": "string", "enum": ["codex", "claude", "gemini"]},
+          "created_at": {"$ref": "#/components/schemas/UtcTimestamp"},
+          "last_active_at": {"$ref": "#/components/schemas/UtcTimestamp"},
+          "availability": {"type": "string", "enum": ["available", "unavailable"]},
+          "message_count": {"type": "integer", "minimum": 0},
+          "usage_event_count": {"type": "integer", "minimum": 0},
+          "title": {"type": "string"}
+        }
+      },
+      "IndexStatus": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["phase", "sources"],
+        "properties": {
+          "phase": {"type": "string", "enum": ["starting", "scanning", "idle"]},
+          "sources": {
+            "type": "array",
+            "maxItems": 3,
+            "items": {"$ref": "#/components/schemas/SourceIndexStatus"}
+          }
+        }
+      },
+      "SourceIndexStatus": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["source", "status"],
+        "properties": {
+          "source": {"type": "string", "enum": ["codex", "claude", "gemini"]},
+          "status": {
+            "type": "string",
+            "enum": [
+              "undiscovered",
+              "available",
+              "stale",
+              "unavailable",
+              "resource_limited"
+            ]
+          },
+          "last_transition_at": {"$ref": "#/components/schemas/UtcTimestamp"},
+          "error_code": {
+            "type": "string",
+            "enum": [
+              "source_root_missing",
+              "source_root_unreadable",
+              "source_sessions_absent",
+              "source_entry_unsafe",
+              "source_io_failed",
+              "source_parse_invalid",
+              "source_record_too_large",
+              "source_replay_parent_missing",
+              "source_replay_parent_ambiguous",
+              "source_replay_inconsistent",
+              "source_replay_limit",
+              "source_candidate_interrupted"
+            ]
+          }
+        }
+      },
+      "SessionMessages": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["schema_version", "items", "next_cursor", "source_generation"],
+        "properties": {
+          "schema_version": {"const": 1},
+          "items": {
+            "type": "array",
+            "maxItems": 500,
+            "items": {"$ref": "#/components/schemas/SessionMessage"}
+          },
+          "next_cursor": {"type": ["string", "null"]},
+          "source_generation": {"type": "integer", "minimum": 1}
+        }
+      },
+      "SessionMessage": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "message_key",
+          "role",
+          "timestamp",
+          "content",
+          "fragment_offset_bytes",
+          "fragment_final"
+        ],
+        "properties": {
+          "message_key": {"$ref": "#/components/schemas/OpaqueKey"},
+          "role": {"type": "string", "enum": ["user", "assistant", "system", "tool"]},
+          "timestamp": {"$ref": "#/components/schemas/UtcTimestamp"},
+          "content": {"type": "string"},
+          "fragment_offset_bytes": {"type": "integer", "minimum": 0},
+          "fragment_final": {"type": "boolean"}
+        }
+      },
+      "UsageResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["schema_version", "group_by", "totals", "buckets", "next_cursor"],
+        "properties": {
+          "schema_version": {"const": 1},
+          "group_by": {"type": "string", "enum": ["day", "source", "model"]},
+          "totals": {"$ref": "#/components/schemas/UsageTotals"},
+          "buckets": {
+            "type": "array",
+            "maxItems": 500,
+            "items": {"$ref": "#/components/schemas/UsageBucket"}
+          },
+          "next_cursor": {"type": ["string", "null"]}
+        }
+      },
+      "UsageTotals": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "input_tokens",
+          "output_tokens",
+          "cache_read_tokens",
+          "cache_write_tokens",
+          "reasoning_tokens",
+          "session_count"
+        ],
+        "properties": {
+          "input_tokens": {"type": "integer", "minimum": 0},
+          "output_tokens": {"type": "integer", "minimum": 0},
+          "cache_read_tokens": {"type": "integer", "minimum": 0},
+          "cache_write_tokens": {"type": "integer", "minimum": 0},
+          "reasoning_tokens": {"type": "integer", "minimum": 0},
+          "session_count": {"type": "integer", "minimum": 0}
+        }
+      },
+      "UsageBucket": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "key",
+          "input_tokens",
+          "output_tokens",
+          "cache_read_tokens",
+          "cache_write_tokens",
+          "reasoning_tokens",
+          "session_count"
+        ],
+        "properties": {
+          "key": {"type": "string"},
+          "start": {"$ref": "#/components/schemas/UtcTimestamp"},
+          "end": {"$ref": "#/components/schemas/UtcTimestamp"},
+          "input_tokens": {"type": "integer", "minimum": 0},
+          "output_tokens": {"type": "integer", "minimum": 0},
+          "cache_read_tokens": {"type": "integer", "minimum": 0},
+          "cache_write_tokens": {"type": "integer", "minimum": 0},
+          "reasoning_tokens": {"type": "integer", "minimum": 0},
+          "session_count": {"type": "integer", "minimum": 0}
+        }
+      },
+      "DiagnosticLogs": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["schema_version", "items", "next_cursor", "dropped_events"],
+        "properties": {
+          "schema_version": {"const": 1},
+          "items": {
+            "type": "array",
+            "maxItems": 1000,
+            "items": {"type": "object"}
+          },
+          "next_cursor": {"type": ["string", "null"]},
+          "dropped_events": {"type": "integer", "minimum": 0}
         }
       },
       "RevokeResponse": {

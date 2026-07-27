@@ -24,6 +24,7 @@ use wokcore_server::{
         ProductionSessionScanBackend, RunningDiagnosticWriter, RunningScheduler,
         RunningStateWriter, ScanTimestampSource, SchedulerConfig,
     },
+    query::{DEFAULT_QUERY_WORKERS, QueryRuntime, QueryService},
     runtime::{TokenMetadataError, TokenMetadataSource},
 };
 use wokcore_storage::{ConfigStore, StateStore, StorageError};
@@ -234,6 +235,7 @@ async fn start_service(
     )
     .await
     .map_err(map_auth_error)?;
+    let session_domain_key = auth.session_domain_key();
     ensure_not_cancelled(cancelled)?;
     let (diagnostics, prepared_diagnostics) = PreparedDiagnosticWriter::open(
         &dependencies.paths.log_dir,
@@ -298,7 +300,6 @@ async fn start_service(
     }
     server_state = server_state.with_diagnostics(diagnostics);
     server_state = server_state.with_state_writer(state_writer);
-    let (server_state, stop_requests) = server_state.with_coordinated_shutdown();
     let running_diagnostics = prepared_diagnostics
         .start()
         .map_err(|_| ServeError::Server)?;
@@ -309,22 +310,40 @@ async fn start_service(
             return Err(ServeError::Server);
         }
     };
+    let query = match QueryService::start(DEFAULT_QUERY_WORKERS) {
+        Ok(query) => query,
+        Err(_) => {
+            let _ = running_diagnostics.shutdown().await;
+            let _ = running_state_writer.checkpoint_and_shutdown(false).await;
+            return Err(ServeError::Server);
+        }
+    };
+    server_state = server_state.with_query_runtime(QueryRuntime::new(
+        query.handle(),
+        &dependencies.paths.state_db,
+        dependencies.session_roots.clone(),
+        session_domain_key,
+        &dependencies.paths.log_dir,
+    ));
+    let (server_state, stop_requests) = server_state.with_coordinated_shutdown();
     let listener = match TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, port))).await {
         Ok(listener) => listener,
         Err(error) => {
-            shutdown_unpublished_observability(running_diagnostics, running_state_writer).await;
+            shutdown_unpublished_observability(query, running_diagnostics, running_state_writer)
+                .await;
             return Err(ServeError::Bind(error));
         }
     };
     if let Err(error) = ensure_not_cancelled(cancelled) {
-        shutdown_unpublished_observability(running_diagnostics, running_state_writer).await;
+        shutdown_unpublished_observability(query, running_diagnostics, running_state_writer).await;
         return Err(error);
     }
     let running = RunningServer::start(listener, server_state).await;
     let running = match running {
         Ok(running) => running,
         Err(_) => {
-            shutdown_unpublished_observability(running_diagnostics, running_state_writer).await;
+            shutdown_unpublished_observability(query, running_diagnostics, running_state_writer)
+                .await;
             return Err(ServeError::Server);
         }
     };
@@ -332,7 +351,7 @@ async fn start_service(
     owner.running = Some(running);
     if lifecycle.mark_running().is_err() {
         shutdown.request();
-        shutdown_unpublished_observability(running_diagnostics, running_state_writer).await;
+        shutdown_unpublished_observability(query, running_diagnostics, running_state_writer).await;
         return Err(ServeError::Server);
     }
 
@@ -345,24 +364,24 @@ async fn start_service(
     };
     if verify_identity(&record).await.is_err() {
         shutdown.request();
-        shutdown_unpublished_observability(running_diagnostics, running_state_writer).await;
+        shutdown_unpublished_observability(query, running_diagnostics, running_state_writer).await;
         return Err(ServeError::Readiness);
     }
     if let Err(error) = ensure_not_cancelled(cancelled) {
         shutdown.request();
-        shutdown_unpublished_observability(running_diagnostics, running_state_writer).await;
+        shutdown_unpublished_observability(query, running_diagnostics, running_state_writer).await;
         return Err(error);
     }
 
     owner.discovery = Some((discovery, instance_id));
     let Some((discovery, _)) = owner.discovery.as_ref() else {
         shutdown.request();
-        shutdown_unpublished_observability(running_diagnostics, running_state_writer).await;
+        shutdown_unpublished_observability(query, running_diagnostics, running_state_writer).await;
         return Err(ServeError::Server);
     };
     if let Err(error) = dependencies.discovery_publisher.publish(discovery, &record) {
         shutdown.request();
-        shutdown_unpublished_observability(running_diagnostics, running_state_writer).await;
+        shutdown_unpublished_observability(query, running_diagnostics, running_state_writer).await;
         return Err(ServeError::Platform(error));
     }
     Ok(StartedService {
@@ -375,6 +394,7 @@ async fn start_service(
         shutdown,
         prepared_scheduler,
         running_scheduler: None,
+        running_query: Some(query),
         running_diagnostics: Some(running_diagnostics),
         running_state_writer: Some(running_state_writer),
         stop_requests,
@@ -382,9 +402,11 @@ async fn start_service(
 }
 
 async fn shutdown_unpublished_observability(
+    query: QueryService,
     diagnostics: RunningDiagnosticWriter,
     state: RunningStateWriter,
 ) {
+    let _ = query.shutdown().await;
     let _ = diagnostics.shutdown().await;
     let _ = state.checkpoint_and_shutdown(false).await;
 }
@@ -536,6 +558,7 @@ struct StartedService {
     shutdown: ServerShutdown,
     prepared_scheduler: Option<PreparedScheduler>,
     running_scheduler: Option<RunningScheduler>,
+    running_query: Option<QueryService>,
     running_diagnostics: Option<RunningDiagnosticWriter>,
     running_state_writer: Option<RunningStateWriter>,
     stop_requests: watch::Receiver<bool>,
@@ -565,6 +588,11 @@ impl StartedService {
         } else {
             Ok(())
         };
+        let query_result = if let Some(running) = self.running_query.take() {
+            running.shutdown().await.map_err(|_| ServeError::Server)
+        } else {
+            Ok(())
+        };
         let (diagnostics_result, diagnostics_idle) =
             if let Some(running) = self.running_diagnostics.take() {
                 let handle = running.handle();
@@ -589,6 +617,7 @@ impl StartedService {
         };
         scheduler_result
             .and(state_flush_result)
+            .and(query_result)
             .and(diagnostics_result)
             .and(state_shutdown_result)
     }

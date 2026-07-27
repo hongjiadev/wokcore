@@ -11,6 +11,8 @@ pub(crate) struct HealthResponse {
 #[serde(deny_unknown_fields)]
 pub(crate) struct AuthorizeRequest {
     pub client_id: ClientId,
+    #[serde(default)]
+    pub scopes: Option<Vec<String>>,
 }
 
 #[derive(Serialize)]
@@ -35,6 +37,7 @@ pub(crate) struct AuthorizeResponse {
     pub client_id: ClientId,
     pub token_id: String,
     pub token: String,
+    pub scopes: Vec<&'static str>,
 }
 
 #[derive(Serialize)]

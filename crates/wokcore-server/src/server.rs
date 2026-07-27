@@ -11,6 +11,7 @@ use crate::{
     auth::{AuthRegistry, EntropySource, OsEntropy},
     lifecycle::ServiceLifecycle,
     observability::{DiagnosticWriterHandle, SchedulerHandle, StateWriterHandle},
+    query::QueryRuntime,
     runtime::{SystemTokenMetadata, TokenMetadataSource},
 };
 
@@ -25,6 +26,7 @@ pub struct ServerState {
     pub(crate) scheduler: Option<SchedulerHandle>,
     pub(crate) diagnostics: Option<DiagnosticWriterHandle>,
     pub(crate) state_writer: Option<StateWriterHandle>,
+    pub(crate) query: Option<QueryRuntime>,
     shutdown: watch::Sender<bool>,
     coordinated_shutdown: bool,
 }
@@ -82,6 +84,7 @@ impl ServerState {
             scheduler: None,
             diagnostics: None,
             state_writer: None,
+            query: None,
             shutdown,
             coordinated_shutdown: false,
         }
@@ -99,6 +102,11 @@ impl ServerState {
 
     pub fn with_state_writer(mut self, state_writer: StateWriterHandle) -> Self {
         self.state_writer = Some(state_writer);
+        self
+    }
+
+    pub fn with_query_runtime(mut self, query: QueryRuntime) -> Self {
+        self.query = Some(query);
         self
     }
 

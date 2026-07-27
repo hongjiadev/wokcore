@@ -188,7 +188,7 @@ pub enum SessionSourceKind {
 }
 
 impl SessionSourceKind {
-    const fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
@@ -243,7 +243,7 @@ pub enum SessionAvailability {
 }
 
 impl SessionAvailability {
-    const fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Available => "available",
             Self::Unavailable => "unavailable",
@@ -271,7 +271,7 @@ pub enum SessionSourceStatus {
 }
 
 impl SessionSourceStatus {
-    const fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Undiscovered => "undiscovered",
             Self::Available => "available",
@@ -312,7 +312,7 @@ pub enum SessionSourceErrorCode {
 }
 
 impl SessionSourceErrorCode {
-    const fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::SourceRootMissing => "source_root_missing",
             Self::SourceRootUnreadable => "source_root_unreadable",
@@ -887,6 +887,105 @@ impl GlobalSessionUsagePageKey {
 pub struct GlobalSessionUsagePage {
     pub items: Vec<SessionUsageRecord>,
     pub next_page_key: Option<GlobalSessionUsagePageKey>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SessionUsageAggregateFilter {
+    pub source: Option<SessionSourceKind>,
+    pub session_key: Option<String>,
+    pub since: Option<String>,
+    pub until: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionUsageGroupBy {
+    Day,
+    Source,
+    Model,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SessionUsageAggregateTotals {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub session_count: u64,
+}
+
+impl SessionUsageAggregateTotals {
+    pub fn total_tokens(&self) -> u64 {
+        self.input_tokens
+            .saturating_add(self.output_tokens)
+            .saturating_add(self.cache_read_tokens)
+            .saturating_add(self.cache_write_tokens)
+            .saturating_add(self.reasoning_tokens)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionUsageAggregateBucket {
+    pub key: String,
+    pub start: Option<String>,
+    pub end: Option<String>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub session_count: u64,
+}
+
+impl SessionUsageAggregateBucket {
+    pub fn total_tokens(&self) -> u64 {
+        self.input_tokens
+            .saturating_add(self.output_tokens)
+            .saturating_add(self.cache_read_tokens)
+            .saturating_add(self.cache_write_tokens)
+            .saturating_add(self.reasoning_tokens)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionUsageAggregatePageKey {
+    key: String,
+    total_tokens: Option<u64>,
+}
+
+impl SessionUsageAggregatePageKey {
+    pub fn day(key: impl Into<String>) -> Result<Self, StorageError> {
+        let key = key.into();
+        validate_usage_day_key(&key)?;
+        Ok(Self {
+            key,
+            total_tokens: None,
+        })
+    }
+
+    pub fn ranked(total_tokens: u64, key: impl Into<String>) -> Result<Self, StorageError> {
+        let key = key.into();
+        validate_bounded_text("usage aggregate key", &key, 256, false)?;
+        Ok(Self {
+            key,
+            total_tokens: Some(total_tokens),
+        })
+    }
+
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    pub const fn total_tokens(&self) -> Option<u64> {
+        self.total_tokens
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionUsageAggregatePage {
+    pub totals: SessionUsageAggregateTotals,
+    pub buckets: Vec<SessionUsageAggregateBucket>,
+    pub next_page_key: Option<SessionUsageAggregatePageKey>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2444,6 +2543,44 @@ impl StateStore {
         })
     }
 
+    pub fn load_global_current_session_index_by_key(
+        &self,
+        session_key: &str,
+    ) -> Result<Option<SessionIndexRecord>, StorageError> {
+        validate_opaque_key("session key", session_key)?;
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT i.session_key, i.source_key, i.generation, i.source_kind,
+                        i.created_at, i.last_active_at, i.message_count,
+                        i.usage_event_count,
+                        CASE WHEN s.status = 'available'
+                             THEN i.availability ELSE 'unavailable' END
+                 FROM session_sources s
+                 JOIN session_index i
+                   ON i.source_key = s.source_key
+                  AND i.generation = s.current_generation
+                 WHERE i.session_key = ?1
+                 ORDER BY i.source_key
+                 LIMIT 2",
+            )
+            .map_err(map_database_error)?;
+        let rows = statement
+            .query_map([session_key], index_database_row)
+            .map_err(map_database_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_database_error)?;
+        if rows.len() > 1 {
+            return Err(StorageError::StateDatabaseCorrupt {
+                message: "current Session index contains a duplicate session key".to_owned(),
+            });
+        }
+        rows.into_iter()
+            .next()
+            .map(index_record_from_database)
+            .transpose()
+    }
+
     pub fn load_global_current_session_usage_page(
         &self,
         after: Option<&GlobalSessionUsagePageKey>,
@@ -2489,6 +2626,174 @@ impl StateStore {
         });
         Ok(GlobalSessionUsagePage {
             items,
+            next_page_key,
+        })
+    }
+
+    pub fn load_global_current_session_usage_aggregate_page(
+        &self,
+        filter: &SessionUsageAggregateFilter,
+        group_by: SessionUsageGroupBy,
+        after: Option<&SessionUsageAggregatePageKey>,
+        limit: usize,
+    ) -> Result<SessionUsageAggregatePage, StorageError> {
+        validate_page_limit(limit, 500)?;
+        validate_usage_aggregate_filter(filter)?;
+        match (
+            group_by,
+            after.and_then(SessionUsageAggregatePageKey::total_tokens),
+        ) {
+            (SessionUsageGroupBy::Day, Some(_))
+            | (SessionUsageGroupBy::Source | SessionUsageGroupBy::Model, None)
+                if after.is_some() =>
+            {
+                return Err(StorageError::StalePageKey);
+            }
+            _ => {}
+        }
+
+        let mut predicate =
+            String::from("u.source_key = s.source_key AND u.generation = s.current_generation");
+        let mut values = Vec::<rusqlite::types::Value>::new();
+        if let Some(source) = filter.source {
+            predicate.push_str(" AND u.source_kind = ?");
+            values.push(source.as_str().to_owned().into());
+        }
+        if let Some(session_key) = &filter.session_key {
+            predicate.push_str(" AND u.session_key = ?");
+            values.push(session_key.clone().into());
+        }
+        if let Some(since) = &filter.since {
+            predicate.push_str(" AND u.occurred_at >= ?");
+            values.push(since.clone().into());
+        }
+        if let Some(until) = &filter.until {
+            predicate.push_str(" AND u.occurred_at < ?");
+            values.push(until.clone().into());
+        }
+
+        let totals_sql = format!(
+            "SELECT COALESCE(SUM(u.input_tokens), 0),
+                    COALESCE(SUM(u.output_tokens), 0),
+                    COALESCE(SUM(u.cache_read_tokens), 0),
+                    COALESCE(SUM(u.cache_write_tokens), 0),
+                    COALESCE(SUM(u.reasoning_tokens), 0),
+                    COUNT(DISTINCT u.session_key)
+             FROM session_sources s
+             CROSS JOIN session_usage_records u
+             WHERE {predicate}"
+        );
+        let totals_raw = self
+            .connection
+            .query_row(
+                &totals_sql,
+                rusqlite::params_from_iter(values.clone()),
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                },
+            )
+            .map_err(map_database_error)?;
+        let totals = usage_aggregate_totals_from_database(totals_raw)?;
+
+        let group_expression = match group_by {
+            SessionUsageGroupBy::Day => "substr(u.occurred_at, 1, 10)",
+            SessionUsageGroupBy::Source => "u.source_kind",
+            SessionUsageGroupBy::Model => "u.model",
+        };
+        let mut having = String::new();
+        if let Some(after) = after {
+            match group_by {
+                SessionUsageGroupBy::Day => {
+                    having.push_str(" HAVING bucket_key < ?");
+                    values.push(after.key.clone().into());
+                }
+                SessionUsageGroupBy::Source | SessionUsageGroupBy::Model => {
+                    let total_tokens = after.total_tokens.ok_or(StorageError::StalePageKey)?;
+                    let total_tokens = to_i64(total_tokens, "usage aggregate total")?;
+                    having.push_str(
+                        " HAVING total_tokens < ?
+                           OR (total_tokens = ? AND bucket_key > ?)",
+                    );
+                    values.push(total_tokens.into());
+                    values.push(total_tokens.into());
+                    values.push(after.key.clone().into());
+                }
+            }
+        }
+        let ordering = match group_by {
+            SessionUsageGroupBy::Day => "bucket_key DESC",
+            SessionUsageGroupBy::Source | SessionUsageGroupBy::Model => {
+                "total_tokens DESC, bucket_key"
+            }
+        };
+        values.push(usize_to_i64(limit + 1, "page limit")?.into());
+        let page_sql = format!(
+            "SELECT {group_expression} AS bucket_key,
+                    SUM(u.input_tokens),
+                    SUM(u.output_tokens),
+                    SUM(u.cache_read_tokens),
+                    SUM(u.cache_write_tokens),
+                    SUM(u.reasoning_tokens),
+                    COUNT(DISTINCT u.session_key),
+                    SUM(u.input_tokens) + SUM(u.output_tokens)
+                      + SUM(u.cache_read_tokens) + SUM(u.cache_write_tokens)
+                      + SUM(u.reasoning_tokens) AS total_tokens
+             FROM session_sources s
+             CROSS JOIN session_usage_records u
+             WHERE {predicate}
+             GROUP BY bucket_key
+             {having}
+             ORDER BY {ordering}
+             LIMIT ?"
+        );
+        let mut statement = self
+            .connection
+            .prepare(&page_sql)
+            .map_err(map_database_error)?;
+        let rows = statement
+            .query_map(rusqlite::params_from_iter(values), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            })
+            .map_err(map_database_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_database_error)?;
+        let mut buckets = rows
+            .into_iter()
+            .map(|row| usage_aggregate_bucket_from_database(group_by, row))
+            .collect::<Result<Vec<_>, _>>()?;
+        let has_more = buckets.len() > limit;
+        buckets.truncate(limit);
+        let next_page_key = has_more
+            .then(|| {
+                let last = buckets
+                    .last()
+                    .expect("an aggregate page with more rows is not empty");
+                match group_by {
+                    SessionUsageGroupBy::Day => SessionUsageAggregatePageKey::day(last.key.clone()),
+                    SessionUsageGroupBy::Source | SessionUsageGroupBy::Model => {
+                        SessionUsageAggregatePageKey::ranked(last.total_tokens(), last.key.clone())
+                    }
+                }
+            })
+            .transpose()?;
+        Ok(SessionUsageAggregatePage {
+            totals,
+            buckets,
             next_page_key,
         })
     }
@@ -2969,6 +3274,9 @@ type UsageDatabaseRow = (
     i64,
 );
 
+type UsageAggregateTotalsDatabaseRow = (i64, i64, i64, i64, i64, i64);
+type UsageAggregateBucketDatabaseRow = (String, i64, i64, i64, i64, i64, i64);
+
 type ReplayDatabaseRow = (String, i64, i64, String, Vec<u8>);
 
 type SupplementalDatabaseRow = (
@@ -3407,6 +3715,67 @@ fn validate_page_limit(limit: usize, maximum: usize) -> Result<(), StorageError>
         return Err(invalid_state("page limit is outside its bound"));
     }
     Ok(())
+}
+
+fn validate_usage_aggregate_filter(
+    filter: &SessionUsageAggregateFilter,
+) -> Result<(), StorageError> {
+    if let Some(session_key) = &filter.session_key {
+        validate_opaque_key("session key", session_key)?;
+    }
+    if let Some(since) = &filter.since {
+        validate_timestamp("usage range start", since)?;
+    }
+    if let Some(until) = &filter.until {
+        validate_timestamp("usage range end", until)?;
+    }
+    if let (Some(since), Some(until)) = (&filter.since, &filter.until)
+        && since >= until
+    {
+        return Err(invalid_state("usage range must increase"));
+    }
+    Ok(())
+}
+
+fn validate_usage_day_key(value: &str) -> Result<(), StorageError> {
+    if value.len() != 10 {
+        return Err(invalid_state("usage day key is invalid"));
+    }
+    validate_timestamp("usage day key", &format!("{value}T00:00:00Z"))
+}
+
+fn next_utc_day(value: &str) -> Result<String, StorageError> {
+    validate_usage_day_key(value)?;
+    let year = value[0..4]
+        .parse::<u32>()
+        .map_err(|_| invalid_state("usage day year is invalid"))?;
+    let month = value[5..7]
+        .parse::<u32>()
+        .map_err(|_| invalid_state("usage day month is invalid"))?;
+    let day = value[8..10]
+        .parse::<u32>()
+        .map_err(|_| invalid_state("usage day is invalid"))?;
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => return Err(invalid_state("usage day month is invalid")),
+    };
+    let (next_year, next_month, next_day) = if day < days_in_month {
+        (year, month, day + 1)
+    } else if month < 12 {
+        (year, month + 1, 1)
+    } else {
+        let year = year
+            .checked_add(1)
+            .filter(|year| *year <= 9999)
+            .ok_or_else(|| invalid_state("usage day exceeds timestamp range"))?;
+        (year, 1, 1)
+    };
+    Ok(format!(
+        "{next_year:04}-{next_month:02}-{next_day:02}T00:00:00Z"
+    ))
 }
 
 fn cursor_logical_bytes(cursor: &SessionScanCursor) -> usize {
@@ -4405,6 +4774,48 @@ fn usage_record_from_database(row: UsageDatabaseRow) -> Result<SessionUsageRecor
         cache_write_tokens: database_u64(row.10, "cache write tokens")?,
         reasoning_tokens: database_u64(row.11, "reasoning tokens")?,
         record_revision: database_u64(row.12, "record revision")?,
+    })
+}
+
+fn usage_aggregate_totals_from_database(
+    row: UsageAggregateTotalsDatabaseRow,
+) -> Result<SessionUsageAggregateTotals, StorageError> {
+    Ok(SessionUsageAggregateTotals {
+        input_tokens: database_u64(row.0, "aggregate input tokens")?,
+        output_tokens: database_u64(row.1, "aggregate output tokens")?,
+        cache_read_tokens: database_u64(row.2, "aggregate cache-read tokens")?,
+        cache_write_tokens: database_u64(row.3, "aggregate cache-write tokens")?,
+        reasoning_tokens: database_u64(row.4, "aggregate reasoning tokens")?,
+        session_count: database_u64(row.5, "aggregate session count")?,
+    })
+}
+
+fn usage_aggregate_bucket_from_database(
+    group_by: SessionUsageGroupBy,
+    row: UsageAggregateBucketDatabaseRow,
+) -> Result<SessionUsageAggregateBucket, StorageError> {
+    let (start, end) = match group_by {
+        SessionUsageGroupBy::Day => {
+            validate_usage_day_key(&row.0)?;
+            let start = format!("{}T00:00:00Z", row.0);
+            let end = next_utc_day(&row.0)?;
+            (Some(start), Some(end))
+        }
+        SessionUsageGroupBy::Source | SessionUsageGroupBy::Model => {
+            validate_bounded_text("usage aggregate key", &row.0, 256, false)?;
+            (None, None)
+        }
+    };
+    Ok(SessionUsageAggregateBucket {
+        key: row.0,
+        start,
+        end,
+        input_tokens: database_u64(row.1, "bucket input tokens")?,
+        output_tokens: database_u64(row.2, "bucket output tokens")?,
+        cache_read_tokens: database_u64(row.3, "bucket cache-read tokens")?,
+        cache_write_tokens: database_u64(row.4, "bucket cache-write tokens")?,
+        reasoning_tokens: database_u64(row.5, "bucket reasoning tokens")?,
+        session_count: database_u64(row.6, "bucket session count")?,
     })
 }
 

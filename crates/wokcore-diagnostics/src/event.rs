@@ -389,6 +389,9 @@ closed_code! {
         StartingToReady => "starting_to_ready",
         ReadyToDegraded => "ready_to_degraded",
         DegradedToReady => "degraded_to_ready",
+        ReadyToDraining => "ready_to_draining",
+        DrainingToAwaitingCancellation => "draining_to_awaiting_cancellation",
+        DrainingToReady => "draining_to_ready",
         ReadyToStopping => "ready_to_stopping",
         StoppingToStopped => "stopping_to_stopped",
     }
@@ -1821,6 +1824,9 @@ decode_code!(decode_transition, StateTransition, {
     "starting_to_ready" => StartingToReady,
     "ready_to_degraded" => ReadyToDegraded,
     "degraded_to_ready" => DegradedToReady,
+    "ready_to_draining" => ReadyToDraining,
+    "draining_to_awaiting_cancellation" => DrainingToAwaitingCancellation,
+    "draining_to_ready" => DrainingToReady,
     "ready_to_stopping" => ReadyToStopping,
     "stopping_to_stopped" => StoppingToStopped,
 });

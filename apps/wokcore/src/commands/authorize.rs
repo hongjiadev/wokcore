@@ -1,10 +1,11 @@
-use std::io;
+use std::{io, str::FromStr};
 
 use reqwest::StatusCode;
 use secrecy::{ExposeSecret, SecretString, zeroize::Zeroizing};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use wokcore_core::id::ClientId;
+use wokcore_storage::ClientTokenScope;
 
 use crate::{CommandOutput, ExitCode, RunDependencies, cli::Authorize};
 
@@ -22,7 +23,11 @@ pub(super) async fn run(
         Ok(client_id) => client_id,
         Err(_) => return render_error(ControlClientError::InvalidRuntime, output),
     };
-    let result = authorize(client_id, dependencies).await;
+    let scopes = match parse_scopes(options.scopes) {
+        Some(scopes) => scopes,
+        None => return render_error(ControlClientError::InvalidRuntime, output),
+    };
+    let result = authorize(client_id, scopes, dependencies).await;
     match result {
         Ok(authorized) => {
             let rendered = write_authorize_json(output, &authorized);
@@ -38,12 +43,14 @@ pub(super) async fn run(
 
 async fn authorize(
     client_id: ClientId,
+    scopes: Vec<ClientTokenScope>,
     dependencies: &RunDependencies,
 ) -> Result<AuthorizeResponse, ControlClientError> {
     let client = ControlClient::connect(dependencies).await?;
     let management = client.management_secret(dependencies).await?;
     let request = AuthorizeRequest {
         client_id: client_id.clone(),
+        scopes: scopes.iter().map(|scope| scope.as_str()).collect(),
     };
     let response = client
         .post_json("/wokcore/v1/clients/authorize", &management, Some(&request))
@@ -62,6 +69,11 @@ async fn authorize(
         client_id: authorized.client_id,
         token_id: authorized.token_id,
         token: SecretString::from(authorized.token),
+        scopes: if authorized.scopes.is_empty() {
+            scopes
+        } else {
+            parse_scopes(authorized.scopes).ok_or(ControlClientError::Internal)?
+        },
     };
     if authorized.client_id != client_id
         || authorized.token_id.is_empty()
@@ -83,6 +95,11 @@ fn write_authorize_json(
         client_id: &authorized.client_id,
         token_id: &authorized.token_id,
         token: authorized.token.expose_secret(),
+        scopes: authorized
+            .scopes
+            .iter()
+            .map(|scope| scope.as_str())
+            .collect(),
     };
     let mut rendered = Zeroizing::new(serde_json::to_string(&response).map_err(io::Error::other)?);
     rendered.push('\n');
@@ -111,6 +128,8 @@ fn render_error(error: ControlClientError, output: &mut dyn CommandOutput) -> Ex
 #[derive(Serialize)]
 struct AuthorizeRequest {
     client_id: ClientId,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    scopes: Vec<&'static str>,
 }
 
 #[derive(Deserialize)]
@@ -118,12 +137,15 @@ struct AuthorizeResponseWire {
     client_id: ClientId,
     token_id: String,
     token: String,
+    #[serde(default)]
+    scopes: Vec<String>,
 }
 
 struct AuthorizeResponse {
     client_id: ClientId,
     token_id: String,
     token: SecretString,
+    scopes: Vec<ClientTokenScope>,
 }
 
 #[derive(Serialize)]
@@ -131,4 +153,22 @@ struct AuthorizeOutput<'a> {
     client_id: &'a ClientId,
     token_id: &'a str,
     token: &'a str,
+    scopes: Vec<&'static str>,
+}
+
+fn parse_scopes(scopes: Vec<String>) -> Option<Vec<ClientTokenScope>> {
+    let scopes = if scopes.is_empty() {
+        vec![ClientTokenScope::ProxyUse.as_str().to_owned()]
+    } else {
+        scopes
+    };
+    let mut parsed = scopes
+        .iter()
+        .map(|scope| ClientTokenScope::from_str(scope))
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    let original_len = parsed.len();
+    parsed.sort_unstable();
+    parsed.dedup();
+    (parsed.len() == original_len).then_some(parsed)
 }

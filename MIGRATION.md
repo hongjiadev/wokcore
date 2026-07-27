@@ -246,3 +246,19 @@ Private pre-rewrite recovery material is excluded from this public repository.
   - `cargo +1.97.1 test -p wokcore-storage --test session_state_store --locked --offline`
   - `cargo +1.97.1 test -p wokcore-storage --all-features --locked --offline`
   - `cargo +1.97.1 clippy -p wokcore-storage --all-targets --all-features --locked --offline -- -D warnings`
+
+## Runtime foundation 10: Session diagnostics control plane
+
+- WokCore automatically discovers Codex, Claude Code, and Gemini CLI Session roots from an injected platform environment snapshot. Production uses the same resolver with the current operating-system environment; tests use only synthetic temporary roots.
+- External Session files are opened read-only through pinned, no-follow platform handles. Scanners operate in bounded slices, preserve incomplete lines, detect replacement/truncation, and update only WokCore-owned SQLite state through the existing single-writer batch path.
+- Session bodies are not copied into SQLite or durable diagnostics. The authenticated message endpoint resolves an opaque indexed key and pages directly from the pinned source generation with a complete serialized-response byte budget.
+- The Session list, message, usage, and diagnostic-log APIs use a dedicated two-worker query service, a 32-command non-blocking queue, and a five-second deadline. These bounds do not limit Provider proxy or SSE concurrency.
+- The memory diagnostic ring is capped at 16 MiB. Durable events use non-blocking bounded admission, batches of at most 128 events or 256 KiB, 4 MiB rotating segments, and seven-day/64 MiB retention. Empty timers perform no writes.
+- Control-plane requests emit one typed event correlated with the returned `X-Request-Id`; there are no per-SSE-chunk events. Ordinary successful and client-error request events stay in memory, while internal failures are eligible for batched persistence.
+- The streamed diagnostic ZIP export is built in a current-user-only internal directory, validated against its manifest, checksums, and leak scan, then removed after transfer. CLI export is create-new, streams directly to a pinned destination, rejects existing/raced targets, and refuses destinations inside or aliased to discovered Session roots.
+- Client authorization supports exact repeatable scopes: `proxy.use`, `sessions.read`, `usage.read`, `diagnostics.read`, and `diagnostics.export`. Existing schema-2 client tokens retain only `proxy.use`.
+- Capabilities add `sessions.index.v1`, `sessions.messages.v1`, `usage.session.v1`, `diagnostics.events.v1`, and `diagnostics.export.v1`.
+- Verification:
+  - `cargo +1.97.1 test -p wokcore-server --all-features --locked --offline`
+  - `cargo +1.97.1 test -p wokcore --all-features --locked --offline`
+  - `cargo +1.97.1 test --workspace --all-features --locked --offline`

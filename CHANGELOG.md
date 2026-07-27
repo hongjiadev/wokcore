@@ -20,11 +20,18 @@ All notable WokCore changes are documented in this file.
 - Local `serve`, `status`, `stop`, `doctor`, and JSON-only `authorize` commands with stable exit/result codes, fixed-port fail-closed startup, exact loopback identity verification, injected runtime seams, read-only diagnostics, and ownership-conditional discovery cleanup.
 - Ordered SQLite schema 3 Session state with hidden staged generations, atomic promotion, bounded cursor/index/usage/replay batches, exact client-token scopes, and content-free supplemental request metadata with explicit capacity and retention cleanup.
 - Read-only Codex Session discovery and bounded JSONL ingestion with byte cursors, cumulative usage reconstruction, durable fork-replay signatures, automatic UTC timestamp normalization, and immutable title metadata fallbacks.
+- Automatic read-only Session indexing for Codex, Claude Code, and Gemini CLI, including bounded source scanners, cross-platform discovery, source-health aggregation, and direct paged message reads.
+- Bounded diagnostic memory ring, batched durable segments, drop summaries, causal snapshots, retention, privacy scanning, and validated streamed support-package export.
+- Authenticated Session list/message, usage, diagnostic-log, and diagnostic-export APIs with exact client scopes, opaque pagination cursors, bounded query workers, response byte limits, and OpenAPI 3.1 schemas.
+- Terminal-safe Session/log CLI output, JSON/JSONL modes, repeatable authorization scopes, and create-new diagnostic ZIP export protected from Session-root aliasing.
+- Typed request diagnostics correlated by response request ID; ordinary request events stay memory-only while internal failures remain durable warning candidates.
 
 ### Fixed
 
 - Session state now enforces monotonic same-generation appends, immutable same-position parser checkpoints, complete current-cursor reloads, lineage-safe resume, externally rebuildable validated page keys, source-derived effective availability, source-driven current-generation paging that ignores hidden-generation volume, transactional generation compare-and-swap updates, typed supplemental drop outcomes, exact cleanup byte budgets, and three-batch interruption coverage.
 - Codex Session scans isolate malformed or resource-limited sources, preserve the last promoted generation, detect same-identity rewrites at the committed cursor boundary, resume interrupted candidates across appends and live-to-archive moves, and perform unchanged scans without durable writes.
+- Live diagnostic queries and exports now tolerate the writer-owned empty active segment by using the complete in-memory ring copy while continuing to fail closed for any older unreadable segment.
+- Internal diagnostic-export temporary directories are excluded from event enumeration and cannot be created through the public diagnostic-file API.
 - Configuration loading now rejects every field outside top-level `revision`/`server` and nested `server.port`, while preserving invalid source files.
 - Protocol channels, SSE frame aggregation, and Azure/Gemini event aggregation now fail closed at configured memory and event bounds.
 - OpenAI Responses streaming and non-stream aggregation now bound retained output, identifiers, output items, and serialized context and usage values.

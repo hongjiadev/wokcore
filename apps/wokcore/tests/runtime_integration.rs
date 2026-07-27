@@ -33,6 +33,7 @@ use wokcore_server::auth::{
     AuthRegistry, EntropySource, StateAuthMetadataStore, TokenError, TokenMaterial,
 };
 use wokcore_server::lifecycle::{LifecyclePhase, ServiceLifecycle};
+use wokcore_server::observability::SessionRootPaths;
 use wokcore_storage::{
     AppConfig, ClientTokenMetadata, ConfigStore, MemorySecretStore, ReadOnlyStateStore,
     SecretStore, ServerConfig, StateStore,
@@ -805,6 +806,149 @@ async fn serve_publishes_only_a_ready_loopback_identity_and_removes_its_discover
     );
     assert_eq!(serve_output.stderr(), "");
     assert!(!paths.discovery_file.exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_log_and_atomic_diagnostic_export_cli_use_the_live_control_plane() {
+    let directory = TestDirectory::new();
+    let paths = paths(directory.path());
+    persist_port(&paths, reserve_port());
+    let roots = SessionRootPaths {
+        codex: directory.path().join("sessions").join("codex"),
+        claude: directory.path().join("sessions").join("claude"),
+        gemini: directory.path().join("sessions").join("gemini"),
+    };
+    for root in [&roots.codex, &roots.claude, &roots.gemini] {
+        std::fs::create_dir_all(root).unwrap();
+    }
+    let secrets = Arc::new(MemorySecretStore::default());
+    let shutdown = Arc::new(ManualShutdown::default());
+    let serve_dependencies = runtime_dependencies(paths.clone(), secrets.clone(), shutdown.clone())
+        .with_session_roots(roots.clone());
+    let serve = tokio::spawn(async move {
+        let mut output = BufferOutput::default();
+        run_with_dependencies(
+            Cli::try_parse_from(["wokcore", "serve", "--json"]).unwrap(),
+            &serve_dependencies,
+            &mut output,
+        )
+        .await
+    });
+    wait_for_discovery(&paths).await;
+    let client_dependencies =
+        runtime_dependencies(paths.clone(), secrets.clone(), shutdown.clone())
+            .with_session_roots(roots.clone());
+
+    let mut sessions = BufferOutput::default();
+    assert_eq!(
+        run_with_dependencies(
+            Cli::try_parse_from(["wokcore", "sessions", "list", "--json"]).unwrap(),
+            &client_dependencies,
+            &mut sessions,
+        )
+        .await,
+        ExitCode::Success
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(sessions.stdout()).unwrap()["schema_version"],
+        1
+    );
+
+    let mut logs = BufferOutput::default();
+    let logs_exit = run_with_dependencies(
+        Cli::try_parse_from(["wokcore", "logs", "--jsonl"]).unwrap(),
+        &client_dependencies,
+        &mut logs,
+    )
+    .await;
+    assert_eq!(
+        logs_exit,
+        ExitCode::Success,
+        "stdout={} stderr={}",
+        logs.stdout(),
+        logs.stderr()
+    );
+    assert!(
+        !logs.stdout().is_empty(),
+        "the completed Session request must be visible in the live diagnostic ring"
+    );
+    let mut found_correlated_request = false;
+    for line in logs.stdout().lines() {
+        let event = serde_json::from_str::<serde_json::Value>(line).unwrap();
+        if event["code"] == "request_completed" {
+            found_correlated_request = event["correlations"]["request_id"]
+                .as_str()
+                .is_some_and(|value| Uuid::parse_str(value).is_ok());
+        }
+    }
+    assert!(found_correlated_request, "logs={}", logs.stdout());
+
+    let output_path = directory.path().join("support.zip");
+    let mut exported = BufferOutput::default();
+    assert_eq!(
+        run_with_dependencies(
+            Cli::try_parse_from([
+                "wokcore",
+                "diagnostics",
+                "export",
+                "--output",
+                output_path.to_str().unwrap(),
+            ])
+            .unwrap(),
+            &client_dependencies,
+            &mut exported,
+        )
+        .await,
+        ExitCode::Success
+    );
+    assert!(std::fs::read(&output_path).unwrap().starts_with(b"PK"));
+
+    let mut existing = BufferOutput::default();
+    assert_eq!(
+        run_with_dependencies(
+            Cli::try_parse_from([
+                "wokcore",
+                "diagnostics",
+                "export",
+                "--output",
+                output_path.to_str().unwrap(),
+            ])
+            .unwrap(),
+            &client_dependencies,
+            &mut existing,
+        )
+        .await,
+        ExitCode::InvalidInput
+    );
+
+    let unsafe_path = roots.codex.join("support.zip");
+    let mut unsafe_export = BufferOutput::default();
+    assert_eq!(
+        run_with_dependencies(
+            Cli::try_parse_from([
+                "wokcore",
+                "diagnostics",
+                "export",
+                "--output",
+                unsafe_path.to_str().unwrap(),
+            ])
+            .unwrap(),
+            &client_dependencies,
+            &mut unsafe_export,
+        )
+        .await,
+        ExitCode::InvalidInput
+    );
+    assert!(!unsafe_path.exists());
+
+    shutdown.trigger();
+    assert_eq!(
+        timeout(Duration::from_secs(5), serve)
+            .await
+            .unwrap()
+            .unwrap(),
+        ExitCode::Success
+    );
 }
 
 async fn wait_for_discovery(paths: &AppPaths) -> DiscoveryRecord {

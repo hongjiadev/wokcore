@@ -71,6 +71,37 @@ pub fn utc_timestamp_from_epoch_seconds(seconds: u64) -> Option<String> {
     ))
 }
 
+pub fn utc_epoch_seconds(value: &str) -> Option<u64> {
+    if value.len() != 20 {
+        return None;
+    }
+    let number = |range: std::ops::Range<usize>| value.get(range)?.parse::<i64>().ok();
+    let year = number(0..4)?;
+    let month = number(5..7)?;
+    let day = number(8..10)?;
+    let hour = number(11..13)?;
+    let minute = number(14..16)?;
+    let second = number(17..19)?;
+    wokcore_diagnostics::event::UtcTimestamp::parse(value).ok()?;
+    let adjusted_year = year - i64::from(month <= 2);
+    let era = if adjusted_year >= 0 {
+        adjusted_year
+    } else {
+        adjusted_year - 399
+    } / 400;
+    let year_of_era = adjusted_year - era * 400;
+    let month_prime = month + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * month_prime + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    let seconds = days
+        .checked_mul(86_400)?
+        .checked_add(hour.checked_mul(3_600)?)?
+        .checked_add(minute.checked_mul(60)?)?
+        .checked_add(second)?;
+    u64::try_from(seconds).ok()
+}
+
 fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let days = days + 719_468;
     let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
@@ -106,7 +137,10 @@ mod tests {
 
     use crate::auth::{EntropySource, TokenError};
 
-    use super::{SystemTokenMetadata, TokenMetadataSource, utc_timestamp_from_epoch_seconds};
+    use super::{
+        SystemTokenMetadata, TokenMetadataSource, utc_epoch_seconds,
+        utc_timestamp_from_epoch_seconds,
+    };
 
     struct FailingEntropy;
 
@@ -138,5 +172,15 @@ mod tests {
             Some("2026-07-27T12:34:56Z")
         );
         assert_eq!(utc_timestamp_from_epoch_seconds(u64::MAX), None);
+    }
+
+    #[test]
+    fn canonical_utc_round_trips_to_epoch_seconds() {
+        for seconds in [0, 951_782_400, 1_785_155_696] {
+            let timestamp = utc_timestamp_from_epoch_seconds(seconds).unwrap();
+            assert_eq!(utc_epoch_seconds(&timestamp), Some(seconds));
+        }
+        assert_eq!(utc_epoch_seconds("not-a-timestamp"), None);
+        assert_eq!(utc_epoch_seconds("1969-12-31T23:59:59Z"), None);
     }
 }

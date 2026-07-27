@@ -28,6 +28,7 @@ use std::sync::{
 
 pub const MAX_DIAGNOSTIC_WRITE_CHUNK_BYTES: usize = 64 * 1024;
 pub const MAX_DIAGNOSTIC_DELETE_TOMBSTONES: usize = 16_384;
+pub const DIAGNOSTIC_EXPORT_TEMPORARY_PREFIX: &str = ".wokcore-diagnostics-export-";
 const DIAGNOSTIC_DELETE_TOMBSTONE_PREFIX: &str = ".wokcore-diagnostic-delete-";
 #[cfg(unix)]
 const DIAGNOSTIC_DELETE_TOMBSTONE_MARKER_SUFFIX: &str = ".owner";
@@ -337,6 +338,13 @@ impl DiagnosticDirectory {
             cursor = raw.last().map(|entry| entry.name().to_os_string());
             let raw_count = raw.len();
             for (index, entry) in raw.into_iter().enumerate() {
+                if entry
+                    .name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(DIAGNOSTIC_EXPORT_TEMPORARY_PREFIX))
+                {
+                    continue;
+                }
                 if is_delete_tombstone(entry.name()) {
                     tombstones = tombstones
                         .checked_add(1)
@@ -376,10 +384,15 @@ impl DiagnosticDirectory {
 
 fn validate_diagnostic_name(name: &OsStr) -> Result<(), DiagnosticStoreError> {
     validate_child_name(name).map_err(map_session_error)?;
-    if is_delete_tombstone(name) {
+    if is_delete_tombstone(name) || is_export_temporary(name) {
         return Err(DiagnosticStoreError::UnsafePath);
     }
     Ok(())
+}
+
+fn is_export_temporary(name: &OsStr) -> bool {
+    name.to_str()
+        .is_some_and(|name| name.starts_with(DIAGNOSTIC_EXPORT_TEMPORARY_PREFIX))
 }
 
 fn is_delete_tombstone(name: &OsStr) -> bool {

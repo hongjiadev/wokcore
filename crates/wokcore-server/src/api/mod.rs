@@ -1,24 +1,31 @@
+mod cursor;
 mod error;
+mod export;
+mod logs;
 mod model;
 mod request_id;
 mod routes;
 mod security;
+mod sessions;
 
 use axum::{
     Router,
     extract::DefaultBodyLimit,
     middleware,
-    routing::{MethodFilter, delete, on, post},
+    routing::{MethodFilter, delete, get, on, post},
 };
 
 use crate::ServerState;
 
+use export::diagnostics_export;
+use logs::logs;
 use request_id::apply_response_envelope;
 use routes::{
     authorize, cancel_drain, capabilities, drain, health, method_not_allowed, not_found, revoke,
     service_status, stop,
 };
 use security::enforce_request_security;
+use sessions::{list_sessions, session_messages, usage};
 
 pub fn build_router(state: ServerState) -> Router {
     Router::new()
@@ -38,6 +45,14 @@ pub fn build_router(state: ServerState) -> Router {
         .route("/wokcore/v1/service/drain/cancel", post(cancel_drain))
         .route("/wokcore/v1/service/stop", post(stop))
         .route("/wokcore/v1/clients/authorize", post(authorize))
+        .route("/wokcore/v1/sessions", get(list_sessions))
+        .route(
+            "/wokcore/v1/sessions/{session_key}/messages",
+            get(session_messages),
+        )
+        .route("/wokcore/v1/usage", get(usage))
+        .route("/wokcore/v1/logs", get(logs))
+        .route("/wokcore/v1/diagnostics/export", get(diagnostics_export))
         .route(
             "/wokcore/v1/clients/{client_id}/tokens/{token_id}",
             delete(revoke),

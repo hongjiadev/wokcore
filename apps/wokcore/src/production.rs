@@ -58,6 +58,12 @@ fn requests_json(cli: &Cli) -> bool {
         | Command::Stop(options)
         | Command::Doctor(options) => options.json,
         Command::Authorize(options) => options.json,
+        Command::Sessions(options) => match &options.command {
+            crate::cli::SessionsCommand::List(options) => options.json,
+            crate::cli::SessionsCommand::Show(options) => options.json,
+        },
+        Command::Logs(options) => options.jsonl,
+        Command::Diagnostics(_) => false,
     }
 }
 

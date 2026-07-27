@@ -1,10 +1,14 @@
 mod authorize;
 mod client;
+mod diagnostics;
 mod doctor;
+mod logs;
 mod response;
 mod serve;
+mod sessions;
 mod status;
 mod stop;
+mod terminal;
 
 use std::io;
 
@@ -23,6 +27,9 @@ pub(crate) async fn run(
         Command::Doctor(options) => doctor::run(options, dependencies, output).await,
         Command::Stop(options) => stop::run(options, dependencies, output).await,
         Command::Authorize(options) => authorize::run(options, dependencies, output).await,
+        Command::Sessions(options) => sessions::run(options, dependencies, output).await,
+        Command::Logs(options) => logs::run(options, dependencies, output).await,
+        Command::Diagnostics(options) => diagnostics::run(options, dependencies, output).await,
     }
 }
 

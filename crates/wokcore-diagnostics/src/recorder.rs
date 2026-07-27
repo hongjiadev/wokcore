@@ -373,6 +373,12 @@ impl PendingQuery {
             Err(_) => Err(QueryReplyError::Deadline),
         }
     }
+
+    pub fn blocking_wait(self) -> Result<RingPage, QueryReplyError> {
+        self.receiver
+            .blocking_recv()
+            .map_err(|_| QueryReplyError::Closed)
+    }
 }
 
 impl fmt::Debug for PendingQuery {

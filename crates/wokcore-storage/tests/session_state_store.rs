@@ -16,8 +16,9 @@ use wokcore_storage::{
     RequestSupplementalMetadata, SessionAvailability, SessionBatch, SessionFileIdentity,
     SessionGenerationState, SessionIndexPageKey, SessionIndexRecord, SessionScanCursor,
     SessionScanResultCode, SessionSourceErrorCode, SessionSourceKind, SessionSourcePageKey,
-    SessionSourceStatus, SessionUsagePageKey, SessionUsageRecord, StateStore, StorageError,
-    SupplementalErrorCode, SupplementalFailoverDecision, SupplementalRetryDecision, TraceId,
+    SessionSourceStatus, SessionUsageAggregateFilter, SessionUsageGroupBy, SessionUsagePageKey,
+    SessionUsageRecord, StateStore, StorageError, SupplementalErrorCode,
+    SupplementalFailoverDecision, SupplementalRetryDecision, TraceId,
 };
 
 const NOW: &str = "2026-07-26T00:00:00Z";
@@ -1459,6 +1460,33 @@ fn bounded_source_and_global_current_pages_restore_only_visible_generations() {
             .iter()
             .all(|record| record.generation == 1)
     );
+    let aggregate = store
+        .load_global_current_session_usage_aggregate_page(
+            &SessionUsageAggregateFilter::default(),
+            SessionUsageGroupBy::Source,
+            None,
+            1,
+        )
+        .unwrap();
+    assert_eq!(aggregate.totals.input_tokens, 20);
+    assert_eq!(aggregate.totals.output_tokens, 40);
+    assert_eq!(aggregate.totals.session_count, 2);
+    assert_eq!(aggregate.buckets.len(), 1);
+    assert_eq!(aggregate.buckets[0].key, "codex");
+    assert_eq!(aggregate.buckets[0].session_count, 2);
+    assert_eq!(aggregate.next_page_key, None);
+    assert_eq!(
+        store
+            .load_global_current_session_index_by_key(&opaque(1060))
+            .unwrap(),
+        Some(index_record(&first_source, 1, 1060))
+    );
+    assert_eq!(
+        store
+            .load_global_current_session_index_by_key(&opaque(9999))
+            .unwrap(),
+        None
+    );
 
     let replacement_cursor = cursor(&first_source, 2, 200);
     store
@@ -1490,6 +1518,18 @@ fn bounded_source_and_global_current_pages_restore_only_visible_generations() {
             .items
             .iter()
             .any(|record| record.source_key == first_source && record.generation == 1)
+    );
+    assert_eq!(
+        store
+            .load_global_current_session_index_by_key(&opaque(1060))
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        store
+            .load_global_current_session_index_by_key(&opaque(1080))
+            .unwrap(),
+        Some(index_record(&first_source, 2, 1080))
     );
 }
 

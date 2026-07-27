@@ -17,7 +17,8 @@ use wokcore_server::auth::{
     AuthMetadataStore, AuthRegistry, EntropySource, TokenError, TokenMaterial,
 };
 use wokcore_storage::{
-    ClientTokenMetadata, MemorySecretStore, RuntimeSecretBinding, SecretStore, StorageError,
+    ClientTokenMetadata, ClientTokenScope, MemorySecretStore, RuntimeSecretBinding, SecretStore,
+    StorageError,
 };
 
 const CREATED_AT: &str = "2026-07-26T00:00:00Z";
@@ -244,6 +245,14 @@ impl AuthMetadataStore for FakeMetadataStore {
             let _ = completed.send(());
         }
         Ok(())
+    }
+
+    fn issue_client_token_with_scopes(
+        &self,
+        token: &ClientTokenMetadata,
+        _scopes: &[ClientTokenScope],
+    ) -> Result<(), StorageError> {
+        self.issue_client_token(token)
     }
 
     fn revoke_client_token(
@@ -971,4 +980,40 @@ async fn one_thousand_parallel_validations_perform_no_metadata_io() {
     }
 
     assert_eq!(metadata.calls.load(Ordering::SeqCst), calls_before);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scoped_client_tokens_are_valid_only_for_their_explicit_scopes() {
+    let (registry, _secrets, _metadata, _management_raw) = existing_registry(0xd1).await;
+    let issued = registry
+        .issue_client_token_with_scopes(
+            "token-session-reader".to_owned(),
+            ClientId::new("wokrouter").unwrap(),
+            CREATED_AT.to_owned(),
+            vec![
+                ClientTokenScope::SessionsRead,
+                ClientTokenScope::DiagnosticsRead,
+            ],
+        )
+        .await
+        .unwrap()
+        .into_response_value();
+    let raw = issued.expose_secret();
+
+    assert!(
+        registry
+            .validate_client_scope(raw, ClientTokenScope::SessionsRead)
+            .is_some()
+    );
+    assert!(
+        registry
+            .validate_client_scope(raw, ClientTokenScope::DiagnosticsRead)
+            .is_some()
+    );
+    assert!(
+        registry
+            .validate_client_scope(raw, ClientTokenScope::UsageRead)
+            .is_none()
+    );
+    assert!(registry.validate_client(raw).is_none());
 }
