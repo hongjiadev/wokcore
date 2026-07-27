@@ -113,8 +113,8 @@ $artifacts = @(
                 Executable = [string] $record.executable
             }
         }
-    }
-) | Sort-Object Executable -Unique
+    } | Sort-Object Executable -Unique
+)
 
 if ($artifacts.Count -eq 0) {
     throw "Cargo artifact manifest contains no test executables: $manifestPath"

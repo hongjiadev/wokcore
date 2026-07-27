@@ -113,7 +113,7 @@ impl DataPlaneRequestError {
     }
 }
 
-fn is_json_content_type(content_type: Option<&str>) -> bool {
+pub(crate) fn is_json_content_type(content_type: Option<&str>) -> bool {
     content_type.is_some_and(|content_type| {
         matches!(
             content_type.trim().to_ascii_lowercase().as_str(),

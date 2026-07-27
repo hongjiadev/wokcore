@@ -32,6 +32,7 @@ All notable WokCore changes are documented in this file.
 - Cancellation-safe Provider execution with a fixed two-attempt pre-visible retry window, authentication-preserving account failover, bounded server delays and retained request bodies, and fixed-size content-free attempt diagnostics without a proxy concurrency semaphore.
 - Management-token-only Provider catalog, runtime/model inspection, candidate validation, revision-checked atomic commit, fail-safe reload, and retry-safe scope-stable opaque secret-reference lifecycle APIs with matching JSON-only CLI commands and OpenAPI 3.1 coverage.
 - Stable versioned Responses, Chat Completions, Anthropic Messages, and strictly non-streaming Anthropic token-count inbound codecs with bounded canonical and retained-identifier validation, an exact frozen data-plane protocol registry, and content-free request summaries.
+- Proxy-scope-only data-plane routes with strict protocol-specific methods and media types, OpenAI/Anthropic-safe errors, separate 16 MiB JSON and 20/50 MiB image limits, and cancellation-safe unlimited lifecycle admission.
 
 ### Fixed
 
@@ -40,6 +41,7 @@ All notable WokCore changes are documented in this file.
 - Live diagnostic queries and exports now tolerate the writer-owned empty active segment by using the complete in-memory ring copy while continuing to fail closed for any older unreadable segment.
 - Internal diagnostic-export temporary directories are excluded from event enumeration and cannot be created through the public diagnostic-file API.
 - Windows workspace tests now execute through one fixed `wokcore-test-host.exe` path, preventing loopback-listener tests from presenting a new hash-named program identity after each build.
+- The fixed Windows test host runner now preserves array semantics for single-artifact manifests, so focused tests keep the same stable executable identity.
 - Configuration loading now rejects every field outside top-level `revision`/`server` and nested `server.port`, while preserving invalid source files.
 - Protocol channels, SSE frame aggregation, and Azure/Gemini event aggregation now fail closed at configured memory and event bounds.
 - OpenAI Responses streaming and non-stream aggregation now bound retained output, identifiers, output items, and serialized context and usage values.

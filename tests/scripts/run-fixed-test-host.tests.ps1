@@ -84,6 +84,29 @@ exit /b 0
         }
     }
 
+    Remove-Item -LiteralPath $observed
+    $singleManifest = Join-Path $temporaryRoot "single-artifact.jsonl"
+    @{
+        reason = "compiler-artifact"
+        package_id = "fixture 0.1.0"
+        target = @{ name = "single"; kind = @("test") }
+        profile = @{ test = $true }
+        executable = $firstArtifact
+    } | ConvertTo-Json -Compress -Depth 5 |
+        Set-Content -LiteralPath $singleManifest -Encoding UTF8
+    & $runner `
+        -ArtifactManifestPath $singleManifest `
+        -TargetDirectory $temporaryRoot `
+        -HarnessArguments @(
+            "/d",
+            "/c",
+            "echo %CMDCMDLINE%>>`"$observed`""
+        )
+    $singleHost = @(Get-Content -LiteralPath $observed)
+    if ($singleHost.Count -ne 1 -or $singleHost[0] -notlike "*$fixedHost*") {
+        throw "Expected one manifest artifact to execute through the fixed host"
+    }
+
     $failed = $false
     try {
         & $runner `

@@ -13,17 +13,22 @@ use axum::{
     Router,
     extract::DefaultBodyLimit,
     middleware,
-    routing::{MethodFilter, delete, on, post, put},
+    routing::{MethodFilter, delete, get, on, post, put},
 };
 
 use crate::ServerState;
 
+use crate::data_plane::{
+    IMAGE_MULTIPART_BODY_LIMIT, JSON_BODY_LIMIT, unsupported_json, unsupported_models,
+    unsupported_multipart,
+};
 use export::diagnostics_export;
 use logs::logs;
 use providers::{
     catalog, commit_configuration, create_secret, delete_secret, models, reload, replace_secret,
     runtime_status, validate_configuration,
 };
+pub(crate) use request_id::RequestId;
 use request_id::apply_response_envelope;
 use routes::{
     authorize, cancel_drain, capabilities, drain, health, method_not_allowed, not_found, revoke,
@@ -96,6 +101,31 @@ pub fn build_router(state: ServerState) -> Router {
         .route(
             "/wokcore/v1/clients/{client_id}/tokens/{token_id}",
             delete(revoke),
+        )
+        .route(
+            "/v1/responses",
+            post(unsupported_json).layer(DefaultBodyLimit::max(JSON_BODY_LIMIT)),
+        )
+        .route(
+            "/v1/chat/completions",
+            post(unsupported_json).layer(DefaultBodyLimit::max(JSON_BODY_LIMIT)),
+        )
+        .route(
+            "/v1/messages",
+            post(unsupported_json).layer(DefaultBodyLimit::max(JSON_BODY_LIMIT)),
+        )
+        .route(
+            "/v1/messages/count_tokens",
+            post(unsupported_json).layer(DefaultBodyLimit::max(JSON_BODY_LIMIT)),
+        )
+        .route("/v1/models", get(unsupported_models))
+        .route(
+            "/v1/images/generations",
+            post(unsupported_json).layer(DefaultBodyLimit::max(JSON_BODY_LIMIT)),
+        )
+        .route(
+            "/v1/images/edits",
+            post(unsupported_multipart).layer(DefaultBodyLimit::max(IMAGE_MULTIPART_BODY_LIMIT)),
         )
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
