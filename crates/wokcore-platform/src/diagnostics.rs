@@ -1992,10 +1992,15 @@ mod tests {
         let lease = super::SessionRootLease::open(&root).unwrap();
         let parent = lease.clone_chain().unwrap();
 
-        match super::try_lock_diagnostic_parent(&parent) {
-            Ok(Some(_lock)) => {}
+        let parent_lock = match super::try_lock_diagnostic_parent(&parent) {
+            Ok(Some(parent_lock)) => parent_lock,
             Ok(None) => panic!("a new private directory must not have a contended parent lock"),
             Err(error) => panic!("macOS diagnostic parent lock failed: {error:?}"),
+        };
+        drop(parent_lock);
+
+        if let Err(error) = DiagnosticDirectory::open(&root) {
+            panic!("macOS diagnostic directory failed after parent lock verification: {error:?}");
         }
     }
 
