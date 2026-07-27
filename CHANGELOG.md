@@ -39,6 +39,7 @@ All notable WokCore changes are documented in this file.
 - Capability-aware image generation and edit execution with bounded JSON, 20 MiB per-file and 50 MiB aggregate multipart limits, randomized private temporary files, cancellation cleanup, streamed upstream uploads, and content-free diagnostics.
 - Completion-only request counters, safe request/attempt diagnostic correlation, bounded 64-row or 250 ms request-metric and account-health batching with zero idle writes, validated metric fields, and complete OpenAPI 3.1 coverage for all seven proxy endpoints.
 - Fixed-name loopback-only Provider simulator with strict bounded inert scenarios, deterministic timing, protocol-shaped JSON/SSE for five upstream adapters, failure/fragmentation/cancellation profiles, content-free counters, and no real Provider or credential capability.
+- Fixed-name loopback-only load generator with uncapped 500/1,000-stream modes, deterministic protocol/payload/cancellation/slow-consumer controls, pooled streaming clients, bounded aggregation, and payload-free JSON evidence.
 
 ### Fixed
 

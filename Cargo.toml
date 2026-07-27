@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
   "apps/wokcore",
+  "apps/wokcore-loadgen",
   "apps/wokcore-provider-sim",
   "crates/wokcore-core",
   "crates/wokcore-diagnostics",
