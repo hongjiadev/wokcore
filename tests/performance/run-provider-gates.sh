@@ -552,17 +552,33 @@ PY
 }
 
 report_wokcore_start_failure() {
-    local path="$ARTIFACT_DIRECTORY/wokcore.stderr"
-    [[ -f "$path" ]] || return 0
-    local size
-    size="$(wc -c <"$path" | tr -d '[:space:]')"
-    [[ "$size" =~ ^[0-9]+$ ]] || return 0
-    if ((size == 0)); then
-        return 0
+    local stdout_path="$ARTIFACT_DIRECTORY/wokcore.stdout"
+    local stderr_path="$ARTIFACT_DIRECTORY/wokcore.stderr"
+    local command_code=""
+    local startup_events=""
+    if [[ -f "$stdout_path" ]]; then
+        command_code="$(
+            tail -c 4096 "$stdout_path" |
+                grep -Eo '"code"[[:space:]]*:[[:space:]]*"[a-z0-9_]+"' |
+                head -n 1 |
+                sed -E 's/^"code"[[:space:]]*:[[:space:]]*"([a-z0-9_]+)"$/\1/' ||
+                true
+        )"
     fi
+    if [[ -f "$stderr_path" ]]; then
+        startup_events="$(
+            tail -c 4096 "$stderr_path" |
+                grep -E '^wokcore startup event_code=[a-z0-9_]+$' || true
+        )"
+    fi
+    [[ -n "$command_code" || -n "$startup_events" ]] || return 0
     printf '%s\n' "portable provider gate: bounded WokCore startup diagnostics follow" >&2
-    tail -c 4096 "$path" >&2
-    printf '\n' >&2
+    if [[ -n "$command_code" ]]; then
+        printf 'portable provider gate: WokCore command_code=%s\n' "$command_code" >&2
+    fi
+    if [[ -n "$startup_events" ]]; then
+        printf '%s\n' "$startup_events" >&2
+    fi
 }
 
 assert_exact_process_path() {

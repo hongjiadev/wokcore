@@ -25,7 +25,7 @@ use wokcore_diagnostics::{
     },
     segment::{
         BoxedDurableWriterOwner, DiagnosticDropSummary, DurableDropRequests, DurableProcessError,
-        DurableProcessOutcome, DurableProducer, DurableWorkOutcome,
+        DurableProcessOutcome, DurableProducer, DurableWorkOutcome, SegmentError,
     },
     snapshot::{SnapshotOwner, SnapshotRecorder, SnapshotShutdown},
 };
@@ -366,6 +366,8 @@ impl fmt::Debug for DiagnosticWriterHandle {
 pub enum DiagnosticWriterError {
     #[error("diagnostic writer filesystem setup failed")]
     Io,
+    #[error("diagnostic writer startup recovery failed")]
+    Recovery(#[source] DurableProcessError),
     #[error("diagnostic writer event construction failed")]
     Build,
     #[error("diagnostic writer persistence failed")]
@@ -374,6 +376,26 @@ pub enum DiagnosticWriterError {
     Task,
     #[error("diagnostic writer recorder barrier failed")]
     Barrier,
+}
+
+impl DiagnosticWriterError {
+    pub fn startup_event_code(&self) -> &'static str {
+        match self {
+            Self::Io => "startup_diagnostics_directory_failed",
+            Self::Recovery(DurableProcessError::Segment(SegmentError::InvalidData)) => {
+                "startup_diagnostics_segment_invalid"
+            }
+            Self::Recovery(DurableProcessError::Segment(_)) => "startup_diagnostics_io_failed",
+            Self::Recovery(DurableProcessError::Retention(_)) => {
+                "startup_diagnostics_retention_failed"
+            }
+            Self::Recovery(DurableProcessError::DropPreparation) => {
+                "startup_diagnostics_recovery_failed"
+            }
+            Self::Build => "startup_diagnostics_recorder_build_failed",
+            Self::Durable | Self::Task | Self::Barrier => "startup_diagnostics_open_failed",
+        }
+    }
 }
 
 pub struct PreparedDiagnosticWriter {
@@ -397,7 +419,7 @@ impl PreparedDiagnosticWriter {
             DurableProducer::with_drop_requests(root);
         let recovery = durable_owner
             .recover_startup(SystemTime::now())
-            .map_err(|_| DiagnosticWriterError::Durable)?;
+            .map_err(DiagnosticWriterError::Recovery)?;
         let (recorder, recorder_owner) = DiagnosticRecorder::new();
         let recorder_owner = recorder_owner
             .with_recovered_durable_producer(producer, recovery)
@@ -816,5 +838,31 @@ impl From<DiagnosticBuildError> for DiagnosticWriterError {
 impl From<DurableProcessError> for DiagnosticWriterError {
     fn from(_: DurableProcessError) -> Self {
         Self::Durable
+    }
+}
+
+#[cfg(test)]
+mod startup_diagnostic_tests {
+    use wokcore_diagnostics::segment::{DurableProcessError, SegmentError};
+
+    use super::DiagnosticWriterError;
+
+    #[test]
+    fn startup_recovery_reports_invalid_segments_without_exposing_runtime_data() {
+        let error = DiagnosticWriterError::Recovery(DurableProcessError::Segment(
+            SegmentError::InvalidData,
+        ));
+
+        assert_eq!(
+            error.startup_event_code(),
+            "startup_diagnostics_segment_invalid"
+        );
+    }
+
+    #[test]
+    fn startup_recovery_distinguishes_filesystem_failures_from_invalid_segments() {
+        let error = DiagnosticWriterError::Recovery(DurableProcessError::Segment(SegmentError::Io));
+
+        assert_eq!(error.startup_event_code(), "startup_diagnostics_io_failed");
     }
 }

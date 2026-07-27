@@ -1938,9 +1938,11 @@ mod tests {
 
     use tempfile::tempdir;
 
+    #[cfg(target_os = "macos")]
+    use super::PinnedExportDestination;
     use super::{
         DIAGNOSTIC_DELETE_TOMBSTONE_PREFIX, DeleteSynchronizationPoint, DiagnosticDirectory,
-        PinnedExportDestination, SessionFileIdentity,
+        SessionFileIdentity,
         delete_synchronization_tests::{self, HookWindow},
     };
 

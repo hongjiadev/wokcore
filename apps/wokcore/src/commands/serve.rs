@@ -20,7 +20,7 @@ use wokcore_server::{
     auth::{AuthError, AuthMetadataStore, AuthRegistry, StateAuthMetadataStore},
     lifecycle::{PreparedIdleMemoryReclaimer, RunningIdleMemoryReclaimer, ServiceLifecycle},
     observability::{
-        PreparedDiagnosticWriter, PreparedScheduler, PreparedStateWriter,
+        DiagnosticWriterError, PreparedDiagnosticWriter, PreparedScheduler, PreparedStateWriter,
         ProductionSessionScanBackend, RunningDiagnosticWriter, RunningScheduler,
         RunningStateWriter, ScanTimestampSource, SchedulerConfig,
     },
@@ -261,7 +261,7 @@ async fn start_service(
             clock: dependencies.clock.clone(),
         }),
     )
-    .map_err(|_| startup_server_error("startup_diagnostics_open_failed"))?;
+    .map_err(map_diagnostic_startup_error)?;
     let (state_writer, prepared_state_writer) =
         PreparedStateWriter::open(&dependencies.paths.state_db)
             .map_err(|_| startup_server_error("startup_state_writer_open_failed"))?;
@@ -689,6 +689,10 @@ fn map_provider_management_error(
         }
         _ => startup_server_error(startup_event_code),
     }
+}
+
+fn map_diagnostic_startup_error(error: DiagnosticWriterError) -> ServeError {
+    startup_server_error(error.startup_event_code())
 }
 
 fn startup_server_error(event_code: &'static str) -> ServeError {

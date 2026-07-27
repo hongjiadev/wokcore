@@ -888,7 +888,10 @@ async fn session_log_and_atomic_diagnostic_export_cli_use_the_live_control_plane
             &mut sessions,
         )
         .await,
-        ExitCode::Success
+        ExitCode::Success,
+        "stdout={} stderr={}",
+        sessions.stdout(),
+        sessions.stderr()
     );
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(sessions.stdout()).unwrap()["schema_version"],
@@ -940,7 +943,10 @@ async fn session_log_and_atomic_diagnostic_export_cli_use_the_live_control_plane
             &mut exported,
         )
         .await,
-        ExitCode::Success
+        ExitCode::Success,
+        "stdout={} stderr={}",
+        exported.stdout(),
+        exported.stderr()
     );
     assert!(std::fs::read(&output_path).unwrap().starts_with(b"PK"));
 

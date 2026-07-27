@@ -68,6 +68,20 @@ TOTAL_CANCELLED=256
 TOTAL_ERRORS=0
 MAX_PEAK_ACTIVE=256
 
+ARTIFACT_DIRECTORY="$TEST_ROOT/startup-diagnostics"
+mkdir -p "$ARTIFACT_DIRECTORY"
+printf '%s\n' \
+    '{"code":"internal_error","secret":"must-not-appear"}' \
+    >"$ARTIFACT_DIRECTORY/wokcore.stdout"
+printf '%s\n' \
+    'wokcore startup event_code=startup_diagnostics_segment_invalid' \
+    'Bearer must-not-appear' \
+    >"$ARTIFACT_DIRECTORY/wokcore.stderr"
+STARTUP_DIAGNOSTICS="$(report_wokcore_start_failure 2>&1)"
+[[ "$STARTUP_DIAGNOSTICS" == *"command_code=internal_error"* ]]
+[[ "$STARTUP_DIAGNOSTICS" == *"event_code=startup_diagnostics_segment_invalid"* ]]
+[[ "$STARTUP_DIAGNOSTICS" != *"must-not-appear"* ]]
+
 write_final_report \
     true \
     "" \
