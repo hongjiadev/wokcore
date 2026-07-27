@@ -17,9 +17,12 @@ use wokcore_diagnostics::{
 };
 use wokcore_server::{
     auth::{EntropySource, TokenError},
-    observability::{PreparedDiagnosticWriter, PreparedStateWriter, ScanTimestampSource},
+    observability::{
+        PreparedDiagnosticWriter, PreparedStateWriter, REQUEST_METRIC_BATCH_ROWS,
+        REQUEST_METRIC_FLUSH_INTERVAL, ScanTimestampSource,
+    },
 };
-use wokcore_storage::StateStoreWriterSubmitError;
+use wokcore_storage::{ProviderMetadataBatch, RequestMetric, StateStoreWriterSubmitError};
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -257,6 +260,55 @@ async fn idle_state_writer_performs_zero_file_writes_and_shutdown_ignores_live_c
         retained.client().try_execute(|_| Ok(())),
         Err(StateStoreWriterSubmitError::WriterClosed)
     ));
+}
+
+fn request_metric(identity: usize) -> RequestMetric {
+    RequestMetric {
+        request_id: format!("019844f0-4de0-7000-8000-{identity:012}"),
+        provider_id: "synthetic-provider".to_owned(),
+        model: "synthetic-model".to_owned(),
+        started_at: "2026-07-27T00:00:00Z".to_owned(),
+        latency_ms: 5,
+        input_tokens: Some(2),
+        output_tokens: Some(3),
+        status_code: 200,
+        error_code: None,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn request_metrics_flush_by_count_or_elapsed_time_and_never_write_per_request() {
+    let fixture = tempdir().unwrap();
+    let state_path = fixture.path().join("state.sqlite3");
+    let (handle, prepared) = PreparedStateWriter::open(&state_path).unwrap();
+    let running = prepared.start().unwrap();
+    let initial_revision = handle.client().activity_revision();
+
+    for identity in 0..REQUEST_METRIC_BATCH_ROWS - 1 {
+        handle.observe_request_metric(request_metric(identity), || {
+            panic!("metadata snapshot must be deferred until the batch is due")
+        });
+    }
+    assert_eq!(handle.client().activity_revision(), initial_revision);
+
+    handle.observe_request_metric(request_metric(REQUEST_METRIC_BATCH_ROWS), || {
+        Some(ProviderMetadataBatch::default())
+    });
+    assert!(handle.client().activity_revision() > initial_revision);
+    running.flush().await.unwrap();
+
+    let after_count_flush = handle.client().activity_revision();
+    handle.observe_request_metric(request_metric(10_000), || {
+        panic!("the first partial row must remain memory-only")
+    });
+    assert_eq!(handle.client().activity_revision(), after_count_flush);
+    sleep(REQUEST_METRIC_FLUSH_INTERVAL + Duration::from_millis(25)).await;
+    handle.observe_request_metric(request_metric(10_001), || {
+        Some(ProviderMetadataBatch::default())
+    });
+    assert!(handle.client().activity_revision() > after_count_flush);
+
+    running.checkpoint_and_shutdown(false).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

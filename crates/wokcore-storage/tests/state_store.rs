@@ -6,7 +6,10 @@ use std::{
 };
 
 use wokcore_core::secret::SecretRef;
-use wokcore_storage::{RequestMetric, StateStore, StorageError, WAL_CHECKPOINT_THRESHOLD_BYTES};
+use wokcore_storage::{
+    MAX_REQUEST_METRIC_BATCH_ROWS, RequestMetric, StateStore, StorageError,
+    WAL_CHECKPOINT_THRESHOLD_BYTES,
+};
 
 fn metric(request_id: &str) -> RequestMetric {
     RequestMetric {
@@ -191,6 +194,27 @@ fn duplicate_row_rolls_back_the_whole_metric_batch() {
         .unwrap_err();
 
     assert!(matches!(error, StorageError::StateDatabase { .. }));
+    assert_eq!(row_count(&path, "request_metrics"), 0);
+}
+
+#[test]
+fn request_metric_batches_and_fields_are_bounded_before_sqlite_writes() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.db");
+    let mut store = StateStore::open(&path).unwrap();
+    let oversized = (0..=MAX_REQUEST_METRIC_BATCH_ROWS)
+        .map(|identity| metric(&format!("request-{identity}")))
+        .collect::<Vec<_>>();
+
+    assert!(matches!(
+        store.record_request_metrics(&oversized),
+        Err(StorageError::InvalidStateRecord { .. })
+    ));
+    let mut unsafe_metric = metric("unsafe");
+    unsafe_metric.model = "model\nAuthorization: bearer-sensitive-canary".to_owned();
+    let error = store.record_request_metrics(&[unsafe_metric]).unwrap_err();
+    assert!(matches!(error, StorageError::InvalidStateRecord { .. }));
+    assert!(!error.to_string().contains("bearer-sensitive-canary"));
     assert_eq!(row_count(&path, "request_metrics"), 0);
 }
 

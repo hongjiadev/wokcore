@@ -2,7 +2,7 @@
 
 WokCore is the independently released local Provider gateway for WokRouter, WokCode, and third-party clients.
 
-The repository is in foundation stage. Local runtime management is implemented; end-user Provider forwarding arrives in a reviewed follow-up change.
+The repository is in foundation stage. Local runtime management and the bounded Provider HTTP data plane are implemented; distribution hardening and downstream client cutover are still in progress.
 
 WokCore is an independent program. Its internal Rust packages are not a supported embeddable library API. The supported management contract is the versioned loopback-only HTTP/JSON API in [`openapi/wokcore-v1.json`](openapi/wokcore-v1.json).
 
@@ -50,6 +50,28 @@ The management API exposes the frozen 58-Provider catalog, active public models,
 Provider secrets are accepted only through bounded JSON requests or CLI standard input. Creation is retry-safe for one Provider/account/purpose scope: matching material returns the same opaque `SecretRef`, while different material conflicts and must use replace for intentional rotation. Responses contain a `SecretRef` and operation metadata only. Secret material is never accepted as a CLI argument, written to configuration, or returned by the API. In-use references cannot be deleted, and the runtime management credential is excluded from the Provider secret lifecycle and configuration.
 
 Every Provider management endpoint requires the management token. A proxy-scoped client token cannot list, validate, commit, reload, create, replace, or delete Provider state. This surface performs no OAuth browser flow, Provider discovery, DNS lookup, or upstream request.
+
+## Provider data plane
+
+All data-plane operations require a client token with the exact `proxy.use` scope. The same loopback authority and Origin restrictions as the management API apply. There is no global request semaphore or configured Provider-concurrency ceiling; per-stream channels and retained request/response bodies remain bounded.
+
+| Client contract | Path | Streaming | Production upstream adapter |
+| --- | --- | --- | --- |
+| OpenAI Responses | `POST /v1/responses` | JSON or SSE | OpenAI Responses, Gemini, Azure |
+| OpenAI Chat Completions | `POST /v1/chat/completions` | JSON or SSE | OpenAI Chat, Gemini, Azure |
+| Anthropic Messages | `POST /v1/messages` | JSON or SSE | Anthropic, Gemini, Azure |
+| Anthropic token count | `POST /v1/messages/count_tokens` | JSON only | Provider-native when supported; otherwise bounded local estimate |
+| OpenAI model list | `GET /v1/models` | JSON only | Immutable local routing snapshot; no upstream request |
+| OpenAI image generation | `POST /v1/images/generations` | JSON only | OpenAI-compatible image adapters, including Azure URL shaping |
+| OpenAI image edit | `POST /v1/images/edits` | JSON only | OpenAI-compatible streamed multipart adapters, including Azure URL shaping |
+
+The bundled catalog describes 58 Provider families, but a catalog capability is not a guarantee that a production wire adapter is enabled. Google image execution currently fails with a typed unsupported-capability result. Provider-specific OAuth browser authorization is not implemented.
+
+JSON requests are capped at 16 MiB. Image edits are streamed through private randomized temporary files with a 20 MiB per-file, 50 MiB aggregate payload, and 51 MiB multipart wire cap; temporary files are removed on success, failure, cancellation, and drop. Pooled transports reject redirects and ambient proxies, validate DNS results against endpoint policy, and bound headers, bodies, connect time, and total time.
+
+Request diagnostics contain only stable request/attempt identifiers, Provider/model metadata, status, timing, and token totals. Successful request events stay in memory. SQLite metrics and account-health metadata flush in batches of 64 or after 250 ms of observed activity; an idle service performs no periodic write, and observability backpressure never blocks a Provider request. Session-derived usage remains the primary detailed usage source.
+
+All repository transport and concurrency tests use injected executors or synthetic loopback Providers. They do not read real credentials or Sessions and do not contact a billable endpoint.
 
 ## Development
 

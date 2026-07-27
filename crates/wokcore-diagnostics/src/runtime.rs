@@ -8,6 +8,111 @@ use std::{
 };
 
 #[derive(Clone, Default)]
+pub struct RequestRuntimeDiagnostics {
+    inner: Arc<RequestRuntimeCounters>,
+}
+
+#[derive(Default)]
+struct RequestRuntimeCounters {
+    active: AtomicU64,
+    completed: AtomicU64,
+    failed: AtomicU64,
+    cancelled: AtomicU64,
+    elapsed_micros: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RequestRuntimeSnapshot {
+    pub active: u64,
+    pub completed: u64,
+    pub failed: u64,
+    pub cancelled: u64,
+    pub elapsed_micros: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RequestRuntimeOutcome {
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl RequestRuntimeDiagnostics {
+    pub fn start(&self) -> RequestRuntimeObservation {
+        self.inner.active.fetch_add(1, Ordering::Relaxed);
+        RequestRuntimeObservation {
+            diagnostics: self.clone(),
+            started_at: Instant::now(),
+            finished: false,
+        }
+    }
+
+    pub fn snapshot(&self) -> RequestRuntimeSnapshot {
+        RequestRuntimeSnapshot {
+            active: self.inner.active.load(Ordering::Relaxed),
+            completed: self.inner.completed.load(Ordering::Relaxed),
+            failed: self.inner.failed.load(Ordering::Relaxed),
+            cancelled: self.inner.cancelled.load(Ordering::Relaxed),
+            elapsed_micros: self.inner.elapsed_micros.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl fmt::Debug for RequestRuntimeDiagnostics {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RequestRuntimeDiagnostics")
+            .field("snapshot", &self.snapshot())
+            .finish()
+    }
+}
+
+pub struct RequestRuntimeObservation {
+    diagnostics: RequestRuntimeDiagnostics,
+    started_at: Instant,
+    finished: bool,
+}
+
+impl RequestRuntimeObservation {
+    pub fn finish(&mut self, outcome: RequestRuntimeOutcome) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        self.diagnostics
+            .inner
+            .active
+            .fetch_sub(1, Ordering::Relaxed);
+        let elapsed = u64::try_from(self.started_at.elapsed().as_micros()).unwrap_or(u64::MAX);
+        self.diagnostics
+            .inner
+            .elapsed_micros
+            .fetch_add(elapsed, Ordering::Relaxed);
+        match outcome {
+            RequestRuntimeOutcome::Completed => &self.diagnostics.inner.completed,
+            RequestRuntimeOutcome::Failed => &self.diagnostics.inner.failed,
+            RequestRuntimeOutcome::Cancelled => &self.diagnostics.inner.cancelled,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+impl fmt::Debug for RequestRuntimeObservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RequestRuntimeObservation")
+            .field("finished", &self.finished)
+            .finish()
+    }
+}
+
+impl Drop for RequestRuntimeObservation {
+    fn drop(&mut self) {
+        self.finish(RequestRuntimeOutcome::Cancelled);
+    }
+}
+
+#[derive(Clone, Default)]
 pub struct StreamRuntimeDiagnostics {
     inner: Arc<StreamRuntimeCounters>,
 }
@@ -146,7 +251,40 @@ impl Drop for StreamRuntimeObservation {
 
 #[cfg(test)]
 mod tests {
-    use super::{StreamRuntimeDiagnostics, StreamRuntimeOutcome};
+    use super::{
+        RequestRuntimeDiagnostics, RequestRuntimeOutcome, StreamRuntimeDiagnostics,
+        StreamRuntimeOutcome,
+    };
+
+    #[test]
+    fn request_observations_publish_one_coarse_result_only_at_completion() {
+        let diagnostics = RequestRuntimeDiagnostics::default();
+        let mut observation = diagnostics.start();
+
+        assert_eq!(diagnostics.snapshot().active, 1);
+        assert_eq!(diagnostics.snapshot().completed, 0);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        observation.finish(RequestRuntimeOutcome::Failed);
+        observation.finish(RequestRuntimeOutcome::Completed);
+
+        let snapshot = diagnostics.snapshot();
+        assert_eq!(snapshot.active, 0);
+        assert_eq!(snapshot.completed, 0);
+        assert_eq!(snapshot.failed, 1);
+        assert_eq!(snapshot.cancelled, 0);
+        assert!(snapshot.elapsed_micros > 0);
+    }
+
+    #[test]
+    fn request_dropped_observation_records_one_cancellation() {
+        let diagnostics = RequestRuntimeDiagnostics::default();
+        let observation = diagnostics.start();
+        drop(observation);
+
+        let snapshot = diagnostics.snapshot();
+        assert_eq!(snapshot.active, 0);
+        assert_eq!(snapshot.cancelled, 1);
+    }
 
     #[test]
     fn streaming_observations_publish_coarse_counters_only_at_completion() {

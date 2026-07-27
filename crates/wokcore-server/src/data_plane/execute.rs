@@ -14,10 +14,10 @@ use wokcore_core::{
 use wokcore_engine::{
     catalog::AdapterFamily,
     execution::{
-        AttemptBoundary, AttemptContext, AttemptFailure, AttemptFailureKind, AttemptResult,
-        ExecutionCancellation, ExecutionCoordinator, ExecutionOutcome, ExecutionRequest,
-        ExecutionRequestId, ExecutionTerminal, PreparedRequestBody, SystemExecutionClock,
-        TokioRetryDelay, UpstreamAttempt,
+        AttemptBoundary, AttemptContext, AttemptFailure, AttemptFailureKind, AttemptHistory,
+        AttemptResult, ExecutionCancellation, ExecutionCoordinator, ExecutionOutcome,
+        ExecutionRequest, ExecutionRequestId, ExecutionTerminal, PreparedRequestBody,
+        SystemExecutionClock, TokioRetryDelay, UpstreamAttempt,
     },
     retry::RetryPolicy,
     routing::{EndpointAccess, RouteDecision, RouteError, RouteRequest},
@@ -28,7 +28,7 @@ use wokcore_protocols::canonical::{
 
 use crate::{ServerState, auth::AuthorizedClient};
 
-use super::JSON_BODY_LIMIT;
+use super::{JSON_BODY_LIMIT, RequestObservationContext};
 
 const MAX_UPSTREAM_REQUEST_ID_BYTES: usize = 256;
 const MAX_UPSTREAM_EVENTS: usize = 4_096;
@@ -705,6 +705,7 @@ pub(crate) struct ExecutedResponse {
     pub(crate) public_model: PublicModelId,
     pub(crate) request: Arc<CanonicalRequest>,
     pub(crate) public_reasoning_effort: Option<String>,
+    pub(crate) observation: RequestObservationContext,
 }
 
 pub(crate) struct ExecutedStream {
@@ -713,6 +714,7 @@ pub(crate) struct ExecutedStream {
     pub(crate) request: Arc<CanonicalRequest>,
     pub(crate) public_reasoning_effort: Option<String>,
     pub(crate) cancellation: CancelOnDrop,
+    pub(crate) observation: RequestObservationContext,
 }
 
 pub(crate) struct StartedUpstreamStream {
@@ -737,6 +739,7 @@ impl StartedUpstreamStream {
 pub(crate) struct DataPlaneExecutionError {
     pub(crate) error: GatewayError,
     pub(crate) upstream_request_id: Option<SafeUpstreamRequestId>,
+    pub(crate) observation: Option<Box<RequestObservationContext>>,
 }
 
 struct RequestAttempt {
@@ -910,6 +913,13 @@ pub(crate) async fn execute_canonical(
             public_model,
             request: Arc::new(canonical),
             public_reasoning_effort,
+            observation: RequestObservationContext {
+                attempt_id: None,
+                provider_id: route.provider_id().as_str().to_owned(),
+                model: route.model().to_owned(),
+                input_tokens: Some(input_tokens),
+                output_tokens: Some(0),
+            },
         }));
     }
     let executor = state
@@ -971,21 +981,26 @@ pub(crate) async fn execute_canonical(
             .execute(request, &health, cancellation.clone())
             .await
         {
-            ExecutionOutcome::Succeeded(success) => executed_from_attempt(
-                success.into_output(),
-                public_model,
-                canonical,
-                public_reasoning_effort,
-                cancel_on_drop,
-            ),
+            ExecutionOutcome::Succeeded(success) => {
+                let observation = request_observation(&route, success.history(), success.output());
+                executed_from_attempt(
+                    success.into_output(),
+                    public_model,
+                    canonical,
+                    public_reasoning_effort,
+                    cancel_on_drop,
+                    observation,
+                )
+            }
             ExecutionOutcome::Failed(failure) => {
                 let request_id = last_upstream_request_id
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .clone();
-                Err(execution_error(
+                Err(execution_error_with_observation(
                     map_terminal(failure.terminal()),
                     request_id,
+                    request_observation_without_usage(&route, failure.history()),
                 ))
             }
         };
@@ -1019,12 +1034,14 @@ pub(crate) async fn execute_canonical(
             .await
         {
             ExecutionOutcome::Succeeded(success) => {
+                let observation = request_observation(&route, success.history(), success.output());
                 return executed_from_attempt(
                     success.into_output(),
                     public_model,
                     Arc::clone(&canonical),
                     public_reasoning_effort,
                     cancel_on_drop,
+                    observation,
                 );
             }
             ExecutionOutcome::Failed(failure)
@@ -1038,9 +1055,10 @@ pub(crate) async fn execute_canonical(
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .clone();
-                return Err(execution_error(
+                return Err(execution_error_with_observation(
                     map_terminal(failure.terminal()),
                     request_id,
+                    request_observation_without_usage(&route, failure.history()),
                 ));
             }
         }
@@ -1057,6 +1075,7 @@ fn executed_from_attempt(
     request: Arc<CanonicalRequest>,
     public_reasoning_effort: Option<String>,
     cancellation: CancelOnDrop,
+    observation: RequestObservationContext,
 ) -> Result<Executed, DataPlaneExecutionError> {
     match (request.stream, output) {
         (false, AttemptExecutionOutput::Complete(response)) => {
@@ -1065,6 +1084,7 @@ fn executed_from_attempt(
                 public_model,
                 request,
                 public_reasoning_effort,
+                observation,
             }))
         }
         (true, AttemptExecutionOutput::Stream(stream)) => Ok(Executed::Stream(ExecutedStream {
@@ -1073,6 +1093,7 @@ fn executed_from_attempt(
             request,
             public_reasoning_effort,
             cancellation,
+            observation,
         })),
         (false, AttemptExecutionOutput::Stream(_))
         | (true, AttemptExecutionOutput::Complete(_)) => Err(execution_error(
@@ -1080,6 +1101,58 @@ fn executed_from_attempt(
             None,
         )),
     }
+}
+
+fn request_observation(
+    route: &RouteDecision,
+    history: &AttemptHistory,
+    output: &AttemptExecutionOutput,
+) -> RequestObservationContext {
+    let usage = match output {
+        AttemptExecutionOutput::Complete(response) => match response.output() {
+            UpstreamExecutionOutput::Events(events) => {
+                events.iter().rev().find_map(|event| match event {
+                    CanonicalEvent::Usage(usage) => Some(usage),
+                    _ => None,
+                })
+            }
+            UpstreamExecutionOutput::TokenCount(_) => None,
+        },
+        AttemptExecutionOutput::Stream(stream) => Some(stream.upstream().initial_usage()),
+    };
+    let (input_tokens, output_tokens) = usage.map_or((None, None), |usage| {
+        (Some(usage.input_tokens), Some(usage.output_tokens))
+    });
+    RequestObservationContext {
+        attempt_id: final_attempt_id(history),
+        provider_id: route.provider_id().as_str().to_owned(),
+        model: route.model().to_owned(),
+        input_tokens,
+        output_tokens,
+    }
+}
+
+fn request_observation_without_usage(
+    route: &RouteDecision,
+    history: &AttemptHistory,
+) -> RequestObservationContext {
+    RequestObservationContext {
+        attempt_id: final_attempt_id(history),
+        provider_id: route.provider_id().as_str().to_owned(),
+        model: route.model().to_owned(),
+        input_tokens: None,
+        output_tokens: None,
+    }
+}
+
+fn final_attempt_id(history: &AttemptHistory) -> Option<String> {
+    history.iter().last().map(|attempt| {
+        format!(
+            "{}-a{}",
+            attempt.request_id().as_str(),
+            attempt.attempt_id().ordinal()
+        )
+    })
 }
 
 fn map_failure_kind(kind: UpstreamFailureKind) -> AttemptFailureKind {
@@ -1191,6 +1264,19 @@ fn execution_error(
     DataPlaneExecutionError {
         error,
         upstream_request_id,
+        observation: None,
+    }
+}
+
+fn execution_error_with_observation(
+    error: GatewayError,
+    upstream_request_id: Option<SafeUpstreamRequestId>,
+    observation: RequestObservationContext,
+) -> DataPlaneExecutionError {
+    DataPlaneExecutionError {
+        error,
+        upstream_request_id,
+        observation: Some(Box::new(observation)),
     }
 }
 

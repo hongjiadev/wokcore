@@ -24,7 +24,9 @@ use wokcore_protocols::{
 
 use crate::{ServerState, auth::AuthorizedClient};
 
-use super::{SafeUpstreamRequestId, UpstreamExecutionFailure, UpstreamFailureKind};
+use super::{
+    RequestObservationContext, SafeUpstreamRequestId, UpstreamExecutionFailure, UpstreamFailureKind,
+};
 
 const ACCOUNTLESS_ACCOUNT_ID: &str = "accountless";
 const IMAGE_RESPONSE_LIMIT: usize = 50 * 1024 * 1024;
@@ -393,11 +395,13 @@ pub enum ImageExecutionResult {
 
 pub(crate) struct ExecutedImage {
     pub(crate) response: ImageExecutionResponse,
+    pub(crate) observation: RequestObservationContext,
 }
 
 pub(crate) struct ImageExecutionError {
     pub(crate) error: GatewayError,
     pub(crate) upstream_request_id: Option<SafeUpstreamRequestId>,
+    pub(crate) observation: Option<Box<RequestObservationContext>>,
 }
 
 pub(crate) async fn execute_image(
@@ -486,6 +490,13 @@ pub(crate) async fn execute_image(
     .map_err(|error| image_error(error, None))?;
     let result = executor.execute_image(request, cancellation).await;
     drop(cancel_on_drop);
+    let observation = RequestObservationContext {
+        attempt_id: Some(format!("{request_id}-a1")),
+        provider_id: route.provider_id().as_str().to_owned(),
+        model: route.model().to_owned(),
+        input_tokens: None,
+        output_tokens: None,
+    };
     match result {
         ImageExecutionResult::Succeeded(response) => {
             if tracked_health {
@@ -495,7 +506,10 @@ pub(crate) async fn execute_image(
                     unix_milliseconds(),
                 );
             }
-            Ok(ExecutedImage { response })
+            Ok(ExecutedImage {
+                response,
+                observation,
+            })
         }
         ImageExecutionResult::Failed(failure) => {
             if tracked_health {
@@ -505,9 +519,10 @@ pub(crate) async fn execute_image(
                     unix_milliseconds(),
                 );
             }
-            Err(image_error(
+            Err(image_error_with_observation(
                 gateway_error_for_failure(&failure),
                 failure.upstream_request_id().cloned(),
+                observation,
             ))
         }
     }
@@ -578,6 +593,19 @@ fn image_error(
     ImageExecutionError {
         error,
         upstream_request_id,
+        observation: None,
+    }
+}
+
+fn image_error_with_observation(
+    error: GatewayError,
+    upstream_request_id: Option<SafeUpstreamRequestId>,
+    observation: RequestObservationContext,
+) -> ImageExecutionError {
+    ImageExecutionError {
+        error,
+        upstream_request_id,
+        observation: Some(Box::new(observation)),
     }
 }
 

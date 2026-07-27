@@ -364,3 +364,14 @@ Private pre-rewrite recovery material is excluded from this public repository.
 - The canonical debug representation omits prompt, response, tool, image, extension, and thread-key content. Header, cookie, authorization, and credential values are not represented by these request types.
 - No WokRouter listener, authentication, routing, executor, network transport, model endpoint, image implementation, TLS, LAN, or metrics code is imported in this foundation.
 - This layer performs no DNS lookup, credential resolution, filesystem write, Provider request, or network operation.
+
+## Provider HTTP data plane foundation 2: bounded production compatibility and coarse observability
+
+- Original WokCore implementation, except for the separately recorded WokRouter front-door registry provenance above; no OpenCodex runtime, credential, logging, or transport code is imported.
+- The seven authenticated `/v1` contracts now execute through immutable routing snapshots and injected executors. Text execution supports OpenAI Responses, OpenAI Chat, Anthropic, Gemini, and Azure wire adapters with a fixed two-attempt pre-visible retry policy.
+- Streaming uses capacity-two event channels, incremental protocol conversion, cancellation propagation, and completion-only counters. No SSE frame, text delta, multipart chunk, prompt, response body, or image byte is written to SQLite or diagnostic segments.
+- Image generation and editing use OpenAI-compatible request/response contracts. Multipart input is written to randomized current-user-only temporary files, capped at 20 MiB per file and 50 MiB aggregate, uploaded in bounded chunks, and deleted on every completion or cancellation path. Google image execution remains an explicit typed unsupported path.
+- The production HTTP client is pooled by transport policy. Redirects and ambient proxies are disabled; endpoint syntax, resolved addresses, headers, response bodies, connect time, and total time are bounded. Tests inject synthetic loopback addresses and never resolve or contact a real Provider.
+- Request completion updates one set of atomic aggregate counters. Stable `request-id-aN` attempt identifiers correlate request diagnostics without bodies or credentials.
+- Request metrics are validated before persistence and buffered to 64 rows. A batch is submitted after the count threshold or after 250 ms of subsequent observed activity; shutdown flushes a partial batch. Provider/account health snapshots share the same best-effort batch submission, unchanged metadata performs no transaction, idle service operation has no timer or heartbeat write, and a full observability queue drops metrics instead of delaying proxy traffic.
+- OpenAPI 3.1 documents all 21 management and seven data-plane operations, exact bearer separation, `proxy.use`, JSON/SSE/multipart media types, and 16/20/50/51 MiB limits without credential values or token samples.

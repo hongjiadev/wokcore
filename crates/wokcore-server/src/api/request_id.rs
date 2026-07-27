@@ -14,13 +14,16 @@ use axum::{
 };
 use uuid::Uuid;
 use wokcore_diagnostics::event::{
-    BuildIdentity, CapabilityVersion, Correlations, DiagnosticBuildError, DiagnosticComponent,
-    DiagnosticDecision, DiagnosticEventCode, DiagnosticEventDraft, DiagnosticLevel, EventId,
-    FailoverDecision, GitCommit, Measurements, RequestId as DiagnosticRequestId, RetryDecision,
-    StageCode, StateTransition, TokenCounts, UtcTimestamp, WokcoreVersion,
+    AttemptId as DiagnosticAttemptId, BuildIdentity, CapabilityVersion, Correlations,
+    DiagnosticBuildError, DiagnosticComponent, DiagnosticDecision, DiagnosticEventCode,
+    DiagnosticEventDraft, DiagnosticLevel, EventId, FailoverDecision, GitCommit, Measurements,
+    RequestId as DiagnosticRequestId, RetryDecision, StageCode, StateTransition, TokenCounts,
+    UtcTimestamp, WokcoreVersion,
 };
+use wokcore_diagnostics::runtime::RequestRuntimeOutcome;
+use wokcore_storage::RequestMetric;
 
-use crate::{ServerState, runtime::generate_uuid_v4};
+use crate::{ServerState, data_plane::RequestObservationContext, runtime::generate_uuid_v4};
 
 use super::error::{ApiError, ApiErrorComponent};
 
@@ -59,19 +62,62 @@ pub(crate) async fn apply_response_envelope(
     request.headers_mut().remove(&REQUEST_ID_HEADER);
     request.extensions_mut().insert(request_id);
     let route_component = request_component(request.uri().path());
+    let metric_started_at = state.token_metadata.now().ok();
     let started_at = Instant::now();
+    let mut runtime_observation = state.request_diagnostics.start();
     let response = next.run(request).await;
+    let status = response.status();
+    runtime_observation.finish(if status.is_success() {
+        RequestRuntimeOutcome::Completed
+    } else {
+        RequestRuntimeOutcome::Failed
+    });
     let component = response
         .extensions()
         .get::<ApiErrorComponent>()
         .map_or(route_component, |component| component.0);
+    let data_plane = response
+        .extensions()
+        .get::<RequestObservationContext>()
+        .cloned();
+    let elapsed = started_at.elapsed();
     record_request_diagnostic(
         &state,
         request_id,
-        response.status(),
+        status,
         component,
-        started_at.elapsed(),
+        elapsed,
+        data_plane
+            .as_ref()
+            .and_then(|observation| observation.attempt_id.as_deref()),
     );
+    if let (Some(writer), Some(observation), Some(started_at)) =
+        (state.state_writer.as_ref(), data_plane, metric_started_at)
+    {
+        writer.observe_request_metric(
+            RequestMetric {
+                request_id: request_id.to_string(),
+                provider_id: observation.provider_id,
+                model: observation.model,
+                started_at,
+                latency_ms: i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX),
+                input_tokens: observation
+                    .input_tokens
+                    .and_then(|value| i64::try_from(value).ok()),
+                output_tokens: observation
+                    .output_tokens
+                    .and_then(|value| i64::try_from(value).ok()),
+                status_code: i64::from(status.as_u16()),
+                error_code: None,
+            },
+            || {
+                state
+                    .providers
+                    .as_ref()
+                    .map(|providers| providers.runtime_metadata_batch())
+            },
+        );
+    }
     apply_headers(response, request_id)
 }
 
@@ -98,6 +144,8 @@ fn request_component(path: &str) -> DiagnosticComponent {
         || path == "/wokcore/v1/usage"
     {
         DiagnosticComponent::Sessions
+    } else if path.starts_with("/v1/") {
+        DiagnosticComponent::Provider
     } else {
         DiagnosticComponent::Core
     }
@@ -109,6 +157,7 @@ fn record_request_diagnostic(
     status: StatusCode,
     component: DiagnosticComponent,
     elapsed: Duration,
+    attempt_id: Option<&str>,
 ) {
     let Some(writer) = state.diagnostics.as_ref() else {
         return;
@@ -122,6 +171,7 @@ fn record_request_diagnostic(
         status,
         component,
         duration_micros,
+        attempt_id,
     );
     let _ = writer.recorder().try_record(draft);
 }
@@ -132,6 +182,7 @@ fn request_diagnostic_draft(
     status: StatusCode,
     component: DiagnosticComponent,
     duration_micros: u64,
+    attempt_id: Option<&str>,
 ) -> Result<DiagnosticEventDraft, DiagnosticBuildError> {
     let level = if status == StatusCode::INTERNAL_SERVER_ERROR {
         DiagnosticLevel::Warn
@@ -154,7 +205,7 @@ fn request_diagnostic_draft(
     .with_correlations(Correlations::new(
         Some(DiagnosticRequestId::parse(request_id)?),
         None,
-        None,
+        attempt_id.map(DiagnosticAttemptId::parse).transpose()?,
         None,
         None,
         None,
@@ -315,6 +366,10 @@ mod tests {
             request_component("/wokcore/v1/clients/authorize"),
             DiagnosticComponent::Core
         );
+        assert_eq!(
+            request_component("/v1/responses"),
+            DiagnosticComponent::Provider
+        );
     }
 
     #[tokio::test]
@@ -329,6 +384,7 @@ mod tests {
                 StatusCode::SERVICE_UNAVAILABLE,
                 DiagnosticComponent::Sessions,
                 12_345,
+                Some("019844f0-4de0-7000-8000-000000000031-a1"),
             )),
             RecordOutcome::Accepted
         );
@@ -346,6 +402,10 @@ mod tests {
         let wire: Value = serde_json::from_slice(page.events()[0].encoded()).unwrap();
         assert_eq!(wire["component"], "sessions");
         assert_eq!(wire["correlations"]["request_id"], request_id);
+        assert_eq!(
+            wire["correlations"]["attempt_id"],
+            "019844f0-4de0-7000-8000-000000000031-a1"
+        );
         assert_eq!(wire["measurements"]["duration_micros"], 12_345);
         drop(recorder);
         owner_task.abort();
@@ -359,6 +419,7 @@ mod tests {
             StatusCode::INTERNAL_SERVER_ERROR,
             DiagnosticComponent::Storage,
             1,
+            None,
         );
         assert!(draft.is_ok());
     }

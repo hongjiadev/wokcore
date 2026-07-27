@@ -77,12 +77,15 @@ pub(crate) async fn anthropic(
     match execute_canonical(&state, &authorized, canonical, UpstreamOperation::Text).await {
         Ok(super::Executed::Response(executed)) if !streaming => {
             match super::anthropic::encode_message(&executed, canonical_request_id) {
-                Ok(response) => response,
-                Err(error) => gateway_error_response(
-                    &error,
-                    request_id,
-                    protocol,
-                    executed.response.upstream_request_id(),
+                Ok(response) => attach_request_observation(response, executed.observation),
+                Err(error) => attach_request_observation(
+                    gateway_error_response(
+                        &error,
+                        request_id,
+                        protocol,
+                        executed.response.upstream_request_id(),
+                    ),
+                    executed.observation,
                 ),
             }
         }
@@ -95,11 +98,14 @@ pub(crate) async fn anthropic(
             protocol,
             None,
         ),
-        Err(error) => gateway_error_response(
-            &error.error,
-            request_id,
-            protocol,
-            error.upstream_request_id.as_ref(),
+        Err(error) => attach_optional_request_observation(
+            gateway_error_response(
+                &error.error,
+                request_id,
+                protocol,
+                error.upstream_request_id.as_ref(),
+            ),
+            error.observation,
         ),
     }
 }
@@ -131,12 +137,15 @@ pub(crate) async fn count_tokens(
     {
         Ok(super::Executed::Response(executed)) => {
             match super::anthropic::encode_token_count(&executed) {
-                Ok(response) => response,
-                Err(error) => gateway_error_response(
-                    &error,
-                    request_id,
-                    protocol,
-                    executed.response.upstream_request_id(),
+                Ok(response) => attach_request_observation(response, executed.observation),
+                Err(error) => attach_request_observation(
+                    gateway_error_response(
+                        &error,
+                        request_id,
+                        protocol,
+                        executed.response.upstream_request_id(),
+                    ),
+                    executed.observation,
                 ),
             }
         }
@@ -146,11 +155,14 @@ pub(crate) async fn count_tokens(
             protocol,
             None,
         ),
-        Err(error) => gateway_error_response(
-            &error.error,
-            request_id,
-            protocol,
-            error.upstream_request_id.as_ref(),
+        Err(error) => attach_optional_request_observation(
+            gateway_error_response(
+                &error.error,
+                request_id,
+                protocol,
+                error.upstream_request_id.as_ref(),
+            ),
+            error.observation,
         ),
     }
 }
@@ -208,13 +220,19 @@ async fn execute_image_request(
                 header::CONTENT_TYPE,
                 HeaderValue::from_static("application/json"),
             );
-            attach_upstream_request_id(response, upstream_request_id.as_ref())
+            attach_request_observation(
+                attach_upstream_request_id(response, upstream_request_id.as_ref()),
+                executed.observation,
+            )
         }
-        Err(error) => gateway_error_response(
-            &error.error,
-            request_id,
-            protocol,
-            error.upstream_request_id.as_ref(),
+        Err(error) => attach_optional_request_observation(
+            gateway_error_response(
+                &error.error,
+                request_id,
+                protocol,
+                error.upstream_request_id.as_ref(),
+            ),
+            error.observation,
         ),
     }
 }
@@ -244,12 +262,15 @@ async fn execute_text(
     }
     match execute_canonical(state, authorized, canonical, UpstreamOperation::Text).await {
         Ok(super::Executed::Response(executed)) if !streaming => match encode(&executed) {
-            Ok(response) => response,
-            Err(error) => gateway_error_response(
-                &error,
-                request_id,
-                protocol,
-                executed.response.upstream_request_id(),
+            Ok(response) => attach_request_observation(response, executed.observation),
+            Err(error) => attach_request_observation(
+                gateway_error_response(
+                    &error,
+                    request_id,
+                    protocol,
+                    executed.response.upstream_request_id(),
+                ),
+                executed.observation,
             ),
         },
         Ok(super::Executed::Stream(executed)) if streaming => {
@@ -261,11 +282,14 @@ async fn execute_text(
             protocol,
             None,
         ),
-        Err(error) => gateway_error_response(
-            &error.error,
-            request_id,
-            protocol,
-            error.upstream_request_id.as_ref(),
+        Err(error) => attach_optional_request_observation(
+            gateway_error_response(
+                &error.error,
+                request_id,
+                protocol,
+                error.upstream_request_id.as_ref(),
+            ),
+            error.observation,
         ),
     }
 }
@@ -277,11 +301,31 @@ fn encode_stream(
     protocol: ClientProtocol,
 ) -> Response {
     let upstream_request_id = executed.stream.upstream().upstream_request_id().cloned();
+    let observation = executed.observation.clone();
     match super::stream::encode(executed, protocol, &state.stream_diagnostics) {
-        Ok(response) => response,
-        Err(error) => {
-            gateway_error_response(&error, request_id, protocol, upstream_request_id.as_ref())
-        }
+        Ok(response) => attach_request_observation(response, observation),
+        Err(error) => attach_request_observation(
+            gateway_error_response(&error, request_id, protocol, upstream_request_id.as_ref()),
+            observation,
+        ),
+    }
+}
+
+fn attach_request_observation(
+    mut response: Response,
+    observation: super::RequestObservationContext,
+) -> Response {
+    response.extensions_mut().insert(observation);
+    response
+}
+
+fn attach_optional_request_observation(
+    response: Response,
+    observation: Option<Box<super::RequestObservationContext>>,
+) -> Response {
+    match observation {
+        Some(observation) => attach_request_observation(response, *observation),
+        None => response,
     }
 }
 

@@ -81,6 +81,7 @@ const GLOBAL_CURRENT_SESSION_USAGE_AFTER_PAGE_SQL: &str =
      LIMIT ?4";
 
 pub const WAL_CHECKPOINT_THRESHOLD_BYTES: u64 = 16 * 1024 * 1024;
+pub const MAX_REQUEST_METRIC_BATCH_ROWS: usize = 512;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RequestMetric {
@@ -1479,6 +1480,7 @@ impl StateStore {
         if metrics.is_empty() {
             return Ok(());
         }
+        validate_request_metrics(metrics)?;
 
         let transaction = self
             .connection
@@ -3954,6 +3956,31 @@ fn validate_bounded_text(
         || value.chars().any(char::is_control)
     {
         return Err(invalid_state(&format!("{name} is outside its safe bound")));
+    }
+    Ok(())
+}
+
+fn validate_request_metrics(metrics: &[RequestMetric]) -> Result<(), StorageError> {
+    if metrics.len() > MAX_REQUEST_METRIC_BATCH_ROWS {
+        return Err(invalid_state("request metric batch exceeds its row bound"));
+    }
+    for metric in metrics {
+        validate_correlation_id("request metric request identifier", &metric.request_id)?;
+        validate_correlation_id("request metric Provider identifier", &metric.provider_id)?;
+        validate_bounded_text("request metric model", &metric.model, 256, false)?;
+        validate_timestamp("request metric start", &metric.started_at)?;
+        if metric.latency_ms < 0
+            || metric.input_tokens.is_some_and(|value| value < 0)
+            || metric.output_tokens.is_some_and(|value| value < 0)
+            || !(100..=599).contains(&metric.status_code)
+        {
+            return Err(invalid_state(
+                "request metric numeric value is outside its bound",
+            ));
+        }
+        if let Some(error_code) = metric.error_code.as_deref() {
+            validate_stable_code("request metric error code", error_code)?;
+        }
     }
     Ok(())
 }

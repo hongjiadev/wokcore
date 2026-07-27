@@ -11,7 +11,8 @@ pub use scheduler::{
 };
 pub use writer::{
     DIAGNOSTIC_PARTIAL_FLUSH_INTERVAL, DiagnosticWriterError, DiagnosticWriterHandle,
-    IDLE_TRUNCATE_INTERVAL, PreparedDiagnosticWriter, PreparedStateWriter, RunningDiagnosticWriter,
+    IDLE_TRUNCATE_INTERVAL, PreparedDiagnosticWriter, PreparedStateWriter,
+    REQUEST_METRIC_BATCH_ROWS, REQUEST_METRIC_FLUSH_INTERVAL, RunningDiagnosticWriter,
     RunningStateWriter, SESSION_BATCH_QUEUE_CAPACITY, SESSION_BATCH_ROWS, SESSION_BATCH_UTF8_BYTES,
     SESSION_PARTIAL_FLUSH_INTERVAL, SESSION_PRODUCER_SLICE, StateWriterError, StateWriterHandle,
 };

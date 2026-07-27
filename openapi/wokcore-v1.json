@@ -718,6 +718,198 @@
           }
         }
       }
+    },
+    "/v1/responses": {
+      "post": {
+        "operationId": "createResponse",
+        "security": [{"clientBearer": []}],
+        "x-wokcore-required-scope": "proxy.use",
+        "x-wokcore-max-body-bytes": 16777216,
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {"schema": {"$ref": "#/components/schemas/DataPlaneJsonRequest"}}
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OpenAI Responses-compatible JSON or SSE response",
+            "headers": {
+              "X-Request-Id": {"$ref": "#/components/headers/XRequestId"},
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
+              "X-Content-Type-Options": {"$ref": "#/components/headers/XContentTypeOptions"}
+            },
+            "content": {
+              "application/json": {"schema": {"$ref": "#/components/schemas/DataPlaneJsonResponse"}},
+              "text/event-stream": {"schema": {"$ref": "#/components/schemas/ServerSentEventStream"}}
+            }
+          },
+          "default": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
+    "/v1/chat/completions": {
+      "post": {
+        "operationId": "createChatCompletion",
+        "security": [{"clientBearer": []}],
+        "x-wokcore-required-scope": "proxy.use",
+        "x-wokcore-max-body-bytes": 16777216,
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {"schema": {"$ref": "#/components/schemas/DataPlaneJsonRequest"}}
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OpenAI Chat-compatible JSON or SSE response",
+            "headers": {
+              "X-Request-Id": {"$ref": "#/components/headers/XRequestId"},
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
+              "X-Content-Type-Options": {"$ref": "#/components/headers/XContentTypeOptions"}
+            },
+            "content": {
+              "application/json": {"schema": {"$ref": "#/components/schemas/DataPlaneJsonResponse"}},
+              "text/event-stream": {"schema": {"$ref": "#/components/schemas/ServerSentEventStream"}}
+            }
+          },
+          "default": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
+    "/v1/messages": {
+      "post": {
+        "operationId": "createAnthropicMessage",
+        "security": [{"clientBearer": []}],
+        "x-wokcore-required-scope": "proxy.use",
+        "x-wokcore-max-body-bytes": 16777216,
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {"schema": {"$ref": "#/components/schemas/DataPlaneJsonRequest"}}
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Anthropic Messages-compatible JSON or SSE response",
+            "headers": {
+              "X-Request-Id": {"$ref": "#/components/headers/XRequestId"},
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
+              "X-Content-Type-Options": {"$ref": "#/components/headers/XContentTypeOptions"}
+            },
+            "content": {
+              "application/json": {"schema": {"$ref": "#/components/schemas/DataPlaneJsonResponse"}},
+              "text/event-stream": {"schema": {"$ref": "#/components/schemas/ServerSentEventStream"}}
+            }
+          },
+          "default": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
+    "/v1/messages/count_tokens": {
+      "post": {
+        "operationId": "countAnthropicMessageTokens",
+        "security": [{"clientBearer": []}],
+        "x-wokcore-required-scope": "proxy.use",
+        "x-wokcore-max-body-bytes": 16777216,
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {"schema": {"$ref": "#/components/schemas/DataPlaneJsonRequest"}}
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Bounded token-count result",
+            "headers": {
+              "X-Request-Id": {"$ref": "#/components/headers/XRequestId"},
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
+              "X-Content-Type-Options": {"$ref": "#/components/headers/XContentTypeOptions"}
+            },
+            "content": {
+              "application/json": {"schema": {"$ref": "#/components/schemas/TokenCountResponse"}}
+            }
+          },
+          "default": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
+    "/v1/models": {
+      "get": {
+        "operationId": "listProxyModels",
+        "security": [{"clientBearer": []}],
+        "x-wokcore-required-scope": "proxy.use",
+        "responses": {
+          "200": {
+            "description": "Immutable public model projection",
+            "headers": {
+              "X-Request-Id": {"$ref": "#/components/headers/XRequestId"},
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
+              "X-Content-Type-Options": {"$ref": "#/components/headers/XContentTypeOptions"}
+            },
+            "content": {
+              "application/json": {"schema": {"$ref": "#/components/schemas/ProxyModelList"}}
+            }
+          },
+          "default": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
+    "/v1/images/generations": {
+      "post": {
+        "operationId": "generateImage",
+        "security": [{"clientBearer": []}],
+        "x-wokcore-required-scope": "proxy.use",
+        "x-wokcore-max-body-bytes": 16777216,
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {"schema": {"$ref": "#/components/schemas/ImageGenerationRequest"}}
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OpenAI-compatible bounded image result",
+            "headers": {
+              "X-Request-Id": {"$ref": "#/components/headers/XRequestId"},
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
+              "X-Content-Type-Options": {"$ref": "#/components/headers/XContentTypeOptions"}
+            },
+            "content": {
+              "application/json": {"schema": {"$ref": "#/components/schemas/ImageResponse"}}
+            }
+          },
+          "default": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
+    "/v1/images/edits": {
+      "post": {
+        "operationId": "editImage",
+        "security": [{"clientBearer": []}],
+        "x-wokcore-required-scope": "proxy.use",
+        "x-wokcore-max-body-bytes": 53477376,
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {"schema": {"$ref": "#/components/schemas/ImageEditRequest"}}
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OpenAI-compatible bounded image-edit result",
+            "headers": {
+              "X-Request-Id": {"$ref": "#/components/headers/XRequestId"},
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
+              "X-Content-Type-Options": {"$ref": "#/components/headers/XContentTypeOptions"}
+            },
+            "content": {
+              "application/json": {"schema": {"$ref": "#/components/schemas/ImageResponse"}}
+            }
+          },
+          "default": {"$ref": "#/components/responses/Error"}
+        }
+      }
     }
   },
   "components": {
@@ -1500,6 +1692,117 @@
           "schema_version": {"const": 1},
           "operation": {"type": "string", "enum": ["created", "replaced", "deleted"]},
           "secret_ref": {"$ref": "#/components/schemas/SecretRef"}
+        }
+      },
+      "DataPlaneJsonRequest": {
+        "type": "object",
+        "required": ["model"],
+        "properties": {
+          "model": {"type": "string", "minLength": 1, "maxLength": 256},
+          "stream": {"type": "boolean", "default": false}
+        },
+        "additionalProperties": true,
+        "maxProperties": 1024
+      },
+      "DataPlaneJsonResponse": {
+        "type": "object",
+        "additionalProperties": true,
+        "maxProperties": 1024
+      },
+      "ServerSentEventStream": {
+        "type": "string",
+        "description": "Bounded server-sent event stream; each emitted event is encoded directly without durable per-event writes."
+      },
+      "TokenCountResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["input_tokens"],
+        "properties": {
+          "input_tokens": {"type": "integer", "minimum": 0}
+        }
+      },
+      "ProxyModelList": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["object", "data"],
+        "properties": {
+          "object": {"const": "list"},
+          "data": {
+            "type": "array",
+            "maxItems": 65536,
+            "items": {"$ref": "#/components/schemas/ProxyModel"}
+          }
+        }
+      },
+      "ProxyModel": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "object", "owned_by"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1, "maxLength": 256},
+          "object": {"const": "model"},
+          "owned_by": {"const": "wokcore"}
+        }
+      },
+      "ImageGenerationRequest": {
+        "type": "object",
+        "required": ["model", "prompt"],
+        "properties": {
+          "model": {"type": "string", "minLength": 1, "maxLength": 256},
+          "prompt": {"type": "string", "minLength": 1, "maxLength": 1048576},
+          "n": {"type": "integer", "minimum": 1, "maximum": 16},
+          "size": {"type": "string", "minLength": 1, "maxLength": 64},
+          "quality": {"type": "string", "minLength": 1, "maxLength": 64},
+          "response_format": {"type": "string", "enum": ["url", "b64_json"]},
+          "style": {"type": "string", "minLength": 1, "maxLength": 64},
+          "user": {"type": "string", "minLength": 1, "maxLength": 256}
+        },
+        "additionalProperties": true,
+        "maxProperties": 128
+      },
+      "ImageEditRequest": {
+        "type": "object",
+        "required": ["model", "prompt", "image"],
+        "x-wokcore-max-image-bytes": 20971520,
+        "x-wokcore-max-total-file-bytes": 52428800,
+        "properties": {
+          "model": {"type": "string", "minLength": 1, "maxLength": 256},
+          "prompt": {"type": "string", "minLength": 1, "maxLength": 1048576},
+          "image": {
+            "type": "string",
+            "format": "binary",
+            "maxLength": 20971520
+          },
+          "mask": {
+            "type": "string",
+            "format": "binary",
+            "maxLength": 20971520
+          },
+          "n": {"type": "integer", "minimum": 1, "maximum": 16},
+          "size": {"type": "string", "minLength": 1, "maxLength": 64},
+          "response_format": {"type": "string", "enum": ["url", "b64_json"]},
+          "user": {"type": "string", "minLength": 1, "maxLength": 256}
+        },
+        "additionalProperties": false
+      },
+      "ImageResponse": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["data"],
+        "properties": {
+          "created": {"type": "integer", "minimum": 0},
+          "data": {
+            "type": "array",
+            "maxItems": 16,
+            "items": {
+              "type": "object",
+              "additionalProperties": true,
+              "properties": {
+                "url": {"type": "string", "format": "uri", "maxLength": 8192},
+                "b64_json": {"type": "string", "maxLength": 69905068}
+              }
+            }
+          }
         }
       },
       "RevokeResponse": {

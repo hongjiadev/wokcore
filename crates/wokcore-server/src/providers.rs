@@ -19,7 +19,8 @@ use wokcore_engine::{
     snapshot::RuntimeSnapshot,
 };
 use wokcore_storage::{
-    AppConfig, ConfigStore, SecretStore, ServerConfig, StorageError, VersionedConfig,
+    AccountRuntimeHealth, AccountRuntimeMetadata, AppConfig, ConfigStore, ProviderMetadataBatch,
+    ProviderRuntimeMetadata, SecretStore, ServerConfig, StorageError, VersionedConfig,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -69,6 +70,7 @@ pub struct ProviderSecretMetadata {
 struct ActiveConfiguration {
     revision: u64,
     snapshot_revision: u64,
+    metadata_updated_at_ms: u64,
     reload_status: ReloadStatus,
     server: ServerConfig,
     candidate: ProviderCandidate,
@@ -128,6 +130,7 @@ impl ProviderManagement {
             active: Arc::new(RwLock::new(ActiveConfiguration {
                 revision: loaded.revision,
                 snapshot_revision: loaded.revision,
+                metadata_updated_at_ms: now_ms(),
                 reload_status: ReloadStatus::Ready,
                 server: loaded.config.server,
                 candidate,
@@ -211,6 +214,65 @@ impl ProviderManagement {
 
     pub(crate) fn execution_snapshot(&self) -> Arc<ProviderExecutionSnapshot> {
         self.execution.load_full()
+    }
+
+    pub(crate) fn runtime_metadata_batch(&self) -> ProviderMetadataBatch {
+        let observed_at_ms = now_ms();
+        let active = self
+            .active
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let execution = self.execution.load();
+        let snapshots = execution.account_health.snapshots(observed_at_ms);
+        let providers = active
+            .candidate
+            .providers
+            .instances
+            .iter()
+            .filter(|provider| provider.enabled)
+            .map(|provider| ProviderRuntimeMetadata {
+                provider_id: provider.id.clone(),
+                updated_at_ms: active.metadata_updated_at_ms,
+            })
+            .collect();
+        let accounts = active
+            .candidate
+            .providers
+            .accounts
+            .iter()
+            .filter(|account| account.enabled)
+            .filter_map(|account| {
+                let snapshot = snapshots
+                    .iter()
+                    .find(|snapshot| snapshot.account_id == account.id)?;
+                let health = if snapshot.quarantined {
+                    AccountRuntimeHealth::Quarantined
+                } else if snapshot
+                    .cooldown_until_ms
+                    .is_some_and(|until| until > observed_at_ms)
+                {
+                    AccountRuntimeHealth::CoolingDown
+                } else {
+                    AccountRuntimeHealth::Healthy
+                };
+                Some(AccountRuntimeMetadata {
+                    provider_id: account.provider.clone(),
+                    account_id: account.id.clone(),
+                    health,
+                    consecutive_failures: snapshot.consecutive_failures,
+                    cooldown_until_ms: snapshot.cooldown_until_ms,
+                    quota_remaining: snapshot.quota_remaining,
+                    quota_resets_at_ms: snapshot.quota_resets_at_ms,
+                    selection_count: snapshot.selection_count,
+                    last_selected_sequence: snapshot.last_selected_sequence,
+                    updated_at_ms: snapshot.updated_at_ms,
+                })
+            })
+            .collect();
+        ProviderMetadataBatch {
+            providers,
+            accounts,
+        }
     }
 
     pub(crate) fn attach_account_health(&self, account_health: Arc<AccountHealthTable>) {
@@ -491,6 +553,7 @@ impl ProviderManagement {
         *active = ActiveConfiguration {
             revision: loaded.revision,
             snapshot_revision: loaded.revision,
+            metadata_updated_at_ms: now_ms(),
             reload_status,
             server: loaded.config.server,
             candidate,

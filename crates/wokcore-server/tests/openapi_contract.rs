@@ -45,14 +45,24 @@ fn openapi_31_matches_the_exact_control_plane_contract_without_secret_examples()
         ("/wokcore/v1/provider-secrets", "post"),
         ("/wokcore/v1/provider-secrets/{secret_ref}", "put"),
         ("/wokcore/v1/provider-secrets/{secret_ref}", "delete"),
+        ("/v1/responses", "post"),
+        ("/v1/chat/completions", "post"),
+        ("/v1/messages", "post"),
+        ("/v1/messages/count_tokens", "post"),
+        ("/v1/models", "get"),
+        ("/v1/images/generations", "post"),
+        ("/v1/images/edits", "post"),
     ];
     let paths = document["paths"].as_object().unwrap();
-    assert_eq!(paths.len(), 21);
+    assert_eq!(paths.len(), 28);
     for (path, method) in expected {
         let operation = &paths[path][method];
         assert!(operation.is_object(), "missing {method} {path}");
         let security = operation["security"].clone();
-        if matches!(path, "/wokcore/v1/health" | "/wokcore/v1/capabilities") {
+        if path.starts_with("/v1/") {
+            assert_eq!(security, json!([{"clientBearer":[]}]));
+            assert_eq!(operation["x-wokcore-required-scope"], "proxy.use");
+        } else if matches!(path, "/wokcore/v1/health" | "/wokcore/v1/capabilities") {
             assert_eq!(security, json!([]));
         } else if matches!(
             path,
@@ -185,6 +195,36 @@ fn openapi_31_matches_the_exact_control_plane_contract_without_secret_examples()
     assert_eq!(
         document["paths"]["/wokcore/v1/diagnostics/export"]["get"]["parameters"][6]["schema"],
         json!({"type":"integer","minimum":65536,"maximum":67108864,"default":16777216})
+    );
+    for path in ["/v1/responses", "/v1/chat/completions", "/v1/messages"] {
+        let operation = &document["paths"][path]["post"];
+        assert_eq!(operation["x-wokcore-max-body-bytes"], 16 * 1024 * 1024);
+        assert!(operation["responses"]["200"]["content"]["application/json"].is_object());
+        assert!(operation["responses"]["200"]["content"]["text/event-stream"].is_object());
+    }
+    assert_eq!(
+        document["paths"]["/v1/messages/count_tokens"]["post"]["x-wokcore-max-body-bytes"],
+        16 * 1024 * 1024
+    );
+    assert_eq!(
+        document["paths"]["/v1/images/generations"]["post"]["x-wokcore-max-body-bytes"],
+        16 * 1024 * 1024
+    );
+    assert_eq!(
+        document["paths"]["/v1/images/edits"]["post"]["x-wokcore-max-body-bytes"],
+        51 * 1024 * 1024
+    );
+    assert_eq!(
+        document["components"]["schemas"]["ImageEditRequest"]["properties"]["image"]["maxLength"],
+        20 * 1024 * 1024
+    );
+    assert_eq!(
+        document["components"]["schemas"]["ImageEditRequest"]["x-wokcore-max-image-bytes"],
+        20 * 1024 * 1024
+    );
+    assert_eq!(
+        document["components"]["schemas"]["ImageEditRequest"]["x-wokcore-max-total-file-bytes"],
+        50 * 1024 * 1024
     );
     let rendered = String::from_utf8(bytes).unwrap().to_ascii_lowercase();
     for forbidden in [

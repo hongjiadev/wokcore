@@ -12,6 +12,15 @@ mod responses;
 mod routes;
 mod stream;
 
+#[derive(Clone, Debug)]
+pub(crate) struct RequestObservationContext {
+    pub(crate) attempt_id: Option<String>,
+    pub(crate) provider_id: String,
+    pub(crate) model: String,
+    pub(crate) input_tokens: Option<u64>,
+    pub(crate) output_tokens: Option<u64>,
+}
+
 pub(crate) use admission_body::hold_admission_until_body_end;
 pub(crate) use body::{IMAGE_MULTIPART_WIRE_LIMIT, JSON_BODY_LIMIT};
 pub(crate) use execute::{Executed, ExecutedResponse, ExecutedStream, execute_canonical};

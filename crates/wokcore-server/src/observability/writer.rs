@@ -1,7 +1,10 @@
 use std::{
     fmt,
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     thread,
     time::{Duration, Instant, SystemTime},
 };
@@ -27,8 +30,8 @@ use wokcore_diagnostics::{
     snapshot::{SnapshotOwner, SnapshotRecorder, SnapshotShutdown},
 };
 use wokcore_storage::{
-    StateStore, StateStoreWriter, StateStoreWriterClient, StateStoreWriterShutdownHandle,
-    state_store_writer,
+    ProviderMetadataBatch, RequestMetric, StateStore, StateStoreWriter, StateStoreWriterClient,
+    StateStoreWriterShutdownHandle, StateStoreWriterSubmitError, state_store_writer,
 };
 
 use crate::{auth::EntropySource, observability::ScanTimestampSource, runtime::generate_uuid_v4};
@@ -39,6 +42,8 @@ pub const SESSION_BATCH_QUEUE_CAPACITY: usize = 4;
 pub const SESSION_PRODUCER_SLICE: Duration = Duration::from_millis(25);
 pub const SESSION_PARTIAL_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
 pub const DIAGNOSTIC_PARTIAL_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
+pub const REQUEST_METRIC_BATCH_ROWS: usize = 64;
+pub const REQUEST_METRIC_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
 pub const IDLE_TRUNCATE_INTERVAL: Duration = Duration::from_secs(60);
 const WRITER_COMMAND_CAPACITY: usize = 1;
 const BARRIER_DEADLINE: Duration = Duration::from_secs(5);
@@ -46,6 +51,8 @@ const BARRIER_DEADLINE: Duration = Duration::from_secs(5);
 #[derive(Clone)]
 pub struct StateWriterHandle {
     client: StateStoreWriterClient,
+    request_metrics: Arc<Mutex<PendingRequestMetrics>>,
+    dropped_request_metrics: Arc<AtomicU64>,
 }
 
 impl StateWriterHandle {
@@ -55,6 +62,97 @@ impl StateWriterHandle {
 
     pub fn has_been_idle_for(&self, duration: Duration) -> bool {
         self.client.has_been_idle_for(duration)
+    }
+
+    pub fn observe_request_metric<F>(&self, metric: RequestMetric, provider_metadata: F)
+    where
+        F: FnOnce() -> Option<ProviderMetadataBatch>,
+    {
+        let batch = {
+            let mut pending = self
+                .request_metrics
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if pending.rows.len() >= REQUEST_METRIC_BATCH_ROWS {
+                self.dropped_request_metrics.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            if pending.rows.is_empty() {
+                pending.started_at = Some(Instant::now());
+            }
+            pending.rows.push(metric);
+            let due = pending.rows.len() >= REQUEST_METRIC_BATCH_ROWS
+                || pending.started_at.is_some_and(|started_at| {
+                    started_at.elapsed() >= REQUEST_METRIC_FLUSH_INTERVAL
+                });
+            due.then(|| pending.take())
+        };
+        let Some(batch) = batch else {
+            return;
+        };
+        let dropped = batch.len();
+        let provider_metadata = provider_metadata();
+        if self
+            .client
+            .try_execute(move |store| {
+                store.record_request_metrics(&batch)?;
+                if let Some(metadata) = provider_metadata {
+                    let _ = store.record_provider_metadata_batch(&metadata)?;
+                }
+                Ok(())
+            })
+            .is_err()
+        {
+            self.dropped_request_metrics.fetch_add(
+                u64::try_from(dropped).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    pub fn dropped_request_metrics(&self) -> u64 {
+        self.dropped_request_metrics.load(Ordering::Relaxed)
+    }
+
+    async fn flush_pending_request_metrics(&self) -> Result<(), StateWriterError> {
+        let batch = {
+            self.request_metrics
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+        };
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let batch = Arc::new(batch);
+        loop {
+            let submitted = Arc::clone(&batch);
+            match self
+                .client
+                .try_execute(move |store| store.record_request_metrics(submitted.as_slice()))
+            {
+                Ok(receipt) => {
+                    return receipt.wait().await.map_err(|_| StateWriterError::Storage);
+                }
+                Err(StateStoreWriterSubmitError::QueueFull) => tokio::task::yield_now().await,
+                Err(StateStoreWriterSubmitError::WriterClosed) => {
+                    return Err(StateWriterError::Admission);
+                }
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct PendingRequestMetrics {
+    rows: Vec<RequestMetric>,
+    started_at: Option<Instant>,
+}
+
+impl PendingRequestMetrics {
+    fn take(&mut self) -> Vec<RequestMetric> {
+        self.started_at = None;
+        std::mem::take(&mut self.rows)
     }
 }
 
@@ -87,7 +185,11 @@ impl PreparedStateWriter {
         let store = StateStore::open(state_path).map_err(|_| StateWriterError::Storage)?;
         store.health().map_err(|_| StateWriterError::Storage)?;
         let (client, shutdown, writer) = state_store_writer(store);
-        let handle = StateWriterHandle { client };
+        let handle = StateWriterHandle {
+            client,
+            request_metrics: Arc::new(Mutex::new(PendingRequestMetrics::default())),
+            dropped_request_metrics: Arc::new(AtomicU64::new(0)),
+        };
         Ok((
             handle.clone(),
             Self {
@@ -136,6 +238,7 @@ impl RunningStateWriter {
     }
 
     pub async fn flush(&self) -> Result<(), StateWriterError> {
+        self.handle.flush_pending_request_metrics().await?;
         loop {
             match self.handle.client.try_flush() {
                 Ok(receipt) => {
