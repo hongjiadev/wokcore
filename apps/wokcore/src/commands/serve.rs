@@ -17,13 +17,14 @@ use wokcore_core::{
 use wokcore_platform::{DiscoveryRecord, DiscoveryStore, PlatformError, RuntimeLease};
 use wokcore_server::{
     RunningServer, ServerShutdown, ServerState,
-    auth::{AuthError, AuthRegistry, StateAuthMetadataStore},
+    auth::{AuthError, AuthMetadataStore, AuthRegistry, StateAuthMetadataStore},
     lifecycle::ServiceLifecycle,
     observability::{
         PreparedDiagnosticWriter, PreparedScheduler, PreparedStateWriter,
         ProductionSessionScanBackend, RunningDiagnosticWriter, RunningScheduler,
         RunningStateWriter, ScanTimestampSource, SchedulerConfig,
     },
+    providers::{ProviderManagement, ProviderManagementError},
     query::{DEFAULT_QUERY_WORKERS, QueryRuntime, QueryService},
     runtime::{TokenMetadataError, TokenMetadataSource},
 };
@@ -203,10 +204,13 @@ async fn start_service(
     owner: &mut ServiceLifetime,
     cancelled: &watch::Receiver<bool>,
 ) -> Result<StartedService, ServeError> {
-    let config = ConfigStore::new(&dependencies.paths.config_file)
-        .load()
-        .map_err(ServeError::Storage)?;
+    let config_store = ConfigStore::new(&dependencies.paths.config_file);
+    let config = config_store.load().map_err(ServeError::Storage)?;
     let port = config.config.server.port;
+    let provider_management = Arc::new(
+        ProviderManagement::from_loaded(config_store, config, dependencies.secrets.clone())
+            .map_err(map_provider_management_error)?,
+    );
     if port == 0 {
         return Err(ServeError::InvalidConfig);
     }
@@ -228,13 +232,21 @@ async fn start_service(
     };
     let auth = AuthRegistry::bootstrap(
         dependencies.secrets.clone(),
-        metadata,
+        metadata.clone(),
         dependencies.entropy.clone(),
         management_scope,
         created_at,
     )
     .await
     .map_err(map_auth_error)?;
+    let management_binding = metadata
+        .runtime_secret_binding("management")
+        .map_err(ServeError::Storage)?
+        .ok_or(ServeError::Auth)?;
+    provider_management
+        .protect_secret_ref(management_binding.secret_ref)
+        .await
+        .map_err(map_provider_management_error)?;
     let session_domain_key = auth.session_domain_key();
     ensure_not_cancelled(cancelled)?;
     let (diagnostics, prepared_diagnostics) = PreparedDiagnosticWriter::open(
@@ -300,6 +312,7 @@ async fn start_service(
     }
     server_state = server_state.with_diagnostics(diagnostics);
     server_state = server_state.with_state_writer(state_writer);
+    server_state = server_state.with_provider_management(provider_management);
     let running_diagnostics = prepared_diagnostics
         .start()
         .map_err(|_| ServeError::Server)?;
@@ -641,6 +654,15 @@ fn map_auth_error(error: AuthError) -> ServeError {
             ServeError::Storage(error)
         }
         _ => ServeError::Auth,
+    }
+}
+
+fn map_provider_management_error(error: ProviderManagementError) -> ServeError {
+    match error {
+        ProviderManagementError::InvalidCatalog | ProviderManagementError::InvalidConfiguration => {
+            ServeError::InvalidConfig
+        }
+        _ => ServeError::Server,
     }
 }
 

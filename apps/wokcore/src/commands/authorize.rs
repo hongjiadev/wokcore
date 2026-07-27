@@ -116,6 +116,7 @@ fn render_error(error: ControlClientError, output: &mut dyn CommandOutput) -> Ex
             (ExitCode::AuthenticationFailure, "authentication_failure")
         }
         ControlClientError::StorageCorruption => (ExitCode::StorageCorruption, "storage_corrupt"),
+        ControlClientError::InvalidInput => (ExitCode::InvalidInput, "invalid_input"),
         ControlClientError::Internal => (ExitCode::InternalFailure, "internal_error"),
     };
     if write_json(output, &json!({"code": code})).is_ok() {

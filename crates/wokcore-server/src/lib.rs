@@ -4,6 +4,7 @@ pub mod api;
 pub mod auth;
 pub mod lifecycle;
 pub mod observability;
+pub mod providers;
 pub mod query;
 pub mod runtime;
 mod server;

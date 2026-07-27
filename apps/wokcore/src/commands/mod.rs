@@ -3,6 +3,7 @@ mod client;
 mod diagnostics;
 mod doctor;
 mod logs;
+mod providers;
 mod response;
 mod serve;
 mod sessions;
@@ -30,6 +31,7 @@ pub(crate) async fn run(
         Command::Sessions(options) => sessions::run(options, dependencies, output).await,
         Command::Logs(options) => logs::run(options, dependencies, output).await,
         Command::Diagnostics(options) => diagnostics::run(options, dependencies, output).await,
+        Command::Providers(options) => providers::run(options, dependencies, output).await,
     }
 }
 

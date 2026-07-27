@@ -486,6 +486,190 @@
         }
       }
     },
+    "/wokcore/v1/providers/catalog": {
+      "get": {
+        "operationId": "listProviderCatalog",
+        "security": [{"managementBearer": []}],
+        "responses": {
+          "200": {
+            "description": "Frozen Provider catalog",
+            "headers": {
+              "X-Request-Id": {"$ref": "#/components/headers/XRequestId"},
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
+              "X-Content-Type-Options": {"$ref": "#/components/headers/XContentTypeOptions"}
+            },
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ProviderCatalogResponse"}}}
+          },
+          "default": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
+    "/wokcore/v1/providers/runtime": {
+      "get": {
+        "operationId": "getProviderRuntime",
+        "security": [{"managementBearer": []}],
+        "responses": {
+          "200": {
+            "description": "Active Provider runtime status",
+            "headers": {
+              "X-Request-Id": {"$ref": "#/components/headers/XRequestId"},
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
+              "X-Content-Type-Options": {"$ref": "#/components/headers/XContentTypeOptions"}
+            },
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ProviderRuntimeResponse"}}}
+          },
+          "default": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
+    "/wokcore/v1/providers/models": {
+      "get": {
+        "operationId": "listProviderModels",
+        "security": [{"managementBearer": []}],
+        "responses": {
+          "200": {
+            "description": "Active public models",
+            "headers": {
+              "X-Request-Id": {"$ref": "#/components/headers/XRequestId"},
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
+              "X-Content-Type-Options": {"$ref": "#/components/headers/XContentTypeOptions"}
+            },
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ProviderModelsResponse"}}}
+          },
+          "default": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
+    "/wokcore/v1/providers/config/validate": {
+      "post": {
+        "operationId": "validateProviderConfiguration",
+        "security": [{"managementBearer": []}],
+        "requestBody": {
+          "required": true,
+          "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ProviderCandidate"}}}
+        },
+        "responses": {
+          "200": {
+            "description": "Validated Provider candidate",
+            "headers": {
+              "X-Request-Id": {"$ref": "#/components/headers/XRequestId"},
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
+              "X-Content-Type-Options": {"$ref": "#/components/headers/XContentTypeOptions"}
+            },
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ProviderValidationResponse"}}}
+          },
+          "default": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
+    "/wokcore/v1/providers/config": {
+      "put": {
+        "operationId": "commitProviderConfiguration",
+        "security": [{"managementBearer": []}],
+        "requestBody": {
+          "required": true,
+          "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ProviderCommitRequest"}}}
+        },
+        "responses": {
+          "200": {
+            "description": "Committed Provider configuration",
+            "headers": {
+              "X-Request-Id": {"$ref": "#/components/headers/XRequestId"},
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
+              "X-Content-Type-Options": {"$ref": "#/components/headers/XContentTypeOptions"}
+            },
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ProviderCommitResponse"}}}
+          },
+          "default": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
+    "/wokcore/v1/providers/reload": {
+      "post": {
+        "operationId": "reloadProviderConfiguration",
+        "security": [{"managementBearer": []}],
+        "responses": {
+          "200": {
+            "description": "Reloaded Provider configuration",
+            "headers": {
+              "X-Request-Id": {"$ref": "#/components/headers/XRequestId"},
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
+              "X-Content-Type-Options": {"$ref": "#/components/headers/XContentTypeOptions"}
+            },
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ProviderCommitResponse"}}}
+          },
+          "default": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
+    "/wokcore/v1/provider-secrets": {
+      "post": {
+        "operationId": "createProviderSecret",
+        "security": [{"managementBearer": []}],
+        "requestBody": {
+          "required": true,
+          "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ProviderSecretCreate"}}}
+        },
+        "responses": {
+          "201": {
+            "description": "Created opaque Provider secret reference",
+            "headers": {
+              "X-Request-Id": {"$ref": "#/components/headers/XRequestId"},
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
+              "X-Content-Type-Options": {"$ref": "#/components/headers/XContentTypeOptions"}
+            },
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ProviderSecretResponse"}}}
+          },
+          "default": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
+    "/wokcore/v1/provider-secrets/{secret_ref}": {
+      "parameters": [
+        {
+          "name": "secret_ref",
+          "in": "path",
+          "required": true,
+          "schema": {"$ref": "#/components/schemas/SecretRef"}
+        }
+      ],
+      "put": {
+        "operationId": "replaceProviderSecret",
+        "security": [{"managementBearer": []}],
+        "requestBody": {
+          "required": true,
+          "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ProviderSecretReplace"}}}
+        },
+        "responses": {
+          "200": {
+            "description": "Replaced Provider secret",
+            "headers": {
+              "X-Request-Id": {"$ref": "#/components/headers/XRequestId"},
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
+              "X-Content-Type-Options": {"$ref": "#/components/headers/XContentTypeOptions"}
+            },
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ProviderSecretResponse"}}}
+          },
+          "default": {"$ref": "#/components/responses/Error"}
+        }
+      },
+      "delete": {
+        "operationId": "deleteProviderSecret",
+        "security": [{"managementBearer": []}],
+        "responses": {
+          "200": {
+            "description": "Deleted unused Provider secret",
+            "headers": {
+              "X-Request-Id": {"$ref": "#/components/headers/XRequestId"},
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
+              "X-Content-Type-Options": {"$ref": "#/components/headers/XContentTypeOptions"}
+            },
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ProviderSecretResponse"}}}
+          },
+          "default": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
     "/wokcore/v1/clients/{client_id}/tokens/{token_id}": {
       "delete": {
         "operationId": "revokeClientToken",
@@ -949,6 +1133,373 @@
           },
           "next_cursor": {"type": ["string", "null"]},
           "dropped_events": {"type": "integer", "minimum": 0}
+        }
+      },
+      "ProviderId": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[a-z0-9._-]*[a-z0-9][a-z0-9._-]*$"
+      },
+      "AccountId": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[a-z0-9._-]*[a-z0-9][a-z0-9._-]*$"
+      },
+      "SecretRef": {
+        "type": "string",
+        "oneOf": [
+          {"pattern": "^secret:[0-9a-fA-F]{32}$"},
+          {"pattern": "^secret:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"},
+          {"pattern": "^secret:\\{[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\\}$"},
+          {"pattern": "^secret:urn:uuid:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"}
+        ]
+      },
+      "ProviderCapabilities": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["text", "streaming", "tools", "vision", "images", "reasoning"],
+        "properties": {
+          "text": {"type": "boolean"},
+          "streaming": {"type": "boolean"},
+          "tools": {"type": "boolean"},
+          "vision": {"type": "boolean"},
+          "images": {"type": "boolean"},
+          "reasoning": {"type": "boolean"}
+        }
+      },
+      "ProviderDefinition": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id", "label", "adapter", "base_url", "auth_kind", "endpoint_policy",
+          "model_source", "aliases", "models", "default_model", "allow_endpoint_override",
+          "key_optional", "allow_key_auth_override", "reasoning_efforts",
+          "reasoning_effort_map", "capabilities"
+        ],
+        "properties": {
+          "id": {"$ref": "#/components/schemas/ProviderId"},
+          "label": {"type": "string", "minLength": 1, "maxLength": 256},
+          "adapter": {
+            "type": "string",
+            "enum": ["open_ai_responses", "open_ai_chat", "anthropic", "google", "azure_open_ai", "cursor", "kiro", "mimo_free"]
+          },
+          "base_url": {"type": "string", "minLength": 1, "maxLength": 2048},
+          "auth_kind": {"type": "string", "enum": ["forward", "oauth", "key", "local"]},
+          "endpoint_policy": {"type": "string", "enum": ["public_https", "https_template", "loopback_http"]},
+          "model_source": {"type": "string", "enum": ["none", "static", "live", "hybrid"]},
+          "aliases": {
+            "type": "array",
+            "maxItems": 32,
+            "uniqueItems": true,
+            "items": {"$ref": "#/components/schemas/ProviderId"}
+          },
+          "models": {
+            "type": "array",
+            "maxItems": 512,
+            "uniqueItems": true,
+            "items": {"type": "string", "minLength": 1, "maxLength": 256}
+          },
+          "default_model": {"type": ["string", "null"], "maxLength": 256},
+          "allow_endpoint_override": {"type": "boolean"},
+          "key_optional": {"type": "boolean"},
+          "allow_key_auth_override": {"type": "boolean"},
+          "reasoning_efforts": {
+            "type": "array",
+            "maxItems": 16,
+            "uniqueItems": true,
+            "items": {"type": "string", "maxLength": 32}
+          },
+          "reasoning_effort_map": {
+            "type": "object",
+            "maxProperties": 32,
+            "additionalProperties": {"type": "string", "maxLength": 32}
+          },
+          "capabilities": {"$ref": "#/components/schemas/ProviderCapabilities"}
+        }
+      },
+      "ProviderCatalogResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["schema_version", "catalog_schema_version", "baseline_commit", "providers"],
+        "properties": {
+          "schema_version": {"const": 1},
+          "catalog_schema_version": {"const": 1},
+          "baseline_commit": {"type": "string", "minLength": 1, "maxLength": 64},
+          "providers": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 256,
+            "items": {"$ref": "#/components/schemas/ProviderDefinition"}
+          }
+        }
+      },
+      "ProviderInstance": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "catalog_id", "enabled", "allow_private_network"],
+        "properties": {
+          "id": {"$ref": "#/components/schemas/ProviderId"},
+          "catalog_id": {"$ref": "#/components/schemas/ProviderId"},
+          "enabled": {"type": "boolean"},
+          "endpoint": {"type": ["string", "null"], "maxLength": 2048},
+          "allow_private_network": {"type": "boolean"}
+        }
+      },
+      "ProviderAccount": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "provider", "enabled", "auth"],
+        "properties": {
+          "id": {"$ref": "#/components/schemas/AccountId"},
+          "provider": {"$ref": "#/components/schemas/ProviderId"},
+          "enabled": {"type": "boolean"},
+          "auth": {"$ref": "#/components/schemas/ProviderAccountAuth"}
+        }
+      },
+      "ProviderAccountAuth": {
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "credential"],
+            "properties": {
+              "kind": {"const": "forward"},
+              "credential": {"$ref": "#/components/schemas/SecretRef"}
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "access"],
+            "properties": {
+              "kind": {"const": "oauth"},
+              "access": {"$ref": "#/components/schemas/SecretRef"},
+              "refresh": {
+                "oneOf": [
+                  {"$ref": "#/components/schemas/SecretRef"},
+                  {"type": "null"}
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "secret"],
+            "properties": {
+              "kind": {"const": "api_key"},
+              "secret": {"$ref": "#/components/schemas/SecretRef"}
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind"],
+            "properties": {"kind": {"const": "local"}}
+          }
+        ]
+      },
+      "ProviderConfig": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["instances", "accounts"],
+        "properties": {
+          "instances": {
+            "type": "array",
+            "maxItems": 64,
+            "items": {"$ref": "#/components/schemas/ProviderInstance"}
+          },
+          "accounts": {
+            "type": "array",
+            "maxItems": 256,
+            "items": {"$ref": "#/components/schemas/ProviderAccount"}
+          }
+        }
+      },
+      "RouteTarget": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["provider", "model"],
+        "properties": {
+          "provider": {"$ref": "#/components/schemas/ProviderId"},
+          "model": {"type": "string", "minLength": 1, "maxLength": 256}
+        }
+      },
+      "ModelAlias": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["alias", "target"],
+        "properties": {
+          "alias": {"type": "string", "minLength": 1, "maxLength": 256},
+          "target": {"$ref": "#/components/schemas/RouteTarget"}
+        }
+      },
+      "RouteRule": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["target"],
+        "properties": {
+          "client_id": {
+            "oneOf": [
+              {"$ref": "#/components/schemas/ClientId"},
+              {"type": "null"}
+            ]
+          },
+          "model": {"type": ["string", "null"], "maxLength": 256},
+          "target": {"$ref": "#/components/schemas/RouteTarget"}
+        }
+      },
+      "RoutingConfig": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["aliases", "rules"],
+        "properties": {
+          "aliases": {
+            "type": "array",
+            "maxItems": 1024,
+            "items": {"$ref": "#/components/schemas/ModelAlias"}
+          },
+          "rules": {
+            "type": "array",
+            "maxItems": 1024,
+            "items": {"$ref": "#/components/schemas/RouteRule"}
+          },
+          "default": {
+            "oneOf": [
+              {"$ref": "#/components/schemas/RouteTarget"},
+              {"type": "null"}
+            ]
+          }
+        }
+      },
+      "ProviderCandidate": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["providers", "routing"],
+        "properties": {
+          "providers": {"$ref": "#/components/schemas/ProviderConfig"},
+          "routing": {"$ref": "#/components/schemas/RoutingConfig"}
+        }
+      },
+      "PublicModel": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "owned_by", "capabilities"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1, "maxLength": 256},
+          "owned_by": {"$ref": "#/components/schemas/ProviderId"},
+          "capabilities": {"$ref": "#/components/schemas/ProviderCapabilities"}
+        }
+      },
+      "ProviderRuntimeResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schema_version", "revision", "snapshot_revision", "reload_status",
+          "provider_count", "models", "providers", "routing"
+        ],
+        "properties": {
+          "schema_version": {"const": 1},
+          "revision": {"type": "integer", "minimum": 0},
+          "snapshot_revision": {"type": "integer", "minimum": 0},
+          "reload_status": {"type": "string", "enum": ["ready", "failed"]},
+          "provider_count": {"type": "integer", "minimum": 0, "maximum": 64},
+          "models": {
+            "type": "array",
+            "items": {"$ref": "#/components/schemas/PublicModel"}
+          },
+          "providers": {"$ref": "#/components/schemas/ProviderConfig"},
+          "routing": {"$ref": "#/components/schemas/RoutingConfig"}
+        }
+      },
+      "ProviderModelsResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["schema_version", "models"],
+        "properties": {
+          "schema_version": {"const": 1},
+          "models": {
+            "type": "array",
+            "items": {"$ref": "#/components/schemas/PublicModel"}
+          }
+        }
+      },
+      "ProviderValidationResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["schema_version", "valid", "provider_count", "models"],
+        "properties": {
+          "schema_version": {"const": 1},
+          "valid": {"const": true},
+          "provider_count": {"type": "integer", "minimum": 0, "maximum": 64},
+          "models": {
+            "type": "array",
+            "items": {"$ref": "#/components/schemas/PublicModel"}
+          }
+        }
+      },
+      "ProviderCommitRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["expected_revision", "providers", "routing"],
+        "properties": {
+          "expected_revision": {"type": "integer", "minimum": 0},
+          "providers": {"$ref": "#/components/schemas/ProviderConfig"},
+          "routing": {"$ref": "#/components/schemas/RoutingConfig"}
+        }
+      },
+      "ProviderCommitResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["schema_version", "revision", "snapshot_revision", "provider_count", "models"],
+        "properties": {
+          "schema_version": {"const": 1},
+          "revision": {"type": "integer", "minimum": 0},
+          "snapshot_revision": {"type": "integer", "minimum": 0},
+          "provider_count": {"type": "integer", "minimum": 0, "maximum": 64},
+          "models": {
+            "type": "array",
+            "items": {"$ref": "#/components/schemas/PublicModel"}
+          }
+        }
+      },
+      "ProviderSecretCreate": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["provider_id", "purpose", "secret"],
+        "properties": {
+          "provider_id": {"$ref": "#/components/schemas/ProviderId"},
+          "account_id": {
+            "oneOf": [
+              {"$ref": "#/components/schemas/AccountId"},
+              {"type": "null"}
+            ]
+          },
+          "purpose": {
+            "type": "string",
+            "enum": ["api_key", "oauth_access", "oauth_refresh", "lan_token", "auxiliary"]
+          },
+          "secret": {"type": "string", "minLength": 1, "writeOnly": true}
+        }
+      },
+      "ProviderSecretReplace": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["secret"],
+        "properties": {
+          "secret": {"type": "string", "minLength": 1, "writeOnly": true}
+        }
+      },
+      "ProviderSecretResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["schema_version", "operation", "secret_ref"],
+        "properties": {
+          "schema_version": {"const": 1},
+          "operation": {"type": "string", "enum": ["created", "replaced", "deleted"]},
+          "secret_ref": {"$ref": "#/components/schemas/SecretRef"}
         }
       },
       "RevokeResponse": {

@@ -139,6 +139,11 @@ fn render_error(
             "storage_corrupt",
             "WokCore storage is corrupt.\n",
         ),
+        ControlClientError::InvalidInput => (
+            ExitCode::InvalidInput,
+            "invalid_input",
+            "WokCore diagnostic query input is invalid.\n",
+        ),
         ControlClientError::Internal => (
             ExitCode::InternalFailure,
             "internal_error",

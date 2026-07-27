@@ -1,11 +1,12 @@
 use std::{
     future::Future,
-    io::{self, Write},
+    io::{self, Read, Write},
     pin::Pin,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use secrecy::{SecretString, zeroize::Zeroizing};
 use uuid::Uuid;
 use wokcore_platform::{AppPaths, is_process_running};
 use wokcore_server::{
@@ -17,7 +18,7 @@ use wokcore_storage::NativeSecretStore;
 
 use crate::{
     Clock, CommandOutput, ExitCode, IdSource, ProcessIdentity, RunDependencies, RuntimeValueError,
-    ShutdownSignal,
+    SecretInput, ShutdownSignal,
     cli::{Cli, Command},
     run_with_dependencies,
 };
@@ -44,7 +45,8 @@ pub async fn run_production(cli: Cli) -> ExitCode {
         Arc::new(SystemIds::new(entropy)),
         Arc::new(SystemProcessIdentity),
         Arc::new(ControlCSignal),
-    );
+    )
+    .with_secret_input(Arc::new(StandardSecretInput));
     if let Some(session_roots) = SessionRootPaths::discover() {
         dependencies = dependencies.with_session_roots(session_roots);
     }
@@ -64,6 +66,7 @@ fn requests_json(cli: &Cli) -> bool {
         },
         Command::Logs(options) => options.jsonl,
         Command::Diagnostics(_) => false,
+        Command::Providers(_) => true,
     }
 }
 
@@ -139,13 +142,36 @@ impl CommandOutput for StandardOutput {
     }
 }
 
+struct StandardSecretInput;
+
+impl SecretInput for StandardSecretInput {
+    fn read_secret(&self, maximum_bytes: usize) -> io::Result<SecretString> {
+        read_bounded_secret(io::stdin().lock(), maximum_bytes)
+    }
+}
+
+fn read_bounded_secret(input: impl Read, maximum_bytes: usize) -> io::Result<SecretString> {
+    let limit = maximum_bytes
+        .checked_add(1)
+        .ok_or_else(|| io::Error::other("secret input limit is invalid"))?;
+    let mut bytes = Zeroizing::new(Vec::with_capacity(limit));
+    input.take(limit as u64).read_to_end(&mut bytes)?;
+    if bytes.is_empty() || bytes.len() > maximum_bytes {
+        return Err(io::Error::other("secret input size is invalid"));
+    }
+    let value =
+        std::str::from_utf8(&bytes).map_err(|_| io::Error::other("secret input is not UTF-8"))?;
+    Ok(SecretString::from(value.to_owned()))
+}
+
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{io::Cursor, sync::Arc};
 
+    use secrecy::ExposeSecret;
     use wokcore_server::auth::{EntropySource, TokenError};
 
-    use super::{IdSource, SystemIds};
+    use super::{IdSource, SystemIds, read_bounded_secret};
 
     struct FailingEntropy;
 
@@ -161,5 +187,15 @@ mod tests {
 
         assert!(ids.new_instance_id().is_err());
         assert!(ids.new_token_id().is_err());
+    }
+
+    #[test]
+    fn bounded_secret_input_accepts_only_nonempty_utf8_within_the_limit() {
+        let accepted = read_bounded_secret(Cursor::new(b"exact-value"), 11).unwrap();
+        assert_eq!(accepted.expose_secret(), "exact-value");
+
+        assert!(read_bounded_secret(Cursor::new(Vec::<u8>::new()), 11).is_err());
+        assert!(read_bounded_secret(Cursor::new(vec![0xff]), 11).is_err());
+        assert!(read_bounded_secret(Cursor::new(b"one-byte-too-long"), 16).is_err());
     }
 }

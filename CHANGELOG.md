@@ -30,6 +30,7 @@ All notable WokCore changes are documented in this file.
 - Immutable lock-free runtime routing snapshots with deterministic explicit/alias/rule/default precedence, enabled-only zero-copy candidate views, exact reasoning-effort mapping, stable public model metadata, and atomic fail-safe reloads.
 - Sharded bounded account health, cooldown, quota, weighted least-use, and ephemeral affinity state with schema-4 coarse Provider/account metadata, atomic bounded replacement batches, unchanged-state zero-write replay, and removal of legacy raw affinity persistence.
 - Cancellation-safe Provider execution with a fixed two-attempt pre-visible retry window, authentication-preserving account failover, bounded server delays and retained request bodies, and fixed-size content-free attempt diagnostics without a proxy concurrency semaphore.
+- Management-token-only Provider catalog, runtime/model inspection, candidate validation, revision-checked atomic commit, fail-safe reload, and retry-safe scope-stable opaque secret-reference lifecycle APIs with matching JSON-only CLI commands and OpenAPI 3.1 coverage.
 
 ### Fixed
 

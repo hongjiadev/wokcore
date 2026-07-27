@@ -106,6 +106,40 @@ impl ControlClient {
             .await
             .map_err(|_| ControlClientError::NotRunning)
     }
+
+    pub(super) async fn put_json<T: Serialize + ?Sized>(
+        &self,
+        path: &str,
+        management: &SecretString,
+        body: &T,
+    ) -> Result<Response, ControlClientError> {
+        use secrecy::ExposeSecret;
+
+        self.client
+            .put(format!("{}{path}", self.record.base_url))
+            .header(HOST, &self.authority)
+            .bearer_auth(management.expose_secret())
+            .json(body)
+            .send()
+            .await
+            .map_err(|_| ControlClientError::NotRunning)
+    }
+
+    pub(super) async fn delete(
+        &self,
+        path: &str,
+        management: &SecretString,
+    ) -> Result<Response, ControlClientError> {
+        use secrecy::ExposeSecret;
+
+        self.client
+            .delete(format!("{}{path}", self.record.base_url))
+            .header(HOST, &self.authority)
+            .bearer_auth(management.expose_secret())
+            .send()
+            .await
+            .map_err(|_| ControlClientError::NotRunning)
+    }
 }
 
 pub(super) async fn response_body(
@@ -145,6 +179,7 @@ pub(super) enum ControlClientError {
     IdentityMismatch,
     Authentication,
     StorageCorruption,
+    InvalidInput,
     Internal,
 }
 

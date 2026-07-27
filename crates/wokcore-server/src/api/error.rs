@@ -95,6 +95,115 @@ impl ApiError {
         )
     }
 
+    pub(crate) fn unsupported_media_type(request_id: RequestId) -> Self {
+        Self::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported_media_type",
+            "request content type is not supported",
+            request_id,
+        )
+    }
+
+    pub(crate) fn provider_runtime_unavailable(request_id: RequestId) -> Self {
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "provider_runtime_unavailable",
+            "Provider runtime is unavailable",
+            request_id,
+        )
+        .with_component(DiagnosticComponent::Provider)
+    }
+
+    pub(crate) fn provider_config_invalid(request_id: RequestId) -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "provider_config_invalid",
+            "Provider configuration is invalid",
+            request_id,
+        )
+        .with_component(DiagnosticComponent::Provider)
+    }
+
+    pub(crate) fn provider_config_revision_conflict(request_id: RequestId) -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "provider_config_revision_conflict",
+            "Provider configuration revision conflicts",
+            request_id,
+        )
+        .with_component(DiagnosticComponent::Provider)
+    }
+
+    pub(crate) fn provider_secret_not_found(request_id: RequestId) -> Self {
+        Self::new(
+            StatusCode::NOT_FOUND,
+            "provider_secret_not_found",
+            "Provider secret was not found",
+            request_id,
+        )
+        .with_component(DiagnosticComponent::Provider)
+    }
+
+    pub(crate) fn provider_secret_already_exists(request_id: RequestId) -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "provider_secret_already_exists",
+            "a different Provider secret already exists for this credential scope",
+            request_id,
+        )
+        .with_component(DiagnosticComponent::Provider)
+    }
+
+    pub(crate) fn provider_secret_in_use(request_id: RequestId) -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "provider_secret_in_use",
+            "Provider secret is referenced by the active configuration",
+            request_id,
+        )
+        .with_component(DiagnosticComponent::Provider)
+    }
+
+    pub(crate) fn provider_secret_protected(request_id: RequestId) -> Self {
+        Self::new(
+            StatusCode::FORBIDDEN,
+            "provider_secret_protected",
+            "secret reference is reserved for WokCore runtime authentication",
+            request_id,
+        )
+        .with_component(DiagnosticComponent::Provider)
+    }
+
+    pub(crate) fn provider_secret_store_read_only(request_id: RequestId) -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "provider_secret_store_read_only",
+            "Provider secret store is read-only",
+            request_id,
+        )
+        .with_component(DiagnosticComponent::Provider)
+    }
+
+    pub(crate) fn provider_storage_failure(request_id: RequestId) -> Self {
+        Self::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "Provider management storage operation failed",
+            request_id,
+        )
+        .with_component(DiagnosticComponent::Storage)
+    }
+
+    pub(crate) fn provider_internal_failure(request_id: RequestId) -> Self {
+        Self::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "Provider management operation failed",
+            request_id,
+        )
+        .with_component(DiagnosticComponent::Provider)
+    }
+
     pub(crate) fn invalid_query(request_id: RequestId) -> Self {
         Self::new(
             StatusCode::BAD_REQUEST,

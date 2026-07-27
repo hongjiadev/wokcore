@@ -339,3 +339,20 @@ Private pre-rewrite recovery material is excluded from this public repository.
   - fixed-host weighted-selection and affinity regressions;
   - complete Windows workspace suite through `E:/Projects/wokcore/target/wokcore-test-host.exe`;
   - workspace Clippy with `-D warnings`, rustfmt, locked offline checks, and public repository hygiene checks.
+
+## Runtime foundation 16: Provider management control plane
+
+- Original WokCore implementation; no external Provider-management or OAuth code is imported.
+- The loopback management API exposes the immutable 58-Provider catalog, active public model projection, and complete revisioned Provider/routing status without resolving credentials or contacting an upstream.
+- Candidate validation and commit share the runtime snapshot builder. Commit requires an exact expected revision, persists the complete configuration atomically, and publishes the rebuilt immutable snapshot only after durable success. Management mutations finish in owned tasks after caller cancellation, and an indeterminate commit is reconciled against the complete durable revision before publication.
+- Explicit reload rebuilds before publication. Invalid durable input marks reload status failed while retaining the prior revision, models, configuration, and active snapshot.
+- Provider secret create, stable-reference replace, and unused-reference delete operations use the configured `SecretStore`. Creation derives a stable opaque reference from the Provider/account/purpose scope, makes same-material retries idempotent after cancellation, and rejects different material until an explicit replace. Requests accept bounded secret material, while responses and error bodies expose metadata only.
+- The WokCore runtime management credential is protected after authentication bootstrap: it cannot enter Provider configuration and cannot be created, replaced, or deleted through the Provider lifecycle.
+- Every Provider endpoint requires the management token. Proxy-token scopes do not grant Provider administration. Methods, JSON content types, body bounds, paths, and revision conflicts fail closed with stable content-free errors.
+- The CLI mirrors the management API with required JSON output. Candidate files are bounded to 16 KiB; secret input is bounded to 8 KiB and is accepted only from standard input. Secret material and secret references are never accepted as positional arguments.
+- OpenAPI 3.1 defines the exact Provider paths, security schemes, request/response schemas, write-only secret fields, and revision contracts. The implementation performs no Provider discovery, OAuth browser flow, DNS lookup, or upstream request.
+- Verification:
+  - five fixed-host Provider management service and HTTP contract tests;
+  - fixed-host OpenAPI, CLI, production bootstrap, and secret-store safety regressions;
+  - complete Windows workspace suite through `E:/Projects/wokcore/target/wokcore-test-host.exe`;
+  - workspace Clippy with `-D warnings`, rustfmt, locked offline checks, and public repository hygiene checks.

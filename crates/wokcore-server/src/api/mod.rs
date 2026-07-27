@@ -3,6 +3,7 @@ mod error;
 mod export;
 mod logs;
 mod model;
+mod providers;
 mod request_id;
 mod routes;
 mod security;
@@ -12,13 +13,17 @@ use axum::{
     Router,
     extract::DefaultBodyLimit,
     middleware,
-    routing::{MethodFilter, delete, on, post},
+    routing::{MethodFilter, delete, on, post, put},
 };
 
 use crate::ServerState;
 
 use export::diagnostics_export;
 use logs::logs;
+use providers::{
+    catalog, commit_configuration, create_secret, delete_secret, models, reload, replace_secret,
+    runtime_status, validate_configuration,
+};
 use request_id::apply_response_envelope;
 use routes::{
     authorize, cancel_drain, capabilities, drain, health, method_not_allowed, not_found, revoke,
@@ -64,6 +69,29 @@ pub fn build_router(state: ServerState) -> Router {
         .route(
             "/wokcore/v1/diagnostics/export",
             on(MethodFilter::GET, diagnostics_export).on(MethodFilter::HEAD, method_not_allowed),
+        )
+        .route(
+            "/wokcore/v1/providers/catalog",
+            on(MethodFilter::GET, catalog).on(MethodFilter::HEAD, method_not_allowed),
+        )
+        .route(
+            "/wokcore/v1/providers/runtime",
+            on(MethodFilter::GET, runtime_status).on(MethodFilter::HEAD, method_not_allowed),
+        )
+        .route(
+            "/wokcore/v1/providers/models",
+            on(MethodFilter::GET, models).on(MethodFilter::HEAD, method_not_allowed),
+        )
+        .route(
+            "/wokcore/v1/providers/config/validate",
+            post(validate_configuration),
+        )
+        .route("/wokcore/v1/providers/config", put(commit_configuration))
+        .route("/wokcore/v1/providers/reload", post(reload))
+        .route("/wokcore/v1/provider-secrets", post(create_secret))
+        .route(
+            "/wokcore/v1/provider-secrets/{secret_ref}",
+            put(replace_secret).delete(delete_secret),
         )
         .route(
             "/wokcore/v1/clients/{client_id}/tokens/{token_id}",

@@ -1,6 +1,8 @@
-use std::{collections::BTreeMap, fs, path::PathBuf};
+use std::{fs, path::PathBuf};
 
 use serde_json::{Value, json};
+use wokcore_core::secret::SecretRef;
+use wokcore_server::providers::ProviderCandidate;
 
 #[test]
 fn openapi_31_matches_the_exact_control_plane_contract_without_secret_examples() {
@@ -17,7 +19,7 @@ fn openapi_31_matches_the_exact_control_plane_contract_without_secret_examples()
         document["components"]["securitySchemes"]["managementBearer"],
         json!({"type":"http","scheme":"bearer","bearerFormat":"WokCore management token"})
     );
-    let expected = BTreeMap::from([
+    let expected = [
         ("/wokcore/v1/capabilities", "get"),
         ("/wokcore/v1/clients/authorize", "post"),
         (
@@ -34,9 +36,18 @@ fn openapi_31_matches_the_exact_control_plane_contract_without_secret_examples()
         ("/wokcore/v1/sessions", "get"),
         ("/wokcore/v1/sessions/{session_key}/messages", "get"),
         ("/wokcore/v1/usage", "get"),
-    ]);
+        ("/wokcore/v1/providers/catalog", "get"),
+        ("/wokcore/v1/providers/runtime", "get"),
+        ("/wokcore/v1/providers/models", "get"),
+        ("/wokcore/v1/providers/config/validate", "post"),
+        ("/wokcore/v1/providers/config", "put"),
+        ("/wokcore/v1/providers/reload", "post"),
+        ("/wokcore/v1/provider-secrets", "post"),
+        ("/wokcore/v1/provider-secrets/{secret_ref}", "put"),
+        ("/wokcore/v1/provider-secrets/{secret_ref}", "delete"),
+    ];
     let paths = document["paths"].as_object().unwrap();
-    assert_eq!(paths.len(), expected.len());
+    assert_eq!(paths.len(), 21);
     for (path, method) in expected {
         let operation = &paths[path][method];
         assert!(operation.is_object(), "missing {method} {path}");
@@ -98,6 +109,71 @@ fn openapi_31_matches_the_exact_control_plane_contract_without_secret_examples()
         document["components"]["schemas"]["AuthorizeResponse"]["properties"]["token"]["readOnly"],
         true
     );
+    assert_eq!(
+        document["components"]["schemas"]["ProviderSecretCreate"]["properties"]["secret"]["writeOnly"],
+        true
+    );
+    assert_eq!(
+        document["components"]["schemas"]["ProviderCandidate"]["additionalProperties"],
+        false
+    );
+    assert_eq!(
+        document["components"]["schemas"]["ProviderInstance"]["required"],
+        json!(["id", "catalog_id", "enabled", "allow_private_network"])
+    );
+    assert_eq!(
+        document["components"]["schemas"]["ProviderAccountAuth"]["oneOf"][1]["required"],
+        json!(["kind", "access"])
+    );
+    assert_eq!(
+        document["components"]["schemas"]["RouteRule"]["required"],
+        json!(["target"])
+    );
+    assert_eq!(
+        document["components"]["schemas"]["RoutingConfig"]["required"],
+        json!(["aliases", "rules"])
+    );
+    assert_eq!(
+        document["components"]["schemas"]["SecretRef"]["oneOf"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
+    serde_json::from_value::<ProviderCandidate>(json!({
+        "providers": {
+            "instances": [{
+                "id": "primary",
+                "catalog_id": "openai-apikey",
+                "enabled": true,
+                "allow_private_network": false
+            }],
+            "accounts": [{
+                "id": "primary",
+                "provider": "primary",
+                "enabled": true,
+                "auth": {
+                    "kind": "oauth",
+                    "access": "secret:00000000-0000-0000-0000-000000000001"
+                }
+            }]
+        },
+        "routing": {
+            "aliases": [],
+            "rules": [{
+                "target": {"provider": "primary", "model": "gpt-5.6"}
+            }]
+        }
+    }))
+    .expect("serde accepts the OpenAPI-optional Provider fields when absent");
+    for secret_ref in [
+        "secret:00000000000000000000000000000001",
+        "secret:00000000-0000-0000-0000-000000000001",
+        "secret:{00000000-0000-0000-0000-000000000001}",
+        "secret:urn:uuid:00000000-0000-0000-0000-000000000001",
+    ] {
+        SecretRef::parse(secret_ref).expect("OpenAPI SecretRef representation must parse");
+    }
     assert_eq!(
         document["paths"]["/wokcore/v1/sessions"]["get"]["parameters"][3]["schema"],
         json!({"type":"integer","minimum":1,"maximum":200,"default":50})

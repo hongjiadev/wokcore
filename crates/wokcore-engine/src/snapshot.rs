@@ -122,6 +122,10 @@ impl RuntimeSnapshot {
         &self.public_models
     }
 
+    pub fn provider_count(&self) -> usize {
+        self.providers.len()
+    }
+
     fn decision(
         &self,
         target: &RouteTarget,
@@ -187,6 +191,12 @@ impl SnapshotPublisher {
 
     pub fn load(&self) -> Arc<RuntimeSnapshot> {
         self.current.load_full()
+    }
+
+    pub fn publish(&self, snapshot: RuntimeSnapshot) -> Arc<RuntimeSnapshot> {
+        let snapshot = Arc::new(snapshot);
+        self.current.store(Arc::clone(&snapshot));
+        snapshot
     }
 
     pub fn rebuild_and_publish(

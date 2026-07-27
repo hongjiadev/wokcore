@@ -35,6 +35,21 @@ async fn memory_store_round_trips_deletes_and_reports_wrong_refs() {
         store.get(&SecretRef::new()).await,
         Err(StorageError::SecretNotFound)
     ));
+    let replacement = ["replacement", "secret"].join("-");
+    store
+        .replace(&secret_ref, SecretString::from(replacement.clone()))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get(&secret_ref).await.unwrap().expose_secret(),
+        &replacement
+    );
+    assert!(matches!(
+        store
+            .replace(&SecretRef::new(), SecretString::from("missing"))
+            .await,
+        Err(StorageError::SecretNotFound)
+    ));
 
     store.delete(&secret_ref).await.unwrap();
     assert!(matches!(
@@ -42,6 +57,32 @@ async fn memory_store_round_trips_deletes_and_reports_wrong_refs() {
         Err(StorageError::SecretNotFound)
     ));
     store.delete(&secret_ref).await.unwrap();
+}
+
+#[tokio::test]
+async fn memory_store_scoped_put_is_idempotent_without_silent_replacement() {
+    let store = MemorySecretStore::default();
+    let first = store
+        .put_scoped(&scope(), SecretString::from("scoped-secret"))
+        .await
+        .unwrap();
+    let retried = store
+        .put_scoped(&scope(), SecretString::from("scoped-secret"))
+        .await
+        .unwrap();
+
+    assert_eq!(first, retried);
+    assert_eq!(first, SecretRef::for_scope(&scope()));
+    assert!(matches!(
+        store
+            .put_scoped(&scope(), SecretString::from("different-secret"))
+            .await,
+        Err(StorageError::SecretAlreadyExists)
+    ));
+    assert_eq!(
+        store.get(&first).await.unwrap().expose_secret(),
+        "scoped-secret"
+    );
 }
 
 #[tokio::test]

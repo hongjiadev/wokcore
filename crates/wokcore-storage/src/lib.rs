@@ -72,6 +72,8 @@ pub enum StorageError {
     ReplaySignatureLimitExceeded,
     #[error("secret was not found")]
     SecretNotFound,
+    #[error("a different secret already exists for this credential scope")]
+    SecretAlreadyExists,
     #[error("the secret backend failed without exposing secret material")]
     SecretBackendFailure,
     #[error("the selected secret backend is read-only")]

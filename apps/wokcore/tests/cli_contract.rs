@@ -22,6 +22,7 @@ Commands:
   sessions     Read indexed local coding sessions
   logs         Read redacted WokCore diagnostic events
   diagnostics  Work with bounded diagnostic support packages
+  providers    Manage Provider catalog, routing, and secret references
   help         Print this message or the help of the given subcommand(s)
 
 Options:
@@ -87,6 +88,10 @@ fn only_the_documented_commands_and_options_are_accepted() {
             "diagnostics",
             "Work with bounded diagnostic support packages\n\nUsage: wokcore diagnostics <COMMAND>\n\nCommands:\n  export  Export a validated diagnostic support package\n  help    Print this message or the help of the given subcommand(s)\n\nOptions:\n  -h, --help  Print help\n",
         ),
+        (
+            "providers",
+            "Manage Provider catalog, routing, and secret references\n\nUsage: wokcore providers <COMMAND>\n\nCommands:\n  catalog   List the frozen Provider catalog\n  status    Show active Provider configuration and reload status\n  models    List active public models\n  validate  Validate a Provider candidate JSON document\n  commit    Atomically commit a Provider candidate JSON document\n  reload    Reload Provider configuration from durable storage\n  secret    Manage opaque Provider secret references\n  help      Print this message or the help of the given subcommand(s)\n\nOptions:\n  -h, --help  Print help\n",
+        ),
     ];
 
     for (command, expected) in cases {
@@ -113,9 +118,67 @@ fn only_the_documented_commands_and_options_are_accepted() {
             "--token",
             "secret",
         ],
+        &[
+            "providers",
+            "secret",
+            "create",
+            "--provider",
+            "primary",
+            "--purpose",
+            "api_key",
+            "--secret",
+            "forbidden",
+            "--json",
+        ],
     ] {
         assert!(!run(rejected).status.success(), "{rejected:?}");
     }
+}
+
+#[test]
+fn provider_commands_require_json_and_secret_material_only_from_stdin() {
+    for rejected in [
+        &["providers", "catalog"][..],
+        &["providers", "validate", "--file", "candidate.json"],
+        &[
+            "providers",
+            "secret",
+            "create",
+            "--provider",
+            "primary",
+            "--purpose",
+            "api_key",
+            "--json",
+        ],
+        &[
+            "providers",
+            "secret",
+            "replace",
+            "--secret-ref",
+            "secret:019844f0-4de0-7000-8000-000000000001",
+            "--json",
+        ],
+    ] {
+        let output = run(rejected);
+        assert_eq!(output.status.code(), Some(ExitCode::InvalidInput.as_i32()));
+        assert!(output.stdout.is_empty());
+    }
+
+    assert!(
+        parse_command([
+            "wokcore",
+            "providers",
+            "secret",
+            "create",
+            "--provider",
+            "primary",
+            "--purpose",
+            "api_key",
+            "--secret-stdin",
+            "--json",
+        ])
+        .is_ok()
+    );
 }
 
 #[test]

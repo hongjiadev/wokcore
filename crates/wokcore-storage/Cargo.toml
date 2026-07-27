@@ -17,6 +17,7 @@ keyring.workspace = true
 rusqlite.workspace = true
 secrecy.workspace = true
 serde.workspace = true
+subtle.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

@@ -13,7 +13,23 @@ pub trait SecretStore: Send + Sync {
         value: SecretString,
     ) -> Result<SecretRef, StorageError>;
 
+    async fn put_scoped(
+        &self,
+        _scope: &SecretScope,
+        _value: SecretString,
+    ) -> Result<SecretRef, StorageError> {
+        Err(StorageError::ReadOnlySecretStore)
+    }
+
     async fn get(&self, secret_ref: &SecretRef) -> Result<SecretString, StorageError>;
+
+    async fn replace(
+        &self,
+        _secret_ref: &SecretRef,
+        _value: SecretString,
+    ) -> Result<(), StorageError> {
+        Err(StorageError::ReadOnlySecretStore)
+    }
 
     async fn delete(&self, secret_ref: &SecretRef) -> Result<(), StorageError>;
 }

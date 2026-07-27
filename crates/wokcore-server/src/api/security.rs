@@ -167,7 +167,12 @@ fn classify_route(path: &str) -> RouteAuthClass {
 }
 
 fn is_metadata_mutation_path(path: &str) -> bool {
-    path == "/wokcore/v1/clients/authorize" || is_revoke_path(path)
+    path == "/wokcore/v1/clients/authorize"
+        || path == "/wokcore/v1/providers/config"
+        || path == "/wokcore/v1/providers/reload"
+        || path == "/wokcore/v1/provider-secrets"
+        || path.starts_with("/wokcore/v1/provider-secrets/")
+        || is_revoke_path(path)
 }
 
 fn is_revoke_path(path: &str) -> bool {

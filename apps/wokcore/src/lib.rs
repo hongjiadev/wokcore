@@ -2,7 +2,7 @@
 
 use std::{future::Future, io, pin::Pin, sync::Arc, time::Duration};
 
-use secrecy::zeroize::Zeroizing;
+use secrecy::{SecretString, zeroize::Zeroizing};
 use uuid::Uuid;
 use wokcore_platform::{AppPaths, DiscoveryRecord, DiscoveryStore, PlatformError};
 use wokcore_server::{
@@ -82,6 +82,10 @@ pub trait CommandOutput: Send {
     fn write_stderr(&mut self, value: &str) -> io::Result<()>;
 }
 
+pub trait SecretInput: Send + Sync {
+    fn read_secret(&self, maximum_bytes: usize) -> io::Result<SecretString>;
+}
+
 #[derive(Default)]
 pub struct BufferOutput {
     stdout: Zeroizing<String>,
@@ -121,6 +125,7 @@ pub struct RunDependencies {
     pub(crate) shutdown: Arc<dyn ShutdownSignal>,
     pub(crate) discovery_publisher: Arc<dyn DiscoveryPublisher>,
     pub(crate) lifecycle_observer: Arc<dyn LifecycleObserver>,
+    pub(crate) secret_input: Arc<dyn SecretInput>,
     pub(crate) session_roots: Option<SessionRootPaths>,
     pub(crate) drain_timeout: Duration,
 }
@@ -146,6 +151,7 @@ impl RunDependencies {
             shutdown,
             discovery_publisher: Arc::new(PlatformDiscoveryPublisher),
             lifecycle_observer: Arc::new(NoopLifecycleObserver),
+            secret_input: Arc::new(UnavailableSecretInput),
             session_roots: None,
             drain_timeout: Duration::from_secs(30),
         }
@@ -172,6 +178,11 @@ impl RunDependencies {
         self
     }
 
+    pub fn with_secret_input(mut self, secret_input: Arc<dyn SecretInput>) -> Self {
+        self.secret_input = secret_input;
+        self
+    }
+
     pub fn with_drain_timeout(mut self, drain_timeout: Duration) -> Self {
         self.drain_timeout = drain_timeout;
         self
@@ -194,6 +205,14 @@ struct NoopLifecycleObserver;
 
 impl LifecycleObserver for NoopLifecycleObserver {
     fn observe(&self, _lifecycle: &ServiceLifecycle) {}
+}
+
+struct UnavailableSecretInput;
+
+impl SecretInput for UnavailableSecretInput {
+    fn read_secret(&self, _maximum_bytes: usize) -> io::Result<SecretString> {
+        Err(io::Error::other("secret input is unavailable"))
+    }
 }
 
 pub async fn run_with_dependencies(

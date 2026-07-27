@@ -122,6 +122,10 @@ fn render_error(error: ControlClientError, output: &mut dyn CommandOutput) -> Ex
         ControlClientError::StorageCorruption => {
             (ExitCode::StorageCorruption, "WokCore storage is corrupt.\n")
         }
+        ControlClientError::InvalidInput => (
+            ExitCode::InvalidInput,
+            "Diagnostic export input is invalid.\n",
+        ),
         ControlClientError::Internal => (
             ExitCode::InternalFailure,
             "WokCore diagnostic export failed.\n",

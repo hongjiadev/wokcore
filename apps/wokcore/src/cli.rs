@@ -32,6 +32,8 @@ pub enum Command {
     Logs(Logs),
     /// Work with bounded diagnostic support packages.
     Diagnostics(Diagnostics),
+    /// Manage Provider catalog, routing, and secret references.
+    Providers(Providers),
 }
 
 #[derive(Debug, Args)]
@@ -133,6 +135,118 @@ pub struct DiagnosticsExport {
     /// Create a new ZIP package at this path.
     #[arg(long, value_name = "PATH")]
     pub output: PathBuf,
+}
+
+#[derive(Debug, Args)]
+pub struct Providers {
+    #[command(subcommand)]
+    pub command: ProvidersCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ProvidersCommand {
+    /// List the frozen Provider catalog.
+    Catalog(RequiredJson),
+    /// Show active Provider configuration and reload status.
+    Status(RequiredJson),
+    /// List active public models.
+    Models(RequiredJson),
+    /// Validate a Provider candidate JSON document.
+    Validate(ProviderCandidateFile),
+    /// Atomically commit a Provider candidate JSON document.
+    Commit(ProviderCommitFile),
+    /// Reload Provider configuration from durable storage.
+    Reload(RequiredJson),
+    /// Manage opaque Provider secret references.
+    Secret(ProviderSecrets),
+}
+
+#[derive(Debug, Args)]
+pub struct RequiredJson {
+    /// Emit the stable JSON response.
+    #[arg(long, required = true)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ProviderCandidateFile {
+    /// Read a Provider candidate JSON document from this file.
+    #[arg(long, value_name = "PATH")]
+    pub file: PathBuf,
+    /// Emit the stable JSON response.
+    #[arg(long, required = true)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ProviderCommitFile {
+    /// Read a Provider candidate JSON document from this file.
+    #[arg(long, value_name = "PATH")]
+    pub file: PathBuf,
+    /// Require this active configuration revision.
+    #[arg(long)]
+    pub expected_revision: u64,
+    /// Emit the stable JSON response.
+    #[arg(long, required = true)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ProviderSecrets {
+    #[command(subcommand)]
+    pub command: ProviderSecretsCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ProviderSecretsCommand {
+    /// Create an opaque secret reference from standard input.
+    Create(ProviderSecretCreate),
+    /// Replace one secret reference from standard input.
+    Replace(ProviderSecretReplace),
+    /// Delete one unused secret reference.
+    Delete(ProviderSecretDelete),
+}
+
+#[derive(Debug, Args)]
+pub struct ProviderSecretCreate {
+    /// Provider instance identifier for the secret scope.
+    #[arg(long, value_name = "ID")]
+    pub provider: String,
+    /// Optional account identifier for the secret scope.
+    #[arg(long, value_name = "ID")]
+    pub account: Option<String>,
+    /// Secret purpose: api_key, oauth_access, oauth_refresh, lan_token, or auxiliary.
+    #[arg(long)]
+    pub purpose: String,
+    /// Read secret material from standard input.
+    #[arg(long, required = true)]
+    pub secret_stdin: bool,
+    /// Emit metadata only as stable JSON.
+    #[arg(long, required = true)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ProviderSecretReplace {
+    /// Opaque secret reference to replace.
+    #[arg(long, value_name = "REF")]
+    pub secret_ref: String,
+    /// Read secret material from standard input.
+    #[arg(long, required = true)]
+    pub secret_stdin: bool,
+    /// Emit metadata only as stable JSON.
+    #[arg(long, required = true)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ProviderSecretDelete {
+    /// Opaque unused secret reference to delete.
+    #[arg(long, value_name = "REF")]
+    pub secret_ref: String,
+    /// Emit metadata only as stable JSON.
+    #[arg(long, required = true)]
+    pub json: bool,
 }
 
 pub fn parse_command<I, T>(arguments: I) -> Result<Command, clap::Error>

@@ -789,6 +789,46 @@ async fn serve_publishes_only_a_ready_loopback_identity_and_removes_its_discover
         })
     );
 
+    let mut provider_catalog_output = BufferOutput::default();
+    let provider_catalog = run_with_dependencies(
+        Cli::try_parse_from(["wokcore", "providers", "catalog", "--json"]).unwrap(),
+        &status_dependencies,
+        &mut provider_catalog_output,
+    )
+    .await;
+    assert_eq!(provider_catalog, ExitCode::Success);
+    let provider_catalog_json =
+        serde_json::from_str::<serde_json::Value>(provider_catalog_output.stdout()).unwrap();
+    assert_eq!(provider_catalog_json["schema_version"], 1);
+    assert_eq!(
+        provider_catalog_json["providers"].as_array().unwrap().len(),
+        58
+    );
+    assert_eq!(provider_catalog_output.stderr(), "");
+
+    let mut provider_status_output = BufferOutput::default();
+    let provider_status = run_with_dependencies(
+        Cli::try_parse_from(["wokcore", "providers", "status", "--json"]).unwrap(),
+        &status_dependencies,
+        &mut provider_status_output,
+    )
+    .await;
+    assert_eq!(provider_status, ExitCode::Success);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(provider_status_output.stdout()).unwrap(),
+        serde_json::json!({
+            "schema_version": 1,
+            "revision": 1,
+            "snapshot_revision": 1,
+            "reload_status": "ready",
+            "provider_count": 0,
+            "models": [],
+            "providers": {"instances": [], "accounts": []},
+            "routing": {"aliases": [], "rules": [], "default": null},
+        })
+    );
+    assert_eq!(provider_status_output.stderr(), "");
+
     shutdown.trigger();
     let (serve_code, serve_output) = timeout(Duration::from_secs(5), serve)
         .await

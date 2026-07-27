@@ -30,6 +30,7 @@ uuid.workspace = true
 zeroize.workspace = true
 wokcore-core = { version = "0.1.0", path = "../wokcore-core" }
 wokcore-diagnostics = { version = "0.1.0", path = "../wokcore-diagnostics" }
+wokcore-engine = { version = "0.1.0", path = "../wokcore-engine" }
 wokcore-platform = { version = "0.1.0", path = "../wokcore-platform" }
 wokcore-protocols = { version = "0.1.0", path = "../wokcore-protocols" }
 wokcore-sessions = { version = "0.1.0", path = "../wokcore-sessions" }
@@ -37,5 +38,6 @@ wokcore-storage = { version = "0.1.0", path = "../wokcore-storage" }
 
 [dev-dependencies]
 async-trait.workspace = true
+fs4.workspace = true
 tempfile.workspace = true
 tower.workspace = true

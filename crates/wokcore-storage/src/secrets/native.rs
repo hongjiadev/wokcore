@@ -1,5 +1,6 @@
 use keyring::{Entry, Error as KeyringError};
 use secrecy::{ExposeSecret, SecretString};
+use subtle::ConstantTimeEq;
 use wokcore_core::secret::{SecretRef, SecretScope};
 use zeroize::Zeroize;
 
@@ -45,6 +46,55 @@ impl SecretStore for NativeSecretStore {
         .await
         .map_err(|_| map_join_failure())??;
         Ok(SecretString::from(value))
+    }
+
+    async fn put_scoped(
+        &self,
+        scope: &SecretScope,
+        value: SecretString,
+    ) -> Result<SecretRef, StorageError> {
+        let secret_ref = SecretRef::for_scope(scope);
+        let account = secret_ref.as_str().to_owned();
+        tokio::task::spawn_blocking(move || {
+            let entry = Entry::new(NATIVE_SERVICE_NAME, &account).map_err(map_keyring_error)?;
+            match entry.get_password() {
+                Ok(mut previous) => {
+                    let same =
+                        bool::from(previous.as_bytes().ct_eq(value.expose_secret().as_bytes()));
+                    previous.zeroize();
+                    if same {
+                        Ok(())
+                    } else {
+                        Err(StorageError::SecretAlreadyExists)
+                    }
+                }
+                Err(KeyringError::NoEntry) => entry
+                    .set_password(value.expose_secret())
+                    .map_err(map_keyring_error),
+                Err(error) => Err(map_keyring_error(error)),
+            }
+        })
+        .await
+        .map_err(|_| map_join_failure())??;
+        Ok(secret_ref)
+    }
+
+    async fn replace(
+        &self,
+        secret_ref: &SecretRef,
+        value: SecretString,
+    ) -> Result<(), StorageError> {
+        let account = secret_ref.as_str().to_owned();
+        tokio::task::spawn_blocking(move || {
+            let entry = Entry::new(NATIVE_SERVICE_NAME, &account).map_err(map_keyring_error)?;
+            let mut previous = entry.get_password().map_err(map_keyring_error)?;
+            previous.zeroize();
+            entry
+                .set_password(value.expose_secret())
+                .map_err(map_keyring_error)
+        })
+        .await
+        .map_err(|_| map_join_failure())?
     }
 
     async fn delete(&self, secret_ref: &SecretRef) -> Result<(), StorageError> {

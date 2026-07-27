@@ -2359,6 +2359,7 @@ name = "wokcore-core"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "sha2",
  "thiserror",
  "url",
  "uuid",
@@ -2431,6 +2432,7 @@ dependencies = [
  "axum",
  "base64",
  "bytes",
+ "fs4",
  "futures-core",
  "getrandom 0.4.3",
  "notify",
@@ -2446,6 +2448,7 @@ dependencies = [
  "uuid",
  "wokcore-core",
  "wokcore-diagnostics",
+ "wokcore-engine",
  "wokcore-platform",
  "wokcore-protocols",
  "wokcore-sessions",
@@ -2480,6 +2483,7 @@ dependencies = [
  "rusqlite",
  "secrecy",
  "serde",
+ "subtle",
  "syn 2.0.119",
  "tempfile",
  "thiserror",

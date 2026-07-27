@@ -11,6 +11,7 @@ use crate::{
     auth::{AuthRegistry, EntropySource, OsEntropy},
     lifecycle::ServiceLifecycle,
     observability::{DiagnosticWriterHandle, SchedulerHandle, StateWriterHandle},
+    providers::ProviderManagement,
     query::QueryRuntime,
     runtime::{SystemTokenMetadata, TokenMetadataSource},
 };
@@ -27,6 +28,7 @@ pub struct ServerState {
     pub(crate) diagnostics: Option<DiagnosticWriterHandle>,
     pub(crate) state_writer: Option<StateWriterHandle>,
     pub(crate) query: Option<QueryRuntime>,
+    pub(crate) providers: Option<Arc<ProviderManagement>>,
     shutdown: watch::Sender<bool>,
     coordinated_shutdown: bool,
 }
@@ -85,6 +87,7 @@ impl ServerState {
             diagnostics: None,
             state_writer: None,
             query: None,
+            providers: None,
             shutdown,
             coordinated_shutdown: false,
         }
@@ -107,6 +110,11 @@ impl ServerState {
 
     pub fn with_query_runtime(mut self, query: QueryRuntime) -> Self {
         self.query = Some(query);
+        self
+    }
+
+    pub fn with_provider_management(mut self, providers: Arc<ProviderManagement>) -> Self {
+        self.providers = Some(providers);
         self
     }
 

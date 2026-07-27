@@ -119,6 +119,10 @@ impl ProviderCatalog {
         &self.baseline_commit
     }
 
+    pub const fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+
     pub fn providers(&self) -> &[ProviderDefinition] {
         &self.providers
     }
