@@ -38,6 +38,7 @@ All notable WokCore changes are documented in this file.
 - Production pooled upstream execution for OpenAI Responses, OpenAI Chat, Anthropic, Gemini, and Azure with last-moment credential resolution, redirect and proxy denial, DNS-aware endpoint policy, bounded headers/bodies/timeouts, incremental stream decoding, and loopback-only offline verification.
 - Capability-aware image generation and edit execution with bounded JSON, 20 MiB per-file and 50 MiB aggregate multipart limits, randomized private temporary files, cancellation cleanup, streamed upstream uploads, and content-free diagnostics.
 - Completion-only request counters, safe request/attempt diagnostic correlation, bounded 64-row or 250 ms request-metric and account-health batching with zero idle writes, validated metric fields, and complete OpenAPI 3.1 coverage for all seven proxy endpoints.
+- Fixed-name loopback-only Provider simulator with strict bounded inert scenarios, deterministic timing, protocol-shaped JSON/SSE for five upstream adapters, failure/fragmentation/cancellation profiles, content-free counters, and no real Provider or credential capability.
 
 ### Fixed
 

@@ -73,6 +73,18 @@ Request diagnostics contain only stable request/attempt identifiers, Provider/mo
 
 All repository transport and concurrency tests use injected executors or synthetic loopback Providers. They do not read real credentials or Sessions and do not contact a billable endpoint.
 
+## Offline Provider simulator
+
+`wokcore-provider-sim` is a fixed-name, loopback-only synthetic Provider used by tests and performance gates. Its strict TOML scenarios cover OpenAI Responses, OpenAI Chat, Anthropic, Gemini, and Azure-compatible JSON/SSE shapes, deterministic delay and jitter, partial/coalesced/UTF-8-split frames, rate limits, failover, malformed/truncated streams, long reasoning/tool payloads, and cancellation. Scenario files are inert bounded data: unknown fields and non-loopback literal addresses are rejected, and no shell, template, filesystem, DNS, credential, or real Provider capability is available.
+
+The reviewable profiles live in `crates/wokcore-provider-sim/scenarios`. A local development instance can be started with:
+
+```powershell
+cargo +1.97.1 run --locked --offline --bin wokcore-provider-sim -- `
+  --bind 127.0.0.1:40100 `
+  --scenario crates/wokcore-provider-sim/scenarios/standard.toml
+```
+
 ## Development
 
 ```powershell

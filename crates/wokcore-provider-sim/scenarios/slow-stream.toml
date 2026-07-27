@@ -1,0 +1,13 @@
+protocol = "openai_responses"
+stream = true
+status = 200
+ttft_ms = 250
+cadence_ms = 4
+jitter_ms = 2
+event_count = 256
+content_bytes = 1048576
+chunk_bytes = 8192
+terminal = true
+seed = 20260728
+payload_profile = "reasoning"
+frame_mode = "partial"

@@ -2992,6 +2992,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "wokcore-provider-sim"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "serde_json",
+ "tokio",
+ "wokcore-provider-sim-core",
+]
+
+[[package]]
+name = "wokcore-provider-sim-core"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "bytes",
+ "futures-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "toml_edit",
+ "url",
+]
+
+[[package]]
 name = "wokcore-server"
 version = "0.1.0"
 dependencies = [

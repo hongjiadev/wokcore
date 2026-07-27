@@ -1,0 +1,14 @@
+protocol = "openai_chat"
+stream = false
+status = 429
+ttft_ms = 5
+cadence_ms = 0
+jitter_ms = 0
+event_count = 1
+content_bytes = 0
+chunk_bytes = 4096
+terminal = true
+seed = 20260729
+payload_profile = "standard"
+frame_mode = "normal"
+headers = [{ name = "retry-after", value = "2" }]
