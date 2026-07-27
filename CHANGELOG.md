@@ -29,6 +29,7 @@ All notable WokCore changes are documented in this file.
 - Revisioned Provider instance, account, secret-reference, model-alias, route-rule, and default-route configuration with server-only backward compatibility, strict nested schemas, safe endpoint policy, and redacted debug/error output.
 - Immutable lock-free runtime routing snapshots with deterministic explicit/alias/rule/default precedence, enabled-only zero-copy candidate views, exact reasoning-effort mapping, stable public model metadata, and atomic fail-safe reloads.
 - Sharded bounded account health, cooldown, quota, weighted least-use, and ephemeral affinity state with schema-4 coarse Provider/account metadata, atomic bounded replacement batches, unchanged-state zero-write replay, and removal of legacy raw affinity persistence.
+- Cancellation-safe Provider execution with a fixed two-attempt pre-visible retry window, authentication-preserving account failover, bounded server delays and retained request bodies, and fixed-size content-free attempt diagnostics without a proxy concurrency semaphore.
 
 ### Fixed
 

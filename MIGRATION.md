@@ -325,3 +325,17 @@ Private pre-rewrite recovery material is excluded from this public repository.
   - seven fixed-host schema-4 migration, atomic batch, zero-WAL replay, bounded replacement, privacy, and writer-queue tests;
   - complete Windows workspace suite through `E:/Projects/wokcore/target/wokcore-test-host.exe`;
   - engine/storage Clippy with `-D warnings`, rustfmt, locked offline metadata, and public repository hygiene checks.
+
+## Runtime foundation 15: pre-visible retry and account failover
+
+- Original WokCore implementation; no external retry, execution, or upstream transport code is imported.
+- An execution request borrows its immutable account candidates and retains one bounded shared body only for the execution window. It does not allocate a per-request candidate collection or introduce a global semaphore, queue, or artificial Provider concurrency limit.
+- Each request has at most two total upstream attempts. Only rate limits, server failures, timeouts, and resets that occur before any response becomes client-visible may retry; any failure after visibility and all credential, request, policy, or unclassified failures terminate immediately.
+- Retry selection remains within the request's authentication kind. Account observations feed the existing bounded cooldown/quarantine state so an eligible alternative is selected without crossing credential types.
+- Server retry hints are bounded by policy, waits and in-flight attempts are cancellation-safe, and the retained request body is released when execution returns.
+- Attempt history has exactly two optional slots and records only stable request, attempt, Provider, account, boundary, failure kind, and status metadata. It never records request bodies, stream content, credentials, headers, cookies, or raw tokens.
+- Verification:
+  - eight fixed-host execution tests covering attempt count, visibility, cancellation, authentication isolation, health-driven failover, delay bounds, body lifetime, and diagnostic privacy;
+  - fixed-host weighted-selection and affinity regressions;
+  - complete Windows workspace suite through `E:/Projects/wokcore/target/wokcore-test-host.exe`;
+  - workspace Clippy with `-D warnings`, rustfmt, locked offline checks, and public repository hygiene checks.

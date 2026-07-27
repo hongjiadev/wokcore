@@ -208,10 +208,6 @@ impl AccountState {
             updated_at_ms: self.updated_at_ms,
         }
     }
-
-    fn is_eligible(&self) -> bool {
-        !self.quarantined && self.cooldown_until_ms.is_none() && self.quota_remaining != Some(0)
-    }
 }
 
 pub struct AccountHealthTable {
@@ -395,28 +391,36 @@ impl AccountHealthTable {
         affinity_account: Option<&AccountId>,
         now_ms: u64,
     ) -> Result<AccountChoice<'a>, SelectionError> {
-        if let Some(account_id) = affinity_account
-            && let Some(candidate) = candidates.iter().copied().find(|candidate| {
-                candidate.authentication == authentication && candidate.account_id == account_id
-            })
-            && self.eligible(candidate.account_id, now_ms)?
-        {
-            self.mark_selected(candidate.account_id, now_ms)?;
-            return Ok(AccountChoice {
-                account_id: candidate.account_id,
-                origin: AccountChoiceOrigin::Affinity,
-            });
-        }
+        self.select_from(
+            candidates.iter().copied(),
+            authentication,
+            affinity_account,
+            now_ms,
+        )
+    }
 
+    pub fn select_from<'a>(
+        &self,
+        candidates: impl IntoIterator<Item = AccountCandidate<'a>>,
+        authentication: AccountAuthentication,
+        affinity_account: Option<&AccountId>,
+        now_ms: u64,
+    ) -> Result<AccountChoice<'a>, SelectionError> {
         let mut best: Option<(AccountCandidate<'a>, AccountStatus)> = None;
-        for candidate in candidates
-            .iter()
-            .copied()
-            .filter(|candidate| candidate.authentication == authentication)
-        {
+        for candidate in candidates {
+            if candidate.authentication != authentication {
+                continue;
+            }
             let status = self.status(candidate.account_id, now_ms)?;
             if status.kind != AccountStatusKind::Healthy {
                 continue;
+            }
+            if affinity_account == Some(candidate.account_id) {
+                self.mark_selected(candidate.account_id, now_ms)?;
+                return Ok(AccountChoice {
+                    account_id: candidate.account_id,
+                    origin: AccountChoiceOrigin::Affinity,
+                });
             }
             let replace = best.as_ref().is_none_or(|(current, current_status)| {
                 compare_weighted_usage(candidate, status, *current, *current_status)
@@ -432,15 +436,6 @@ impl AccountHealthTable {
             account_id: candidate.account_id,
             origin: AccountChoiceOrigin::WeightedLeastRecentlyUsed,
         })
-    }
-
-    fn eligible(&self, account_id: &AccountId, now_ms: u64) -> Result<bool, SelectionError> {
-        let mut shard = self.lock_shard(account_id);
-        let state = shard
-            .get_mut(account_id)
-            .ok_or(AccountStateError::UnknownAccount)?;
-        state.normalize(now_ms);
-        Ok(state.is_eligible())
     }
 
     fn mark_selected(&self, account_id: &AccountId, now_ms: u64) -> Result<(), SelectionError> {
