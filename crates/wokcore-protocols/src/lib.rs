@@ -1,9 +1,10 @@
 pub mod canonical;
+pub mod inbound;
 pub mod stream;
 
-mod inbound;
 mod outbound;
 
+pub use inbound::{InboundCodecV1, InboundLimitsV1};
 pub use outbound::{
     AnthropicCodec, AnthropicEncodeContext, AnthropicResponseTemplate, AnthropicStopReason,
     AnthropicTokenCount, AzureAdapter, AzureConfig, AzureStreamDecoder, ChatCodec,

@@ -2,6 +2,7 @@
 
 pub mod api;
 pub mod auth;
+pub mod data_plane;
 pub mod lifecycle;
 pub mod observability;
 pub mod providers;

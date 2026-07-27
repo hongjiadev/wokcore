@@ -45,7 +45,7 @@ pub enum AdapterKind {
     Cursor,
 }
 
-#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, PartialEq, Deserialize, Serialize)]
 pub struct CanonicalRequest {
     pub request_id: RequestId,
     pub model: PublicModelId,
@@ -55,6 +55,28 @@ pub struct CanonicalRequest {
     pub stream: bool,
     pub reasoning: Option<ReasoningOptions>,
     pub extensions: BTreeMap<String, Value>,
+}
+
+impl fmt::Debug for CanonicalRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let image_items = self
+            .input
+            .iter()
+            .filter(|item| matches!(item, InputItem::ImageUrl { .. }))
+            .count();
+        formatter
+            .debug_struct("CanonicalRequest")
+            .field("request_id", &self.request_id)
+            .field("model", &self.model)
+            .field("has_thread_key", &self.thread_key.is_some())
+            .field("input_items", &self.input.len())
+            .field("image_items", &image_items)
+            .field("tools", &self.tools.len())
+            .field("stream", &self.stream)
+            .field("has_reasoning", &self.reasoning.is_some())
+            .field("extension_fields", &self.extensions.len())
+            .finish()
+    }
 }
 
 impl CanonicalRequest {

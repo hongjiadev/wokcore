@@ -360,6 +360,7 @@ fn validate_request(
         || wire.messages.len() > limits.max_messages
         || require_max_tokens && wire.max_tokens.is_none_or(|tokens| tokens == 0)
         || !require_max_tokens && wire.max_tokens.is_some()
+        || !require_max_tokens && wire.stream
     {
         return Err(GatewayError::invalid_request());
     }

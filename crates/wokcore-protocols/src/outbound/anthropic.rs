@@ -7,7 +7,7 @@ use serde_json::{Map, Value, json};
 use crate::{
     ANTHROPIC_KNOWN_BLOCKS_EXTENSION_KEY,
     canonical::{CanonicalEvent, CanonicalRequest, GatewayError, PublicModelId, RequestId, Usage},
-    inbound::anthropic::REQUEST_EXTENSION_KEY,
+    inbound::REQUEST_EXTENSION_KEY,
     stream::encode_sse,
 };
 

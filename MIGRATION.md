@@ -356,3 +356,11 @@ Private pre-rewrite recovery material is excluded from this public repository.
   - fixed-host OpenAPI, CLI, production bootstrap, and secret-store safety regressions;
   - complete Windows workspace suite through `E:/Projects/wokcore/target/wokcore-test-host.exe`;
   - workspace Clippy with `-D warnings`, rustfmt, locked offline checks, and public repository hygiene checks.
+
+## Provider HTTP data plane foundation 1: stable front-door contracts
+
+- Source: `crates/wokrouter-daemon/src/data_plane/registry.rs` (blob `16d7c2c6d368687ddb898b6cbd15f349a388c804`) from WokRouter commit `226a40e08ad6c783e996ceed77b8e6dfe2640fb4` is adapted into `crates/wokcore-server/src/data_plane/registry.rs`.
+- The exact seven `/v1` path mappings and protocol family labels are retained. WokCore adds versioned public inbound codec dispatch, strict JSON media types, strictly non-streaming token counting, bounded canonical and recursively retained semantic-identifier validation, and summaries that contain only request/model identifiers, flags, and counts.
+- The canonical debug representation omits prompt, response, tool, image, extension, and thread-key content. Header, cookie, authorization, and credential values are not represented by these request types.
+- No WokRouter listener, authentication, routing, executor, network transport, model endpoint, image implementation, TLS, LAN, or metrics code is imported in this foundation.
+- This layer performs no DNS lookup, credential resolution, filesystem write, Provider request, or network operation.

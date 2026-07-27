@@ -40,6 +40,8 @@ The initial WokCore domain types were migrated from WokRouter commit `226a40e08a
 
 The initial WokCore protocol substrate and fixtures were migrated from WokRouter commit `226a40e08ad6c783e996ceed77b8e6dfe2640fb4`. Package renames and the exact source mapping are recorded in `MIGRATION.md`.
 
+The WokCore data-plane protocol registry is adapted from WokRouter commit `226a40e08ad6c783e996ceed77b8e6dfe2640fb4`. The exact source path, blob, public-codec boundary, bounded canonical validation, and deliberate omissions are recorded in `MIGRATION.md`.
+
 The initial WokCore configuration storage was migrated from WokRouter commit `226a40e08ad6c783e996ceed77b8e6dfe2640fb4`. Its exact source-path and blob mapping, package rename, removed UI/LAN fields, validation adaptation, and retained atomic-write behavior are recorded in `MIGRATION.md`.
 
 The initial WokCore secret-storage backends were migrated from WokRouter commit `226a40e08ad6c783e996ceed77b8e6dfe2640fb4`. Their exact source-path and blob mapping, WokCore native service identity, blocking keyring boundary, 64 KiB headless input limit, fail-closed permission adaptations, and structural offline native-credential test gate are recorded in `MIGRATION.md`.
