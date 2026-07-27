@@ -951,24 +951,33 @@ model = "synthetic"
             -WorkingDirectory $repositoryRoot `
             -ArtifactDirectory $artifactDirectory `
             -Name "warmup-long-500"
-        $warmupResult = Invoke-WokCoreLoadPhase `
-            -LoadGenerator $loadGeneratorExecutable `
-            -Token $token `
-            -Target "http://127.0.0.1:$corePort" `
-            -Concurrency 500 `
-            -PayloadProfile "long-reasoning" `
-            -PhaseName "active" `
-            -WokCoreProcess $wokcore `
-            -WokCoreExecutable $wokcoreExecutable `
-            -SimulatorProcess $simulator `
-            -WorkingDirectory $repositoryRoot `
-            -ArtifactDirectory $artifactDirectory `
-            -RampMilliseconds 250
-        if (
-            [uint64] $warmupResult.Load.errors -ne 0 -or
-            [uint64] $warmupResult.Load.peak_active -ne 500
-        ) {
-            throw "Synthetic WokCore warmup did not complete exactly."
+        foreach ($warmupPass in @(
+            "warmup-primary-500",
+            "warmup-stabilize-500"
+        )) {
+            $warmupResult = Invoke-WokCoreLoadPhase `
+                -LoadGenerator $loadGeneratorExecutable `
+                -Token $token `
+                -Target "http://127.0.0.1:$corePort" `
+                -Concurrency 500 `
+                -PayloadProfile "long-reasoning" `
+                -PhaseName "active" `
+                -WokCoreProcess $wokcore `
+                -WokCoreExecutable $wokcoreExecutable `
+                -SimulatorProcess $simulator `
+                -WorkingDirectory $repositoryRoot `
+                -ArtifactDirectory $artifactDirectory `
+                -RampMilliseconds 250
+            if (
+                [uint64] $warmupResult.Load.started -ne 500 -or
+                [uint64] $warmupResult.Load.active -ne 0 -or
+                [uint64] $warmupResult.Load.peak_active -ne 500 -or
+                [uint64] $warmupResult.Load.completed -ne 500 -or
+                [uint64] $warmupResult.Load.cancelled -ne 0 -or
+                [uint64] $warmupResult.Load.errors -ne 0
+            ) {
+                throw "Synthetic WokCore $warmupPass did not complete exactly."
+            }
         }
         Stop-WokCoreGateProcess -Process $simulator
         $simulator = $null
@@ -1026,7 +1035,8 @@ model = "synthetic"
             -WokCoreExecutable $wokcoreExecutable `
             -SimulatorProcess $simulator `
             -WorkingDirectory $repositoryRoot `
-            -ArtifactDirectory $artifactDirectory
+            -ArtifactDirectory $artifactDirectory `
+            -SampleDurationSeconds 5
         Stop-WokCoreGateProcess -Process $simulator
         $simulator = $null
         if (-not (Test-WokCorePortAvailable -Port $simulatorPort)) {

@@ -126,7 +126,16 @@ fn profile_fixtures_cover_bounded_standard_reasoning_tool_and_failure_shapes() {
     assert!(standard.schedule().unwrap().total_bytes() >= 32 * 1024);
     assert_eq!(slow.protocol(), Protocol::OpenAiChat);
     assert_eq!(slow.payload_profile(), PayloadProfile::Reasoning);
-    assert!(slow.schedule().unwrap().total_bytes() >= 1024 * 1024);
+    let slow_schedule = slow.schedule().unwrap();
+    assert!(slow_schedule.total_bytes() >= 1024 * 1024);
+    assert!(
+        slow_schedule
+            .chunks()
+            .iter()
+            .map(|chunk| chunk.delay())
+            .sum::<Duration>()
+            >= Duration::from_secs(5)
+    );
     assert_eq!(cancellation.payload_profile(), PayloadProfile::Tool);
     assert!(cancellation.schedule().unwrap().chunks().len() <= 128);
     assert!(malformed.schedule().unwrap().chunks().iter().any(|chunk| {

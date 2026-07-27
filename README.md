@@ -89,12 +89,12 @@ cargo +1.97.1 run --locked --offline --bin wokcore-provider-sim -- `
 
 The Windows release gate builds and launches only the fixed `wokcore.exe`, `wokcore-provider-sim.exe`, and `wokcore-loadgen.exe` names. It isolates `APPDATA`, `LOCALAPPDATA`, `HOME`, and `USERPROFILE`, supplies an accountless local Provider configuration, denies ambient proxy use, and permits only literal loopback traffic. No real Provider, credential, Session, prompt, response, or tool payload is available to the run.
 
-After a representative 500-stream long-reasoning synthetic warmup and a 10-second settle, the hard Windows thresholds in `tests/performance/provider-gates.toml` are:
+After two identical representative 500-stream long-reasoning synthetic stabilization passes and a 10-second settle, the hard Windows thresholds in `tests/performance/provider-gates.toml` are:
 
 - warmed idle private working set at or below 64 MiB;
 - 500 active standard SSE streams at or below 512 MiB private working set;
 - private working set 60 seconds after completion at or below 1.5 times warmed idle;
-- WokCore disk writes at or below 128 KiB/s during 500 long streams;
+- WokCore disk writes at or below 128 KiB/s across a 5-second active window with 500 long streams;
 - a reported 1,000-active-stream observation with no crash, incomplete task, request error, handle/thread leak, or sustained unbounded memory growth.
 
 The gate has no request semaphore and does not reject work because the requested concurrency was reached. Missing, restarted, path-mismatched, counter-rollback, incomplete, or ambiguous samples fail closed.

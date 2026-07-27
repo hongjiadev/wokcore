@@ -253,6 +253,9 @@ foreach ($required in @(
     'catalog_id = "ollama"',
     'endpoint = "http://127.0.0.1:',
     'kind = "local"',
+    'warmup-primary-500',
+    'warmup-stabilize-500',
+    '-SampleDurationSeconds 5',
     'Provider gate evidence must remain outside the public repository.',
     'Remove-WokCoreNewSyntheticCredential'
 )) {

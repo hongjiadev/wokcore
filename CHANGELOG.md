@@ -46,6 +46,7 @@ All notable WokCore changes are documented in this file.
 
 ### Fixed
 
+- Stabilized exact Windows recovery and long-stream write-rate evidence with two identical 500-stream warmup passes and a 5-second active disk window, without changing any hard threshold.
 - Session state now enforces monotonic same-generation appends, immutable same-position parser checkpoints, complete current-cursor reloads, lineage-safe resume, externally rebuildable validated page keys, source-derived effective availability, source-driven current-generation paging that ignores hidden-generation volume, transactional generation compare-and-swap updates, typed supplemental drop outcomes, exact cleanup byte budgets, and three-batch interruption coverage.
 - Codex Session scans isolate malformed or resource-limited sources, preserve the last promoted generation, detect same-identity rewrites at the committed cursor boundary, resume interrupted candidates across appends and live-to-archive moves, and perform unchanged scans without durable writes.
 - Live diagnostic queries and exports now tolerate the writer-owned empty active segment by using the complete in-memory ring copy while continuing to fail closed for any older unreadable segment.
