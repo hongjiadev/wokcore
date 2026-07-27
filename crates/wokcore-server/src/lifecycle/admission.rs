@@ -111,6 +111,7 @@ pub(crate) struct SharedLifecycle {
     activity_revision: AtomicU64,
     last_activity_tick_millis: AtomicU64,
     zero_active: Notify,
+    idle_zero_active: Notify,
     #[cfg(test)]
     test_hooks: AdmissionTestHooks,
 }
@@ -124,6 +125,7 @@ impl SharedLifecycle {
             activity_revision: AtomicU64::new(0),
             last_activity_tick_millis: AtomicU64::new(monotonic_tick_millis()),
             zero_active: Notify::new(),
+            idle_zero_active: Notify::new(),
             #[cfg(test)]
             test_hooks: AdmissionTestHooks::default(),
         }
@@ -193,6 +195,10 @@ impl SharedLifecycle {
         }
     }
 
+    pub(crate) async fn wait_for_idle_zero_transition(&self) {
+        self.idle_zero_active.notified().await;
+    }
+
     fn decrement_active(&self) {
         #[cfg(test)]
         self.test_hooks
@@ -204,6 +210,9 @@ impl SharedLifecycle {
         }
         if outcome == DecrementOutcome::BecameZero {
             self.zero_active.notify_waiters();
+            // The idle-memory observer is the sole consumer. A stored single permit
+            // coalesces bursts without making request completion perform reclamation.
+            self.idle_zero_active.notify_one();
         }
     }
 

@@ -19,6 +19,7 @@ bytes.workspace = true
 futures-core.workspace = true
 getrandom.workspace = true
 http-body.workspace = true
+libc.workspace = true
 notify.workspace = true
 secrecy.workspace = true
 serde.workspace = true

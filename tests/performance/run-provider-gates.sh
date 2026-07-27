@@ -551,6 +551,20 @@ PY
     return 1
 }
 
+report_wokcore_start_failure() {
+    local path="$ARTIFACT_DIRECTORY/wokcore.stderr"
+    [[ -f "$path" ]] || return 0
+    local size
+    size="$(wc -c <"$path" | tr -d '[:space:]')"
+    [[ "$size" =~ ^[0-9]+$ ]] || return 0
+    if ((size == 0)); then
+        return 0
+    fi
+    printf '%s\n' "portable provider gate: bounded WokCore startup diagnostics follow" >&2
+    tail -c 4096 "$path" >&2
+    printf '\n' >&2
+}
+
 assert_exact_process_path() {
     local pid="$1"
     local expected="$2"
@@ -740,10 +754,14 @@ start_runtime() {
         2>"$ARTIFACT_DIRECTORY/wokcore.stderr" &
     WOKCORE_PID=$!
     assert_exact_process_path "$WOKCORE_PID" "$WOKCORE_EXECUTABLE"
-    wait_for_loopback_port "$CORE_PORT" "$WOKCORE_PID" ||
+    wait_for_loopback_port "$CORE_PORT" "$WOKCORE_PID" || {
+        report_wokcore_start_failure
         fail "WokCore did not become ready"
-    wait_for_wokcore_ready "$WOKCORE_PID" ||
+    }
+    wait_for_wokcore_ready "$WOKCORE_PID" || {
+        report_wokcore_start_failure
         fail "WokCore management plane did not become ready"
+    }
 
     monitor_runtime &
     MONITOR_PID=$!

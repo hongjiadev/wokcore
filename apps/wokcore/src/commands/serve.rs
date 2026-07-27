@@ -18,7 +18,7 @@ use wokcore_platform::{DiscoveryRecord, DiscoveryStore, PlatformError, RuntimeLe
 use wokcore_server::{
     RunningServer, ServerShutdown, ServerState,
     auth::{AuthError, AuthMetadataStore, AuthRegistry, StateAuthMetadataStore},
-    lifecycle::ServiceLifecycle,
+    lifecycle::{PreparedIdleMemoryReclaimer, RunningIdleMemoryReclaimer, ServiceLifecycle},
     observability::{
         PreparedDiagnosticWriter, PreparedScheduler, PreparedStateWriter,
         ProductionSessionScanBackend, RunningDiagnosticWriter, RunningScheduler,
@@ -209,7 +209,9 @@ async fn start_service(
     let port = config.config.server.port;
     let provider_management = Arc::new(
         ProviderManagement::from_loaded(config_store, config, dependencies.secrets.clone())
-            .map_err(map_provider_management_error)?,
+            .map_err(|error| {
+                map_provider_management_error(error, "startup_provider_management_failed")
+            })?,
     );
     let account_health = provider_management.account_health();
     if port == 0 {
@@ -247,7 +249,9 @@ async fn start_service(
     provider_management
         .protect_secret_ref(management_binding.secret_ref)
         .await
-        .map_err(map_provider_management_error)?;
+        .map_err(|error| {
+            map_provider_management_error(error, "startup_management_secret_protection_failed")
+        })?;
     let session_domain_key = auth.session_domain_key();
     ensure_not_cancelled(cancelled)?;
     let (diagnostics, prepared_diagnostics) = PreparedDiagnosticWriter::open(
@@ -257,9 +261,10 @@ async fn start_service(
             clock: dependencies.clock.clone(),
         }),
     )
-    .map_err(|_| ServeError::Server)?;
+    .map_err(|_| startup_server_error("startup_diagnostics_open_failed"))?;
     let (state_writer, prepared_state_writer) =
-        PreparedStateWriter::open(&dependencies.paths.state_db).map_err(|_| ServeError::Server)?;
+        PreparedStateWriter::open(&dependencies.paths.state_db)
+            .map_err(|_| startup_server_error("startup_state_writer_open_failed"))?;
     let scheduler = if let Some(roots) = dependencies.session_roots.clone() {
         let notification_roots = roots.clone();
         let backend = ProductionSessionScanBackend::open_with_writer(
@@ -274,7 +279,7 @@ async fn start_service(
         .map_err(ServeError::Storage)?;
         let (handle, prepared) =
             PreparedScheduler::new(Arc::new(backend), SchedulerConfig::default())
-                .map_err(|_| ServeError::Server)?;
+                .map_err(|_| startup_server_error("startup_session_scheduler_failed"))?;
         Some((
             handle,
             prepared.with_filesystem_notifications(notification_roots),
@@ -319,10 +324,11 @@ async fn start_service(
     }
     let running_diagnostics = prepared_diagnostics
         .start()
-        .map_err(|_| ServeError::Server)?;
+        .map_err(|_| startup_server_error("startup_diagnostics_task_failed"))?;
     let running_state_writer = match prepared_state_writer.start() {
         Ok(running) => running,
         Err(_) => {
+            report_startup_failure("startup_state_writer_task_failed");
             let _ = running_diagnostics.shutdown().await;
             return Err(ServeError::Server);
         }
@@ -330,6 +336,7 @@ async fn start_service(
     let query = match QueryService::start(DEFAULT_QUERY_WORKERS) {
         Ok(query) => query,
         Err(_) => {
+            report_startup_failure("startup_query_service_failed");
             let _ = running_diagnostics.shutdown().await;
             let _ = running_state_writer.checkpoint_and_shutdown(false).await;
             return Err(ServeError::Server);
@@ -401,6 +408,8 @@ async fn start_service(
         shutdown_unpublished_observability(query, running_diagnostics, running_state_writer).await;
         return Err(ServeError::Platform(error));
     }
+    let running_memory_reclaimer =
+        PreparedIdleMemoryReclaimer::for_system(lifecycle.clone()).map(|prepared| prepared.start());
     Ok(StartedService {
         ready: ReadyService {
             instance_id,
@@ -414,6 +423,7 @@ async fn start_service(
         running_query: Some(query),
         running_diagnostics: Some(running_diagnostics),
         running_state_writer: Some(running_state_writer),
+        running_memory_reclaimer,
         stop_requests,
     })
 }
@@ -578,6 +588,7 @@ struct StartedService {
     running_query: Option<QueryService>,
     running_diagnostics: Option<RunningDiagnosticWriter>,
     running_state_writer: Option<RunningStateWriter>,
+    running_memory_reclaimer: Option<RunningIdleMemoryReclaimer>,
     stop_requests: watch::Receiver<bool>,
 }
 
@@ -595,6 +606,12 @@ impl StartedService {
     }
 
     async fn shutdown_observability(&mut self) -> Result<(), ServeError> {
+        let memory_reclaimer_result =
+            if let Some(mut running) = self.running_memory_reclaimer.take() {
+                running.shutdown().await.map_err(|_| ServeError::Server)
+            } else {
+                Ok(())
+            };
         let scheduler_result = if let Some(running) = self.running_scheduler.take() {
             running.shutdown().await.map_err(|_| ServeError::Server)
         } else {
@@ -632,7 +649,8 @@ impl StartedService {
         } else {
             Ok(())
         };
-        scheduler_result
+        memory_reclaimer_result
+            .and(scheduler_result)
             .and(state_flush_result)
             .and(query_result)
             .and(diagnostics_result)
@@ -661,13 +679,25 @@ fn map_auth_error(error: AuthError) -> ServeError {
     }
 }
 
-fn map_provider_management_error(error: ProviderManagementError) -> ServeError {
+fn map_provider_management_error(
+    error: ProviderManagementError,
+    startup_event_code: &'static str,
+) -> ServeError {
     match error {
         ProviderManagementError::InvalidCatalog | ProviderManagementError::InvalidConfiguration => {
             ServeError::InvalidConfig
         }
-        _ => ServeError::Server,
+        _ => startup_server_error(startup_event_code),
     }
+}
+
+fn startup_server_error(event_code: &'static str) -> ServeError {
+    report_startup_failure(event_code);
+    ServeError::Server
+}
+
+fn report_startup_failure(event_code: &'static str) {
+    eprintln!("wokcore startup event_code={event_code}");
 }
 
 struct InjectedTokenMetadata {

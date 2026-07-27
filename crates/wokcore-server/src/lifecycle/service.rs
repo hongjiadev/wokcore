@@ -238,6 +238,10 @@ impl ServiceLifecycle {
         self.state.shared.wait_for_zero_active().await;
     }
 
+    pub(crate) async fn wait_for_idle_zero_transition(&self) {
+        self.state.shared.wait_for_idle_zero_transition().await;
+    }
+
     async fn wait_for_drain(&self, drain_generation: u64) -> DrainWait {
         let mut phase_watch = self.state.phase_watch.subscribe();
         loop {

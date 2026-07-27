@@ -8,6 +8,8 @@ trap - EXIT INT TERM HUP
 
 grep -q 'wait_for_wokcore_ready' "$SCRIPT_DIRECTORY/run-provider-gates.sh"
 grep -q '"status" "--json"' "$SCRIPT_DIRECTORY/run-provider-gates.sh"
+grep -q 'report_wokcore_start_failure' "$SCRIPT_DIRECTORY/run-provider-gates.sh"
+grep -q 'tail -c 4096' "$SCRIPT_DIRECTORY/run-provider-gates.sh"
 
 (
     PROFILE=""
