@@ -1011,6 +1011,10 @@ fn open_absolute_directory_chain(path: &Path) -> Result<DirectoryChain, SessionE
     if !path.is_absolute() {
         return Err(SessionError::UnsafePath);
     }
+    #[cfg(target_vendor = "apple")]
+    let normalized_path = normalize_apple_system_root_alias(path)?;
+    #[cfg(target_vendor = "apple")]
+    let path = normalized_path.as_path();
     let root_path = PathBuf::from("/");
     let root_file = fs::OpenOptions::new()
         .read(true)
@@ -1044,6 +1048,35 @@ fn open_absolute_directory_chain(path: &Path) -> Result<DirectoryChain, SessionE
     }
     chain.root_index = chain.directories.len() - 1;
     Ok(chain)
+}
+
+#[cfg(target_vendor = "apple")]
+fn normalize_apple_system_root_alias(path: &Path) -> Result<PathBuf, SessionError> {
+    let mut components = path.components();
+    if !matches!(components.next(), Some(Component::RootDir)) {
+        return Err(SessionError::UnsafePath);
+    }
+    let Some(Component::Normal(first)) = components.next() else {
+        return Ok(path.to_path_buf());
+    };
+    if ![OsStr::new("var"), OsStr::new("tmp"), OsStr::new("etc")].contains(&first) {
+        return Ok(path.to_path_buf());
+    }
+
+    let expected = Path::new("/private").join(first);
+    let alias = Path::new("/").join(first);
+    if fs::canonicalize(alias).map_err(map_session_io)? != expected {
+        return Err(SessionError::UnsafePath);
+    }
+
+    let mut normalized = expected;
+    for component in components {
+        let Component::Normal(name) = component else {
+            return Err(SessionError::UnsafePath);
+        };
+        normalized.push(name);
+    }
+    Ok(normalized)
 }
 
 #[cfg(windows)]
