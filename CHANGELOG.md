@@ -35,6 +35,7 @@ All notable WokCore changes are documented in this file.
 - Proxy-scope-only data-plane routes with strict protocol-specific methods and media types, OpenAI/Anthropic-safe errors, separate 16 MiB JSON and 20/50 MiB image limits, and cancellation-safe unlimited lifecycle admission.
 - Injected non-streaming Provider execution for Responses, Chat Completions, Anthropic Messages, Anthropic token counting, and local model snapshots, with bounded canonical aggregation, pre-visible failover, safe request correlation, and client-drop cancellation.
 - Capacity-two Provider event streams with upstream backpressure, first-visible retry closure, client-drop cancellation, incremental Responses/Chat/Anthropic SSE encoding, single terminal protocol errors, and completion-only in-memory runtime counters with no per-event disk writes.
+- Production pooled upstream execution for OpenAI Responses, OpenAI Chat, Anthropic, Gemini, and Azure with last-moment credential resolution, redirect and proxy denial, DNS-aware endpoint policy, bounded headers/bodies/timeouts, incremental stream decoding, and loopback-only offline verification.
 
 ### Fixed
 

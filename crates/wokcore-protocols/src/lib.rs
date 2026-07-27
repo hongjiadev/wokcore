@@ -1,6 +1,7 @@
 pub mod canonical;
 pub mod inbound;
 pub mod stream;
+pub mod upstream;
 
 mod outbound;
 

@@ -6,13 +6,15 @@ use secrecy::{SecretString, zeroize::Zeroizing};
 use uuid::Uuid;
 use wokcore_platform::{AppPaths, DiscoveryRecord, DiscoveryStore, PlatformError};
 use wokcore_server::{
-    auth::EntropySource, lifecycle::ServiceLifecycle, observability::SessionRootPaths,
+    auth::EntropySource, data_plane::UpstreamExecutor, lifecycle::ServiceLifecycle,
+    observability::SessionRootPaths,
 };
 use wokcore_storage::SecretStore;
 
 pub mod cli;
 mod commands;
 mod production;
+pub mod runtime;
 
 pub use production::run_production;
 
@@ -127,6 +129,7 @@ pub struct RunDependencies {
     pub(crate) lifecycle_observer: Arc<dyn LifecycleObserver>,
     pub(crate) secret_input: Arc<dyn SecretInput>,
     pub(crate) session_roots: Option<SessionRootPaths>,
+    pub(crate) upstream_executor: Option<Arc<dyn UpstreamExecutor>>,
     pub(crate) drain_timeout: Duration,
 }
 
@@ -153,6 +156,7 @@ impl RunDependencies {
             lifecycle_observer: Arc::new(NoopLifecycleObserver),
             secret_input: Arc::new(UnavailableSecretInput),
             session_roots: None,
+            upstream_executor: None,
             drain_timeout: Duration::from_secs(30),
         }
     }
@@ -180,6 +184,11 @@ impl RunDependencies {
 
     pub fn with_secret_input(mut self, secret_input: Arc<dyn SecretInput>) -> Self {
         self.secret_input = secret_input;
+        self
+    }
+
+    pub fn with_upstream_executor(mut self, upstream_executor: Arc<dyn UpstreamExecutor>) -> Self {
+        self.upstream_executor = Some(upstream_executor);
         self
     }
 

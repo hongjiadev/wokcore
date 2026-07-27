@@ -11,7 +11,7 @@ use wokcore_core::{
 use wokcore_engine::{
     accounts::AccountAuthentication,
     catalog::ProviderCatalog,
-    routing::{RouteError, RouteOrigin, RouteRequest},
+    routing::{EndpointAccess, RouteError, RouteOrigin, RouteRequest},
     snapshot::{RuntimeSnapshot, SnapshotBuilder, SnapshotError, SnapshotPublisher},
 };
 
@@ -282,6 +282,44 @@ fn builder_is_deterministic_and_candidates_borrow_only_enabled_accounts() {
         first.route(&request(Some("disabled-provider"), "gpt-5.6-sol", None)),
         Err(RouteError::ProviderUnavailable)
     );
+}
+
+#[test]
+fn snapshot_preserves_public_private_and_loopback_endpoint_access() {
+    let catalog = ProviderCatalog::bundled().expect("catalog");
+    let mut private = provider("private", "qwen-cloud");
+    private.endpoint = Some("http://127.0.0.1:19001/v1".to_owned());
+    private.allow_private_network = true;
+    let providers = ProviderConfig {
+        instances: vec![
+            provider("public", "openai-apikey"),
+            provider("loopback", "ollama"),
+            private,
+        ],
+        accounts: vec![
+            account("public-key", "public"),
+            AccountConfig {
+                id: AccountId::new("loopback-local").expect("account"),
+                provider: ProviderId::new("loopback").expect("provider"),
+                enabled: true,
+                auth: AccountAuthConfig::Local,
+            },
+            account("private-key", "private"),
+        ],
+    };
+    let snapshot =
+        RuntimeSnapshot::build(&catalog, &providers, &RoutingConfig::default()).expect("snapshot");
+
+    for (provider, expected) in [
+        ("public", EndpointAccess::PublicOnly),
+        ("loopback", EndpointAccess::LoopbackOnly),
+        ("private", EndpointAccess::PrivateAllowed),
+    ] {
+        let decision = snapshot
+            .route(&request(Some(provider), "model", None))
+            .expect("route");
+        assert_eq!(decision.provider().endpoint_access(), expected);
+    }
 }
 
 fn two_provider_config() -> ProviderConfig {

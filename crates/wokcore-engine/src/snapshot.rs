@@ -13,7 +13,10 @@ use crate::{
     catalog::{AuthKind, ProviderCatalog, ProviderDefinition},
     config::{ProviderConfigError, validate_provider_configuration},
     models::PublicModelMetadata,
-    routing::{RouteAccount, RouteDecision, RouteError, RouteOrigin, RouteProvider, RouteRequest},
+    routing::{
+        EndpointAccess, RouteAccount, RouteDecision, RouteError, RouteOrigin, RouteProvider,
+        RouteRequest,
+    },
 };
 
 #[derive(Clone)]
@@ -259,6 +262,10 @@ fn build_runtime_providers(
             instance.id.clone(),
             instance.catalog_id.clone(),
             endpoint,
+            EndpointAccess::from_configuration(
+                definition.endpoint_policy,
+                instance.allow_private_network,
+            ),
             definition.adapter,
             definition.auth_kind,
             definition.capabilities.clone(),

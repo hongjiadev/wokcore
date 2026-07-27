@@ -8,6 +8,7 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+async-trait.workspace = true
 clap.workspace = true
 reqwest.workspace = true
 secrecy.workspace = true
@@ -18,6 +19,11 @@ tokio.workspace = true
 url.workspace = true
 uuid.workspace = true
 wokcore-core = { version = "0.1.0", path = "../../crates/wokcore-core" }
+wokcore-engine = { version = "0.1.0", path = "../../crates/wokcore-engine" }
 wokcore-platform = { version = "0.1.0", path = "../../crates/wokcore-platform" }
+wokcore-protocols = { version = "0.1.0", path = "../../crates/wokcore-protocols" }
 wokcore-server = { version = "0.1.0", path = "../../crates/wokcore-server" }
 wokcore-storage = { version = "0.1.0", path = "../../crates/wokcore-storage" }
+
+[dev-dependencies]
+axum.workspace = true

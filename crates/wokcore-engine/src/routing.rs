@@ -9,7 +9,7 @@ use wokcore_core::{
 
 use crate::{
     accounts::AccountAuthentication,
-    catalog::{AdapterFamily, AuthKind, ProviderCapabilities},
+    catalog::{AdapterFamily, AuthKind, EndpointPolicy, ProviderCapabilities},
 };
 
 const STANDARD_REASONING_EFFORTS: &[&str] =
@@ -28,6 +28,28 @@ pub enum RouteOrigin {
     Alias,
     Rule,
     Default,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EndpointAccess {
+    PublicOnly,
+    PrivateAllowed,
+    LoopbackOnly,
+}
+
+impl EndpointAccess {
+    pub(crate) const fn from_configuration(
+        policy: EndpointPolicy,
+        allow_private_network: bool,
+    ) -> Self {
+        if allow_private_network {
+            Self::PrivateAllowed
+        } else if matches!(policy, EndpointPolicy::LoopbackHttp) {
+            Self::LoopbackOnly
+        } else {
+            Self::PublicOnly
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -64,6 +86,7 @@ pub struct RouteProvider {
     id: ProviderId,
     catalog_id: ProviderId,
     endpoint: String,
+    endpoint_access: EndpointAccess,
     adapter: AdapterFamily,
     auth_kind: AuthKind,
     capabilities: ProviderCapabilities,
@@ -78,6 +101,7 @@ impl RouteProvider {
         id: ProviderId,
         catalog_id: ProviderId,
         endpoint: String,
+        endpoint_access: EndpointAccess,
         adapter: AdapterFamily,
         auth_kind: AuthKind,
         capabilities: ProviderCapabilities,
@@ -89,6 +113,7 @@ impl RouteProvider {
             id,
             catalog_id,
             endpoint,
+            endpoint_access,
             adapter,
             auth_kind,
             capabilities,
@@ -108,6 +133,10 @@ impl RouteProvider {
 
     pub fn endpoint(&self) -> &str {
         &self.endpoint
+    }
+
+    pub const fn endpoint_access(&self) -> EndpointAccess {
+        self.endpoint_access
     }
 
     pub const fn adapter(&self) -> AdapterFamily {
@@ -133,6 +162,7 @@ impl fmt::Debug for RouteProvider {
             .debug_struct("RouteProvider")
             .field("id", &self.id)
             .field("catalog_id", &self.catalog_id)
+            .field("endpoint_access", &self.endpoint_access)
             .field("adapter", &self.adapter)
             .field("auth_kind", &self.auth_kind)
             .field("account_count", &self.accounts.len())

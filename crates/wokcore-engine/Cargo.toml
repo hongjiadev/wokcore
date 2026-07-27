@@ -13,6 +13,9 @@ doctest = false
 [dependencies]
 arc-swap.workspace = true
 async-trait.workspace = true
+bytes.workspace = true
+reqwest.workspace = true
+secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -21,3 +24,7 @@ tokio.workspace = true
 toml_edit.workspace = true
 url.workspace = true
 wokcore-core = { version = "0.1.0", path = "../wokcore-core" }
+
+[dev-dependencies]
+axum.workspace = true
+futures-util.workspace = true

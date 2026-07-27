@@ -205,6 +205,10 @@ impl ProviderManagement {
         Arc::clone(&self.execution.load().snapshot)
     }
 
+    pub fn account_health(&self) -> Arc<AccountHealthTable> {
+        Arc::clone(&self.execution.load().account_health)
+    }
+
     pub(crate) fn execution_snapshot(&self) -> Arc<ProviderExecutionSnapshot> {
         self.execution.load_full()
     }

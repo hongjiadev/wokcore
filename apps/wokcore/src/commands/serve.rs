@@ -211,6 +211,7 @@ async fn start_service(
         ProviderManagement::from_loaded(config_store, config, dependencies.secrets.clone())
             .map_err(map_provider_management_error)?,
     );
+    let account_health = provider_management.account_health();
     if port == 0 {
         return Err(ServeError::InvalidConfig);
     }
@@ -313,6 +314,9 @@ async fn start_service(
     server_state = server_state.with_diagnostics(diagnostics);
     server_state = server_state.with_state_writer(state_writer);
     server_state = server_state.with_provider_management(provider_management);
+    if let Some(upstream_executor) = dependencies.upstream_executor.clone() {
+        server_state = server_state.with_upstream_executor(upstream_executor, account_health);
+    }
     let running_diagnostics = prepared_diagnostics
         .start()
         .map_err(|_| ServeError::Server)?;

@@ -20,7 +20,7 @@ use wokcore_engine::{
         TokioRetryDelay, UpstreamAttempt,
     },
     retry::RetryPolicy,
-    routing::{RouteDecision, RouteError, RouteRequest},
+    routing::{EndpointAccess, RouteDecision, RouteError, RouteRequest},
 };
 use wokcore_protocols::canonical::{
     CanonicalEvent, CanonicalRequest, GatewayError, PublicModelId, Usage,
@@ -99,12 +99,57 @@ pub struct UpstreamExecutionRequest {
     account_id: AccountId,
     adapter: AdapterFamily,
     endpoint: Arc<str>,
+    endpoint_access: EndpointAccess,
     model: Arc<str>,
     auth: AccountAuthConfig,
     canonical: Arc<CanonicalRequest>,
 }
 
 impl UpstreamExecutionRequest {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        request_id: impl Into<String>,
+        attempt_ordinal: u8,
+        operation: UpstreamOperation,
+        provider_id: ProviderId,
+        account_id: AccountId,
+        adapter: AdapterFamily,
+        endpoint: impl Into<String>,
+        endpoint_access: EndpointAccess,
+        model: impl Into<String>,
+        auth: AccountAuthConfig,
+        canonical: CanonicalRequest,
+    ) -> Result<Self, InvalidUpstreamExecutionRequest> {
+        let request_id = request_id.into();
+        let endpoint = endpoint.into();
+        let model = model.into();
+        if ExecutionRequestId::new(request_id.clone()).is_err()
+            || attempt_ordinal == 0
+            || endpoint.is_empty()
+            || endpoint.len() > 2_048
+            || url::Url::parse(&endpoint).is_err()
+            || model.is_empty()
+            || model.len() > 256
+            || model.chars().any(char::is_control)
+            || canonical.model.as_str() != model
+        {
+            return Err(InvalidUpstreamExecutionRequest);
+        }
+        Ok(Self {
+            request_id: request_id.into(),
+            attempt_ordinal,
+            operation,
+            provider_id,
+            account_id,
+            adapter,
+            endpoint: endpoint.into(),
+            endpoint_access,
+            model: model.into(),
+            auth,
+            canonical: Arc::new(canonical),
+        })
+    }
+
     pub fn request_id(&self) -> &str {
         &self.request_id
     }
@@ -133,6 +178,10 @@ impl UpstreamExecutionRequest {
         &self.endpoint
     }
 
+    pub const fn endpoint_access(&self) -> EndpointAccess {
+        self.endpoint_access
+    }
+
     pub fn model(&self) -> &str {
         &self.model
     }
@@ -157,11 +206,16 @@ impl fmt::Debug for UpstreamExecutionRequest {
             .field("account_id", &self.account_id)
             .field("adapter", &self.adapter)
             .field("endpoint", &"[redacted]")
+            .field("endpoint_access", &self.endpoint_access)
             .field("model", &self.model)
             .field("canonical", &self.canonical)
             .finish()
     }
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("the upstream execution request is invalid")]
+pub struct InvalidUpstreamExecutionRequest;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum UpstreamExecutionOutput {
@@ -719,6 +773,7 @@ impl UpstreamAttempt for RequestAttempt {
             account_id: context.account_id().clone(),
             adapter: self.route.provider().adapter(),
             endpoint: Arc::from(self.route.provider().endpoint()),
+            endpoint_access: self.route.provider().endpoint_access(),
             model: Arc::from(context.model()),
             auth,
             canonical: Arc::clone(&self.canonical),

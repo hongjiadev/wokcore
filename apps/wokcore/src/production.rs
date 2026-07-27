@@ -21,6 +21,7 @@ use crate::{
     SecretInput, ShutdownSignal,
     cli::{Cli, Command},
     run_with_dependencies,
+    runtime::production_upstream_executor,
 };
 
 pub async fn run_production(cli: Cli) -> ExitCode {
@@ -37,9 +38,25 @@ pub async fn run_production(cli: Cli) -> ExitCode {
         }
     };
     let entropy: Arc<dyn EntropySource> = Arc::new(OsEntropy);
+    let secrets = Arc::new(NativeSecretStore::new());
+    let upstream_executor = if matches!(&cli.command, Command::Serve(_)) {
+        match production_upstream_executor(secrets.clone()) {
+            Ok(executor) => Some(executor),
+            Err(_) => {
+                if requests_json(&cli) {
+                    let _ = output.write_stdout("{\"code\":\"invalid_runtime\"}\n");
+                } else {
+                    let _ = output.write_stderr("WokCore upstream runtime is unavailable.\n");
+                }
+                return ExitCode::InternalFailure;
+            }
+        }
+    } else {
+        None
+    };
     let mut dependencies = RunDependencies::new(
         paths,
-        Arc::new(NativeSecretStore::new()),
+        secrets,
         entropy.clone(),
         Arc::new(SystemClock),
         Arc::new(SystemIds::new(entropy)),
@@ -47,6 +64,9 @@ pub async fn run_production(cli: Cli) -> ExitCode {
         Arc::new(ControlCSignal),
     )
     .with_secret_input(Arc::new(StandardSecretInput));
+    if let Some(upstream_executor) = upstream_executor {
+        dependencies = dependencies.with_upstream_executor(upstream_executor);
+    }
     if let Some(session_roots) = SessionRootPaths::discover() {
         dependencies = dependencies.with_session_roots(session_roots);
     }
