@@ -1,0 +1,127 @@
+name: Release verification
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: release-verification-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows-release-gate:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      OPENAI_API_KEY: ""
+      ANTHROPIC_API_KEY: ""
+      GOOGLE_API_KEY: ""
+      GEMINI_API_KEY: ""
+      AZURE_OPENAI_API_KEY: ""
+      AZURE_OPENAI_ENDPOINT: ""
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: 1.97.1
+          target: x86_64-pc-windows-msvc
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+      - name: Run exact Windows release gates
+        shell: powershell
+        run: >-
+          powershell.exe -NoProfile -ExecutionPolicy Bypass
+          -File tests/performance/run-provider-gates.ps1
+          -Profile release
+          -OutputDirectory "${{ runner.temp }}\wokcore-performance\windows"
+          -TargetDirectory "${{ github.workspace }}\target"
+      - name: Upload bounded Windows release evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-provider-gates-windows-x64
+          path: ${{ runner.temp }}\wokcore-performance\windows\provider-gates-report.json
+          if-no-files-found: warn
+          retention-days: 14
+
+  portable-soak:
+    name: portable-soak (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            platform: linux
+          - os: macos-15
+            target: aarch64-apple-darwin
+            platform: macos
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      OPENAI_API_KEY: ""
+      ANTHROPIC_API_KEY: ""
+      GOOGLE_API_KEY: ""
+      GEMINI_API_KEY: ""
+      AZURE_OPENAI_API_KEY: ""
+      AZURE_OPENAI_ENDPOINT: ""
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: 1.97.1
+          target: ${{ matrix.target }}
+      - name: Install private Linux Secret Service runtime
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes dbus-x11 gnome-keyring
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+      - name: Build fixed release executables offline
+        run: >-
+          cargo build
+          --workspace
+          --all-features
+          --release
+          --locked
+          --offline
+          --target-dir "${{ github.workspace }}/target"
+      - name: Run Linux release soak
+        if: runner.os == 'Linux'
+        run: >-
+          dbus-run-session --
+          env WOKCORE_PRIVATE_DBUS=1
+          bash tests/performance/run-provider-gates.sh
+          --profile soak
+          --output-directory "${{ runner.temp }}/wokcore-performance/${{ matrix.target }}"
+          --target-directory "${{ github.workspace }}/target"
+          --skip-build
+      - name: Run macOS release soak
+        if: runner.os == 'macOS'
+        run: >-
+          bash tests/performance/run-provider-gates.sh
+          --profile soak
+          --output-directory "${{ runner.temp }}/wokcore-performance/${{ matrix.target }}"
+          --target-directory "${{ github.workspace }}/target"
+          --skip-build
+      - name: Upload bounded portable soak evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-provider-gates-${{ matrix.target }}
+          path: ${{ runner.temp }}/wokcore-performance/${{ matrix.target }}/provider-gates-${{ matrix.platform }}-soak.json
+          if-no-files-found: warn
+          retention-days: 14

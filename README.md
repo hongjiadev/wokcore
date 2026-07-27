@@ -110,6 +110,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
 
 The output is one bounded, content-free JSON report. The script refuses to place evidence inside the public repository. Its temporary native management credential is synthetic, scoped to the isolated run, identified by the newly created exact UUID target, deleted after shutdown, and never included in evidence. Pre-existing Credential Manager entries are not modified.
 
+Linux x64 and macOS arm64 CI also run the complete release data path through `tests/performance/run-provider-gates.sh`. The fixed 5-minute pull-request profile checks exact concurrency, cancellation, RSS recovery trend, file-descriptor/task growth, process survival, listener cleanup, and process-scoped loopback-only networking. Manual and release verification use a 30-minute soak. Linux uses a private temporary Secret Service session and macOS uses a temporary Keychain; both isolate application/Session roots and receive no real Provider credentials.
+
 ## Development
 
 ```powershell

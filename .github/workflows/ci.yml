@@ -3,6 +3,16 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
+    inputs:
+      performance_profile:
+        description: Portable performance profile
+        required: true
+        default: pull-request
+        type: choice
+        options:
+          - pull-request
+          - soak
 
 permissions:
   contents: read
@@ -105,20 +115,159 @@ jobs:
       - name: Check target
         run: cargo check --workspace --all-features --locked --target ${{ matrix.target }}
 
+  performance-policy:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Check portable gate shell syntax
+        run: bash -n tests/performance/run-provider-gates.sh
+      - name: Test portable gate shell logic
+        run: bash tests/performance/run-provider-gates.tests.sh
+      - name: Test Windows resource gate logic
+        shell: pwsh
+        run: pwsh tests/performance/windows-resource-gate.tests.ps1
+      - name: Test exact Provider gate logic
+        shell: pwsh
+        run: pwsh tests/performance/run-provider-gates.tests.ps1
+      - name: Test portable Provider gate policy
+        shell: pwsh
+        run: pwsh tests/performance/portable-provider-gates.tests.ps1
+
+  windows-performance:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      OPENAI_API_KEY: ""
+      ANTHROPIC_API_KEY: ""
+      GOOGLE_API_KEY: ""
+      GEMINI_API_KEY: ""
+      AZURE_OPENAI_API_KEY: ""
+      AZURE_OPENAI_ENDPOINT: ""
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: 1.97.1
+          target: x86_64-pc-windows-msvc
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+      - name: Run exact Windows release gates
+        shell: powershell
+        run: >-
+          powershell.exe -NoProfile -ExecutionPolicy Bypass
+          -File tests/performance/run-provider-gates.ps1
+          -Profile release
+          -OutputDirectory "${{ runner.temp }}\wokcore-performance\windows"
+          -TargetDirectory "${{ github.workspace }}\target"
+      - name: Upload bounded Windows performance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: provider-gates-windows-x64
+          path: ${{ runner.temp }}\wokcore-performance\windows\provider-gates-report.json
+          if-no-files-found: warn
+          retention-days: 7
+
+  portable-performance:
+    name: portable-performance (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            platform: linux
+          - os: macos-15
+            target: aarch64-apple-darwin
+            platform: macos
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      PERFORMANCE_PROFILE: ${{ github.event_name == 'workflow_dispatch' && inputs.performance_profile || 'pull-request' }}
+      OPENAI_API_KEY: ""
+      ANTHROPIC_API_KEY: ""
+      GOOGLE_API_KEY: ""
+      GEMINI_API_KEY: ""
+      AZURE_OPENAI_API_KEY: ""
+      AZURE_OPENAI_ENDPOINT: ""
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: 1.97.1
+          target: ${{ matrix.target }}
+      - name: Install private Linux Secret Service runtime
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes dbus-x11 gnome-keyring
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+      - name: Build fixed release executables offline
+        run: >-
+          cargo build
+          --workspace
+          --all-features
+          --release
+          --locked
+          --offline
+          --target-dir "${{ github.workspace }}/target"
+      - name: Run Linux portable Provider gate
+        if: runner.os == 'Linux'
+        run: >-
+          dbus-run-session --
+          env WOKCORE_PRIVATE_DBUS=1
+          bash tests/performance/run-provider-gates.sh
+          --profile "$PERFORMANCE_PROFILE"
+          --output-directory "${{ runner.temp }}/wokcore-performance/${{ matrix.target }}"
+          --target-directory "${{ github.workspace }}/target"
+          --skip-build
+      - name: Run macOS portable Provider gate
+        if: runner.os == 'macOS'
+        run: >-
+          bash tests/performance/run-provider-gates.sh
+          --profile "$PERFORMANCE_PROFILE"
+          --output-directory "${{ runner.temp }}/wokcore-performance/${{ matrix.target }}"
+          --target-directory "${{ github.workspace }}/target"
+          --skip-build
+      - name: Upload bounded portable performance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: provider-gates-${{ matrix.target }}
+          path: ${{ runner.temp }}/wokcore-performance/${{ matrix.target }}/provider-gates-${{ matrix.platform }}-${{ env.PERFORMANCE_PROFILE }}.json
+          if-no-files-found: warn
+          retention-days: 7
+
   required-targets:
     if: always()
     needs:
       - quality
       - native-platform-test
       - target-check
+      - performance-policy
+      - windows-performance
+      - portable-performance
     runs-on: ubuntu-24.04
     steps:
-      - name: Require quality, native tests, and every target
+      - name: Require quality, native tests, every target, and performance gates
         env:
           QUALITY_RESULT: ${{ needs.quality.result }}
           NATIVE_RESULT: ${{ needs.native-platform-test.result }}
           TARGET_RESULT: ${{ needs.target-check.result }}
+          PERFORMANCE_POLICY_RESULT: ${{ needs.performance-policy.result }}
+          WINDOWS_PERFORMANCE_RESULT: ${{ needs.windows-performance.result }}
+          PORTABLE_PERFORMANCE_RESULT: ${{ needs.portable-performance.result }}
         run: |
           test "$QUALITY_RESULT" = "success"
           test "$NATIVE_RESULT" = "success"
           test "$TARGET_RESULT" = "success"
+          test "$PERFORMANCE_POLICY_RESULT" = "success"
+          test "$WINDOWS_PERFORMANCE_RESULT" = "success"
+          test "$PORTABLE_PERFORMANCE_RESULT" = "success"

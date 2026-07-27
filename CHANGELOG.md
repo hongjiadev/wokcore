@@ -42,6 +42,7 @@ All notable WokCore changes are documented in this file.
 - Fixed-name loopback-only load generator with uncapped 500/1,000-stream modes, deterministic protocol/payload/cancellation/slow-consumer controls, pooled streaming clients, bounded aggregation, and payload-free JSON evidence.
 - Exact Windows PID/path process sampling for private working set, peak private bytes, I/O, handles, threads, and lifetime, with restart/counter-rollback rejection and bounded content-free phase evidence.
 - Offline release performance gates for 64 MiB warmed idle, 512 MiB at 500 standard streams, 1.5× 60-second recovery, 128 KiB/s WokCore writes at 500 long streams, and crash/leak/growth observation at 1,000 streams, with fail-closed exact-process evidence and no configured concurrency ceiling.
+- Secret-free native CI gates: authoritative Windows hard thresholds plus fixed 5-minute Linux x64/macOS arm64 functional profiles and 30-minute release/manual soaks for exact concurrency, cancellation, RSS recovery trend, descriptor/task growth, and process-scoped loopback-only networking.
 
 ### Fixed
 

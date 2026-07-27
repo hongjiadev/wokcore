@@ -44,6 +44,40 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
   -File tests/performance/windows-resource-gate.tests.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass `
   -File tests/performance/run-provider-gates.tests.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File tests/performance/portable-provider-gates.tests.ps1
+bash tests/performance/run-provider-gates.tests.sh
 ```
 
-The self-tests use synthetic counters only and do not launch WokCore or any Provider process.
+The self-tests use synthetic counters and static workflow policy checks only. They do not launch WokCore or any Provider process.
+
+## Linux and macOS portable gates
+
+Linux x64 and macOS arm64 run the complete release WokCore data path with the same three fixed executable names. These platforms enforce functional rather than absolute memory baselines until native measurements are approved:
+
+- every standard and cancellation round must reach its exact requested concurrency with zero request errors or unfinished work;
+- the 5-minute pull-request profile uses 256 concurrent streams, while the 30-minute release/manual soak uses 500;
+- recovery RSS must return below the larger of twice the warmed baseline or baseline plus 64 MiB;
+- final file-descriptor and task counts may grow by at most 32 and 8 respectively;
+- periodic process-scoped socket audits reject every UDP socket, wildcard listener, or non-loopback TCP endpoint.
+
+The runner isolates all application and Session roots, clears known Provider credential variables and ambient proxies, and uses only an accountless local Provider. Linux must run inside a private D-Bus session and creates a temporary Secret Service collection under the isolated home. macOS temporarily replaces the user search list/default with a private Keychain, then restores the original settings and deletes the temporary Keychain.
+
+Linux example:
+
+```bash
+dbus-run-session -- env WOKCORE_PRIVATE_DBUS=1 \
+  bash tests/performance/run-provider-gates.sh \
+  --profile pull-request \
+  --output-directory /path/outside/the/public/repository
+```
+
+macOS example:
+
+```bash
+bash tests/performance/run-provider-gates.sh \
+  --profile pull-request \
+  --output-directory /path/outside/the/public/repository
+```
+
+`ci.yml` runs the exact Windows gate and both portable 5-minute gates without a secret context. `release.yml` repeats the exact Windows gate and runs the 30-minute portable soak. Only the bounded content-free aggregate reports are uploaded; raw process output and synthetic management material remain in the deleted private temporary directory.
