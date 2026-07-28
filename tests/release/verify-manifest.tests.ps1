@@ -10,9 +10,16 @@ $repositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "../.."))
 $buildPackage = Join-Path $PSScriptRoot "build-package.ps1"
 $writeManifest = Join-Path $PSScriptRoot "write-manifest.ps1"
 $verifyManifest = Join-Path $PSScriptRoot "verify-manifest.ps1"
+$normalizePublicKey = Join-Path $PSScriptRoot "normalize-minisign-public-key.ps1"
 $schema = Join-Path $repositoryRoot "release\manifest-v1.schema.json"
 
-foreach ($path in @($buildPackage, $writeManifest, $verifyManifest, $schema)) {
+foreach ($path in @(
+    $buildPackage,
+    $writeManifest,
+    $verifyManifest,
+    $normalizePublicKey,
+    $schema
+)) {
     if (-not [IO.File]::Exists($path)) {
         throw "Missing release contract implementation: $path"
     }
@@ -125,6 +132,53 @@ $testRoot = Join-Path ([IO.Path]::GetTempPath()) (
 [IO.Directory]::CreateDirectory($testRoot) | Out-Null
 
 try {
+    $legacyPublicKey = Join-Path $testRoot "legacy-leading-zero.pub"
+    [byte[]] $legacyPayload = [byte[]]::new(42)
+    $legacyPayload[0] = 0x45
+    $legacyPayload[1] = 0x64
+    [byte[]] $legacyKeyId = @(
+        0xef,
+        0xcd,
+        0xab,
+        0x89,
+        0x67,
+        0x45,
+        0x23,
+        0x01
+    )
+    [Array]::Copy($legacyKeyId, 0, $legacyPayload, 2, $legacyKeyId.Length)
+    Write-Utf8NoBom -Path $legacyPublicKey -Value (
+        "untrusted comment: minisign public key 123456789ABCDEF`n" +
+        [Convert]::ToBase64String($legacyPayload) +
+        "`n"
+    )
+    $normalizedLegacyKeyId = (
+        & $normalizePublicKey -Path $legacyPublicKey
+    ).Trim()
+    $normalizedLegacyText = [IO.File]::ReadAllText(
+        $legacyPublicKey,
+        [Text.Encoding]::UTF8
+    )
+    if (
+        $normalizedLegacyKeyId -cne "0123456789ABCDEF" -or
+        -not $normalizedLegacyText.StartsWith(
+            "untrusted comment: minisign public key 0123456789ABCDEF`n",
+            [StringComparison]::Ordinal
+        )
+    ) {
+        throw "A legacy leading-zero Minisign key id was not normalized."
+    }
+    Write-Utf8NoBom -Path $legacyPublicKey -Value (
+        "untrusted comment: minisign public key 223456789ABCDEF`n" +
+        [Convert]::ToBase64String($legacyPayload) +
+        "`n"
+    )
+    Assert-Fails `
+        -Message "A mismatched short Minisign key id was normalized." `
+        -Operation {
+            & $normalizePublicKey -Path $legacyPublicKey
+        }
+
     $packages = Join-Path $testRoot "packages"
     $secondPackages = Join-Path $testRoot "packages-second"
     [IO.Directory]::CreateDirectory($packages) | Out-Null
@@ -218,11 +272,15 @@ try {
         "-p", $publicKey,
         "-s", $secretKey
     )
+    $keyId = (& $normalizePublicKey -Path $publicKey).Trim()
     $publicText = [IO.File]::ReadAllText($publicKey, [Text.Encoding]::UTF8)
-    if ($publicText -notmatch "minisign public key ([0-9A-F]{16})") {
+    if (
+        $keyId -cnotmatch "^[0-9A-F]{16}$" -or
+        $publicText -notmatch "minisign public key ([0-9A-F]{16})" -or
+        $Matches[1] -cne $keyId
+    ) {
         throw "Fixture public key does not expose a stable key id."
     }
-    $keyId = $Matches[1]
 
     $manifest = Join-Path $packages "wokcore-update-v1.json"
     $checksums = Join-Path $packages "SHA256SUMS"

@@ -88,6 +88,7 @@ foreach ($required in @(
     "ubuntu-24.04-arm",
     "tests/release/build-package.ps1",
     "tests/release/build-package.sh",
+    "tests/release/normalize-minisign-public-key.ps1",
     "tests/release/verify-manifest.tests.ps1",
     "ci-wokcore-package-",
     "actions/download-artifact@"

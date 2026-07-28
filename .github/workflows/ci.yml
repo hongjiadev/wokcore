@@ -257,8 +257,8 @@ jobs:
           umask 077
           minisign -G -W -f -p "$public_key" -s "$secret_key"
           key_id="$(
-            sed -nE 's/^untrusted comment: minisign public key ([0-9A-F]{16})$/\1/p' \
-              "$public_key"
+            pwsh tests/release/normalize-minisign-public-key.ps1 \
+              -Path "$public_key"
           )"
           [[ "$key_id" =~ ^[0-9A-F]{16}$ ]]
           pwsh tests/release/write-manifest.ps1 \
