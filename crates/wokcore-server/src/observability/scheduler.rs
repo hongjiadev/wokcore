@@ -779,11 +779,7 @@ struct SessionFilesystemWatcher {
 
 impl SessionFilesystemWatcher {
     fn new(roots: SessionRootPaths, handle: SchedulerHandle) -> Option<Self> {
-        let watched_roots = [
-            (SessionKind::Codex, roots.codex),
-            (SessionKind::Claude, roots.claude),
-            (SessionKind::Gemini, roots.gemini),
-        ];
+        let watched_roots = canonical_watch_roots(roots);
         let callback_roots = watched_roots.clone();
         let mut watcher = RecommendedWatcher::new(
             move |result: notify::Result<notify::Event>| {
@@ -800,13 +796,27 @@ impl SessionFilesystemWatcher {
         )
         .ok()?;
         let mut watching = false;
-        for (_, root) in watched_roots {
-            if root.is_dir() && watcher.watch(&root, RecursiveMode::Recursive).is_ok() {
+        for (_, root) in &watched_roots {
+            if watcher.watch(root, RecursiveMode::Recursive).is_ok() {
                 watching = true;
             }
         }
         watching.then_some(Self { watcher })
     }
+}
+
+fn canonical_watch_roots(roots: SessionRootPaths) -> Vec<(SessionKind, PathBuf)> {
+    [
+        (SessionKind::Codex, roots.codex),
+        (SessionKind::Claude, roots.claude),
+        (SessionKind::Gemini, roots.gemini),
+    ]
+    .into_iter()
+    .filter_map(|(kind, root)| {
+        root.is_dir()
+            .then(|| (kind, root.canonicalize().unwrap_or(root)))
+    })
+    .collect()
 }
 
 impl fmt::Debug for SessionFilesystemWatcher {
@@ -1171,5 +1181,37 @@ const fn error_priority(code: SessionSourceErrorCode) -> u8 {
         SessionSourceErrorCode::SourceCandidateInterrupted => 9,
         SessionSourceErrorCode::SourceRootMissing => 10,
         SessionSourceErrorCode::SourceSessionsAbsent => 11,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SessionKind, SessionRootPaths, canonical_watch_roots};
+
+    #[test]
+    fn filesystem_watcher_canonicalizes_callback_roots() {
+        let fixture = tempfile::tempdir().unwrap();
+        let alias = fixture.path().join("alias");
+        let codex = fixture.path().join("codex");
+        let claude = fixture.path().join("claude");
+        let gemini = fixture.path().join("gemini");
+        for root in [&alias, &codex, &claude, &gemini] {
+            std::fs::create_dir(root).unwrap();
+        }
+        let roots = SessionRootPaths {
+            codex: alias.join("..").join("codex"),
+            claude,
+            gemini,
+        };
+
+        let watched_roots = canonical_watch_roots(roots);
+
+        assert_eq!(
+            watched_roots
+                .iter()
+                .find(|(kind, _)| *kind == SessionKind::Codex)
+                .map(|(_, root)| root),
+            Some(&codex.canonicalize().unwrap())
+        );
     }
 }
