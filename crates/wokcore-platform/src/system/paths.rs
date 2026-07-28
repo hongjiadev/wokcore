@@ -106,9 +106,17 @@ impl EnvironmentSnapshot {
             Platform::Linux
         };
         let names = match platform {
-            Platform::Windows => ["APPDATA", "LOCALAPPDATA", "HOME", "USERPROFILE"].as_slice(),
-            Platform::Macos => ["HOME", "USERPROFILE"].as_slice(),
+            Platform::Windows => [
+                "WOKCORE_HOME",
+                "APPDATA",
+                "LOCALAPPDATA",
+                "HOME",
+                "USERPROFILE",
+            ]
+            .as_slice(),
+            Platform::Macos => ["WOKCORE_HOME", "HOME", "USERPROFILE"].as_slice(),
             Platform::Linux => [
+                "WOKCORE_HOME",
                 "XDG_CONFIG_HOME",
                 "XDG_STATE_HOME",
                 "XDG_RUNTIME_DIR",
@@ -128,6 +136,9 @@ impl EnvironmentSnapshot {
     }
 
     fn config_dir(&self) -> Result<PathBuf, PlatformError> {
+        if let Some(directory) = self.environment_path("WOKCORE_HOME") {
+            return Ok(directory);
+        }
         match self.platform {
             Platform::Windows => Ok(self.windows_data_dir("APPDATA", &["AppData", "Roaming"])?),
             Platform::Macos => append_components(
@@ -143,6 +154,9 @@ impl EnvironmentSnapshot {
     }
 
     fn state_dir(&self) -> Result<PathBuf, PlatformError> {
+        if let Some(directory) = self.environment_path("WOKCORE_HOME") {
+            return Ok(directory);
+        }
         match self.platform {
             Platform::Windows => Ok(self.windows_data_dir("LOCALAPPDATA", &["AppData", "Local"])?),
             Platform::Macos => self.config_dir(),

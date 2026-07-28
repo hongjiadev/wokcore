@@ -116,9 +116,15 @@ STARTUP_DIAGNOSTICS="$(report_wokcore_start_failure 2>&1)"
     ORIGINAL_SECURITY_HOME="$HOME"
     isolate_environment
 
-    [[ "$CFFIXED_USER_HOME" == "$ORIGINAL_SECURITY_HOME" ]]
+    [[ "$HOME" == "$ORIGINAL_SECURITY_HOME" ]]
+    [[ "$WOKCORE_HOME" == "$TEMPORARY_ROOT/wokcore-home" ]]
+    [[ "$CODEX_HOME" == "$TEMPORARY_ROOT/sessions/codex" ]]
+    [[ "$CLAUDE_CONFIG_DIR" == "$TEMPORARY_ROOT/sessions/claude" ]]
+    [[ "$GEMINI_CLI_HOME" == "$TEMPORARY_ROOT/sessions/gemini" ]]
     printf '%s\n' "${RUNTIME_ENVIRONMENT[@]}" |
-        grep -Fx "CFFIXED_USER_HOME=$ORIGINAL_SECURITY_HOME" >/dev/null
+        grep -Fx "HOME=$ORIGINAL_SECURITY_HOME" >/dev/null
+    printf '%s\n' "${RUNTIME_ENVIRONMENT[@]}" |
+        grep -Fx "WOKCORE_HOME=$TEMPORARY_ROOT/wokcore-home" >/dev/null
 
     python3 - "$SECURITY_CALLS" <<'PY'
 import sys
@@ -130,11 +136,7 @@ with open(sys.argv[1], "r", encoding="utf-8") as handle:
         calls.append((home, command))
 assert len(calls) >= 13, calls
 original_home = calls[0][0]
-isolated_home = calls[7][0]
-assert original_home != isolated_home, calls
-assert all(home == original_home for home, _ in calls[:7]), calls
-assert all(home == isolated_home for home, _ in calls[7:]), calls
-assert isolated_home.endswith("/macos-runtime/home"), calls
+assert all(home == original_home for home, _ in calls), calls
 assert calls[0][1] == "list-keychains", calls
 assert calls[1][1] == "default-keychain", calls
 assert any(command == "create-keychain" for _, command in calls[2:]), calls

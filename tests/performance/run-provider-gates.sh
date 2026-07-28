@@ -387,13 +387,19 @@ PY
 }
 
 isolate_environment() {
+    local isolated_home="$TEMPORARY_ROOT/home"
     if [[ "$PLATFORM" == "macos" ]]; then
         MAC_SECURITY_HOME="$HOME"
         capture_macos_keychain_configuration
         configure_macos_keychain
     fi
 
-    export HOME="$TEMPORARY_ROOT/home"
+    export WOKCORE_HOME="$TEMPORARY_ROOT/wokcore-home"
+    if [[ "$PLATFORM" == "macos" ]]; then
+        export HOME="$MAC_SECURITY_HOME"
+    else
+        export HOME="$isolated_home"
+    fi
     export USERPROFILE="$HOME"
     export XDG_CONFIG_HOME="$TEMPORARY_ROOT/config"
     export XDG_STATE_HOME="$TEMPORARY_ROOT/state"
@@ -402,7 +408,8 @@ isolate_environment() {
     export XDG_RUNTIME_DIR="$TEMPORARY_ROOT/runtime"
     export TMPDIR="$TEMPORARY_ROOT/tmp"
     mkdir -m 700 \
-        "$HOME" \
+        "$WOKCORE_HOME" \
+        "$isolated_home" \
         "$XDG_CONFIG_HOME" \
         "$XDG_STATE_HOME" \
         "$XDG_CACHE_HOME" \
@@ -411,7 +418,6 @@ isolate_environment() {
         "$TMPDIR"
 
     if [[ "$PLATFORM" == "macos" ]]; then
-        export CFFIXED_USER_HOME="$MAC_SECURITY_HOME"
         prepare_macos_runtime_keychain
     fi
 
@@ -436,6 +442,13 @@ isolate_environment() {
         http_proxy \
         https_proxy \
         all_proxy || true
+    export CODEX_HOME="$TEMPORARY_ROOT/sessions/codex"
+    export CLAUDE_CONFIG_DIR="$TEMPORARY_ROOT/sessions/claude"
+    export GEMINI_CLI_HOME="$TEMPORARY_ROOT/sessions/gemini"
+    mkdir -m 700 -p \
+        "$CODEX_HOME" \
+        "$CLAUDE_CONFIG_DIR" \
+        "$GEMINI_CLI_HOME"
     export NO_PROXY="127.0.0.1,::1"
     export no_proxy="$NO_PROXY"
 
@@ -446,8 +459,12 @@ isolate_environment() {
     RUNTIME_ENVIRONMENT=(
         env -i
         "PATH=$PATH"
+        "WOKCORE_HOME=$WOKCORE_HOME"
         "HOME=$HOME"
         "USERPROFILE=$USERPROFILE"
+        "CODEX_HOME=$CODEX_HOME"
+        "CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR"
+        "GEMINI_CLI_HOME=$GEMINI_CLI_HOME"
         "XDG_CONFIG_HOME=$XDG_CONFIG_HOME"
         "XDG_STATE_HOME=$XDG_STATE_HOME"
         "XDG_CACHE_HOME=$XDG_CACHE_HOME"
@@ -458,11 +475,6 @@ isolate_environment() {
         "no_proxy=$no_proxy"
         "LANG=${LANG:-C.UTF-8}"
     )
-    if [[ "$PLATFORM" == "macos" ]]; then
-        RUNTIME_ENVIRONMENT+=(
-            "CFFIXED_USER_HOME=$CFFIXED_USER_HOME"
-        )
-    fi
     if [[ "$PLATFORM" == "linux" ]]; then
         RUNTIME_ENVIRONMENT+=(
             "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS"
@@ -492,12 +504,7 @@ write_config() {
         [[ "$SIMULATOR_PORT" != "$CORE_PORT" ]] && break
     done
 
-    local config_directory
-    if [[ "$PLATFORM" == "linux" ]]; then
-        config_directory="$XDG_CONFIG_HOME/WokCore"
-    else
-        config_directory="$HOME/Library/Application Support/WokCore"
-    fi
+    local config_directory="$WOKCORE_HOME"
     mkdir -m 700 -p "$config_directory"
     CONFIG_PATH="$config_directory/config.toml"
     cat >"$CONFIG_PATH" <<EOF

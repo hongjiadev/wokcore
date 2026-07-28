@@ -60,6 +60,37 @@ fn macos_uses_wokcore_application_support_directory() {
 }
 
 #[test]
+fn explicit_app_home_isolates_wokcore_files_without_changing_platform_home() {
+    let paths = AppPaths::resolve(EnvironmentSnapshot::new(
+        Platform::Macos,
+        [
+            ("HOME", "/Users/runner"),
+            ("WOKCORE_HOME", "/private/synthetic/wokcore"),
+        ],
+    ))
+    .expect("an absolute WokCore application home overrides platform data directories");
+
+    assert_path(&paths.config_file, "/private/synthetic/wokcore/config.toml");
+    assert_path(&paths.state_db, "/private/synthetic/wokcore/state.sqlite3");
+    assert_path(&paths.runtime_dir, "/private/synthetic/wokcore/runtime");
+    assert_path(&paths.log_dir, "/private/synthetic/wokcore/logs");
+}
+
+#[test]
+fn relative_app_home_is_ignored_for_platform_owned_paths() {
+    let paths = AppPaths::resolve(EnvironmentSnapshot::new(
+        Platform::Macos,
+        [("HOME", "/Users/ada"), ("WOKCORE_HOME", "relative/wokcore")],
+    ))
+    .expect("a relative application home falls back to the platform-owned directory");
+
+    assert_path(
+        &paths.config_file,
+        "/Users/ada/Library/Application Support/WokCore/config.toml",
+    );
+}
+
+#[test]
 fn linux_uses_absolute_xdg_roots_and_wokcore_runtime_directory() {
     let paths = AppPaths::resolve(EnvironmentSnapshot::new(
         Platform::Linux,
