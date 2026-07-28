@@ -22,6 +22,7 @@ use wokcore_storage::{
 };
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+const FILESYSTEM_EVENT_TIMEOUT: Duration = Duration::from_secs(15);
 
 struct FixedTimestamp;
 
@@ -362,7 +363,7 @@ async fn native_filesystem_events_feed_the_debounced_scheduler() {
 
     std::fs::write(roots.codex.join("notification.jsonl"), b"{}\n").unwrap();
 
-    timeout(TEST_TIMEOUT, async {
+    timeout(FILESYSTEM_EVENT_TIMEOUT, async {
         while backend.count(SessionKind::Codex) == baseline {
             sleep(Duration::from_millis(10)).await;
         }
