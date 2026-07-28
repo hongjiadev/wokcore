@@ -109,11 +109,12 @@ STARTUP_DIAGNOSTICS="$(report_wokcore_start_failure 2>&1)"
         esac
     }
 
+    ORIGINAL_SECURITY_HOME="$HOME"
     isolate_environment
 
-    [[ -z "${CFFIXED_USER_HOME+x}" ]]
-    ! printf '%s\n' "${RUNTIME_ENVIRONMENT[@]}" |
-        grep -F "CFFIXED_USER_HOME=" >/dev/null
+    [[ "$CFFIXED_USER_HOME" == "$ORIGINAL_SECURITY_HOME" ]]
+    printf '%s\n' "${RUNTIME_ENVIRONMENT[@]}" |
+        grep -Fx "CFFIXED_USER_HOME=$ORIGINAL_SECURITY_HOME" >/dev/null
 
     python3 - "$SECURITY_CALLS" "$HOME" <<'PY'
 import sys

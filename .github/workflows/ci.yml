@@ -82,6 +82,17 @@ jobs:
           --target ${{ matrix.target }}
           diagnostics::tests::macos_diagnostic_directory_opens_and_publishes_on_private_system_temp_path
           -- --exact --nocapture
+      - name: Verify concurrent macOS publishing
+        if: runner.os == 'macOS'
+        run: >-
+          cargo test
+          --package wokcore-platform
+          --lib
+          --all-features
+          --locked
+          --target ${{ matrix.target }}
+          sessions::export_destination::apple_regression_tests::concurrent_relative_publishes_do_not_share_legacy_move_state
+          -- --exact --nocapture
       - name: Test native workspace
         if: runner.os != 'Windows'
         run: cargo test --workspace --all-features --locked --target ${{ matrix.target }}

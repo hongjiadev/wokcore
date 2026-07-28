@@ -8,8 +8,6 @@ use std::{
 };
 
 use super::SessionError;
-#[cfg(target_vendor = "apple")]
-use super::file::DirectoryChainStability;
 #[cfg(not(target_vendor = "apple"))]
 use super::file::SessionFileIdentity;
 #[cfg(windows)]
@@ -66,8 +64,6 @@ struct TemporaryCreationGuard<'a> {
 #[cfg(target_vendor = "apple")]
 struct ApplePublishStability {
     watcher: apple::PublishWatcher,
-    parent_ancestors: DirectoryChainStability,
-    session_roots: Vec<DirectoryChainStability>,
 }
 
 #[cfg(target_vendor = "apple")]
@@ -77,16 +73,8 @@ impl ApplePublishStability {
         session_roots: &[DirectoryChain],
         published_object: &File,
     ) -> Result<Self, SessionError> {
-        let watcher = apple::PublishWatcher::start(parent, session_roots, published_object)?;
-        let parent_ancestors = parent.capture_ancestor_stability()?;
-        let root_stabilities = session_roots
-            .iter()
-            .map(DirectoryChain::capture_stability)
-            .collect::<Result<Vec<_>, _>>()?;
         let stability = Self {
-            watcher,
-            parent_ancestors,
-            session_roots: root_stabilities,
+            watcher: apple::PublishWatcher::start(parent, session_roots, Some(published_object))?,
         };
         validate_export_boundary(parent, session_roots)?;
         stability.verify(parent, session_roots)?;
@@ -98,14 +86,8 @@ impl ApplePublishStability {
         parent: &DirectoryChain,
         session_roots: &[DirectoryChain],
     ) -> Result<(), SessionError> {
-        if self.session_roots.len() != session_roots.len() {
-            return Err(SessionError::UnsafePath);
-        }
         self.watcher.verify_quiet()?;
-        parent.verify_ancestor_stability(&self.parent_ancestors)?;
-        for (root, stability) in session_roots.iter().zip(&self.session_roots) {
-            root.verify_stability(stability)?;
-        }
+        validate_export_boundary(parent, session_roots)?;
         self.watcher.verify_quiet()
     }
 }
@@ -1173,7 +1155,7 @@ mod apple {
 
     use crate::sessions::SessionFileIdentity;
 
-    use super::{DirectoryChain, SessionError, file_identity};
+    use super::{DirectoryChain, SessionError, file_identity, validate_directory_chain};
 
     // CoreServices/CarbonCore/Files.h 64-bit ABI, as mirrored by objc2-generated
     // CoreServices/CarbonCore/Files.rs: FSIORefNum is c_int, OSStatus is i32,
@@ -1323,7 +1305,7 @@ mod apple {
         pub(super) fn start(
             parent: &DirectoryChain,
             session_roots: &[DirectoryChain],
-            published_object: &File,
+            published_object: Option<&File>,
         ) -> Result<Self, SessionError> {
             let queue = unsafe { libc::kqueue() };
             if queue < 0 {
@@ -1332,6 +1314,8 @@ mod apple {
                 });
             }
             let queue = unsafe { OwnedFd::from_raw_fd(queue) };
+            // Directory NOTE_WRITE includes unrelated sibling changes in shared
+            // temporary ancestors, so only identity-changing events are boundary signals.
             let directory_events = libc::NOTE_DELETE | libc::NOTE_RENAME | libc::NOTE_REVOKE;
             let mut changes = Vec::new();
             for directory in parent.directories.iter().chain(
@@ -1348,17 +1332,19 @@ mod apple {
                     udata: ptr::null_mut(),
                 });
             }
-            changes.push(libc::kevent {
-                ident: published_object.as_raw_fd() as libc::uintptr_t,
-                filter: libc::EVFILT_VNODE,
-                flags: libc::EV_ADD | libc::EV_CLEAR,
-                fflags: libc::NOTE_WRITE
-                    | libc::NOTE_EXTEND
-                    | libc::NOTE_DELETE
-                    | libc::NOTE_REVOKE,
-                data: 0,
-                udata: ptr::null_mut(),
-            });
+            if let Some(published_object) = published_object {
+                changes.push(libc::kevent {
+                    ident: published_object.as_raw_fd() as libc::uintptr_t,
+                    filter: libc::EVFILT_VNODE,
+                    flags: libc::EV_ADD | libc::EV_CLEAR,
+                    fflags: libc::NOTE_WRITE
+                        | libc::NOTE_EXTEND
+                        | libc::NOTE_DELETE
+                        | libc::NOTE_REVOKE,
+                    data: 0,
+                    udata: ptr::null_mut(),
+                });
+            }
             let change_count =
                 libc::c_int::try_from(changes.len()).map_err(|_| SessionError::UnsafePath)?;
             let status = unsafe {
@@ -1749,7 +1735,9 @@ mod apple {
     }
 
     fn pinned_directory_ref(parent: &DirectoryChain) -> Result<FsRef, SessionError> {
-        let stability = parent.capture_stability()?;
+        let watcher = PublishWatcher::start(parent, &[], None)?;
+        validate_directory_chain(parent)?;
+        watcher.verify_quiet()?;
         let path = CString::new(parent.path().as_os_str().as_bytes())
             .map_err(|_| SessionError::UnsafePath)?;
         #[cfg(test)]
@@ -1774,7 +1762,8 @@ mod apple {
         let reference = unsafe { reference.assume_init() };
         #[cfg(test)]
         super::apple_synchronization_tests::hit(super::AppleSynchronizationPoint::AfterPathMakeRef);
-        parent.verify_stability(&stability)?;
+        watcher.verify_quiet()?;
+        validate_directory_chain(parent)?;
         let mut verified_path = [0_u8; libc::PATH_MAX as usize];
         let status = unsafe {
             FSRefMakePath(
@@ -1812,7 +1801,9 @@ mod apple {
             return Err(SessionError::UnsafePath);
         }
         verify_reference_identity(&reference, pinned_identity)?;
-        parent.verify_stability(&stability)?;
+        watcher.verify_quiet()?;
+        validate_directory_chain(parent)?;
+        watcher.verify_quiet()?;
         Ok(reference)
     }
 

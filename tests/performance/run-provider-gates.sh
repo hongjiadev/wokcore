@@ -27,6 +27,7 @@ GNOME_KEYRING_PID=""
 MAC_KEYCHAIN_ACTIVE=0
 MAC_KEYCHAIN_PATH=""
 MAC_KEYCHAIN_PASSWORD=""
+MAC_SECURITY_HOME=""
 ORIGINAL_DEFAULT_KEYCHAIN=""
 ORIGINAL_KEYCHAINS=()
 REPORT_PATH=""
@@ -364,6 +365,7 @@ PY
 
 isolate_environment() {
     if [[ "$PLATFORM" == "macos" ]]; then
+        MAC_SECURITY_HOME="$HOME"
         capture_macos_keychain_configuration
         configure_macos_keychain
     fi
@@ -386,7 +388,7 @@ isolate_environment() {
         "$TMPDIR"
 
     if [[ "$PLATFORM" == "macos" ]]; then
-        unset CFFIXED_USER_HOME
+        export CFFIXED_USER_HOME="$MAC_SECURITY_HOME"
     fi
 
     unset \
@@ -432,6 +434,11 @@ isolate_environment() {
         "no_proxy=$no_proxy"
         "LANG=${LANG:-C.UTF-8}"
     )
+    if [[ "$PLATFORM" == "macos" ]]; then
+        RUNTIME_ENVIRONMENT+=(
+            "CFFIXED_USER_HOME=$CFFIXED_USER_HOME"
+        )
+    fi
     if [[ "$PLATFORM" == "linux" ]]; then
         RUNTIME_ENVIRONMENT+=(
             "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS"
