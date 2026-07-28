@@ -27,6 +27,9 @@ wokcore-protocols = { version = "0.1.0", path = "../../crates/wokcore-protocols"
 wokcore-server = { version = "0.1.0", path = "../../crates/wokcore-server" }
 wokcore-storage = { version = "0.1.0", path = "../../crates/wokcore-storage" }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+mimalloc.workspace = true
+
 [dev-dependencies]
 axum.workspace = true
 tempfile.workspace = true
