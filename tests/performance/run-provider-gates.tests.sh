@@ -82,6 +82,57 @@ STARTUP_DIAGNOSTICS="$(report_wokcore_start_failure 2>&1)"
 [[ "$STARTUP_DIAGNOSTICS" == *"event_code=startup_diagnostics_segment_invalid"* ]]
 [[ "$STARTUP_DIAGNOSTICS" != *"must-not-appear"* ]]
 
+(
+    PLATFORM="macos"
+    TEMPORARY_ROOT="$TEST_ROOT/macos-runtime"
+    HOME="$TEST_ROOT/macos-original-home"
+    SECURITY_CALLS="$TEST_ROOT/macos-security-calls.tsv"
+    mkdir -p "$HOME" "$TEMPORARY_ROOT"
+    mkdir() {
+        local argument
+        for argument in "$@"; do
+            case "$argument" in
+                -m | -p | 700) ;;
+                *) command mkdir -p "$argument" ;;
+            esac
+        done
+    }
+    security() {
+        printf '%s\t%s\n' "$HOME" "$1" >>"$SECURITY_CALLS"
+        case "$*" in
+            "list-keychains -d user")
+                printf '"%s"\n' "$HOME/Library/Keychains/login.keychain-db"
+                ;;
+            "default-keychain -d user")
+                printf '"%s"\n' "$HOME/Library/Keychains/login.keychain-db"
+                ;;
+        esac
+    }
+
+    isolate_environment
+
+    python3 - "$SECURITY_CALLS" <<'PY'
+import sys
+
+calls = []
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    for line in handle:
+        home, command = line.rstrip("\n").split("\t", 1)
+        calls.append((home, command))
+assert len(calls) >= 7, calls
+original_home = calls[0][0]
+isolated_home = calls[2][0]
+assert original_home != isolated_home, calls
+assert all(home == original_home for home, _ in calls[:2]), calls
+assert all(home == isolated_home for home, _ in calls[2:]), calls
+assert isolated_home.endswith("/macos-runtime/home"), calls
+assert calls[0][1] == "list-keychains", calls
+assert calls[1][1] == "default-keychain", calls
+assert any(command == "create-keychain" for _, command in calls[2:]), calls
+assert any(command == "default-keychain" for _, command in calls[2:]), calls
+PY
+)
+
 write_final_report \
     true \
     "" \

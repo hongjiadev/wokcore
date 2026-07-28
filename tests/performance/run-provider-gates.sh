@@ -305,7 +305,7 @@ create_private_runtime() {
     : >"$RESOURCE_SAMPLES_FILE"
 }
 
-configure_macos_keychain() {
+capture_macos_keychain_configuration() {
     while IFS= read -r line; do
         local keychain
         keychain="$(trim_security_path "$line")"
@@ -314,7 +314,9 @@ configure_macos_keychain() {
     ORIGINAL_DEFAULT_KEYCHAIN="$(
         trim_security_path "$(security default-keychain -d user)"
     )"
+}
 
+configure_macos_keychain() {
     MAC_KEYCHAIN_PATH="$TEMPORARY_ROOT/wokcore-performance.keychain-db"
     MAC_KEYCHAIN_PASSWORD="$(
         python3 - <<'PY'
@@ -362,7 +364,7 @@ PY
 
 isolate_environment() {
     if [[ "$PLATFORM" == "macos" ]]; then
-        configure_macos_keychain
+        capture_macos_keychain_configuration
     fi
 
     export HOME="$TEMPORARY_ROOT/home"
@@ -381,6 +383,10 @@ isolate_environment() {
         "$XDG_DATA_HOME" \
         "$XDG_RUNTIME_DIR" \
         "$TMPDIR"
+
+    if [[ "$PLATFORM" == "macos" ]]; then
+        configure_macos_keychain
+    fi
 
     unset \
         OPENAI_API_KEY \
