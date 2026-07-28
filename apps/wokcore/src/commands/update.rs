@@ -1243,6 +1243,18 @@ mod tests {
     };
 
     const ARCHIVE: &[u8] = b"synthetic update archive";
+
+    fn private_tempdir() -> tempfile::TempDir {
+        let directory = tempdir().expect("private update test temporary directory");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+                .expect("set private update test temporary directory permissions");
+        }
+        directory
+    }
     const INSTALL_PUBLIC_KEY: &str = include_str!(
         "../../../../crates/wokcore-platform/tests/fixtures/update/install-minisign.pub"
     );
@@ -1318,7 +1330,7 @@ mod tests {
     #[tokio::test]
     async fn update_artifact_download_streams_to_the_target_volume_and_verifies_exact_bytes() {
         let (source, server) = serve_archive(ARCHIVE).await;
-        let directory = tempdir().unwrap();
+        let directory = private_tempdir();
         let artifact = artifact(ARCHIVE);
 
         let download = download_artifact(
@@ -1342,7 +1354,7 @@ mod tests {
     #[tokio::test]
     async fn update_artifact_download_rejects_size_mismatch_and_cleans_the_partial_file() {
         let (source, server) = serve_archive(&ARCHIVE[..ARCHIVE.len() - 1]).await;
-        let directory = tempdir().unwrap();
+        let directory = private_tempdir();
         let artifact = artifact(ARCHIVE);
 
         assert!(
@@ -1377,7 +1389,7 @@ mod tests {
             origin: Url::parse(&format!("http://{address}/")).unwrap(),
             public_key: "".into(),
         };
-        let directory = tempdir().unwrap();
+        let directory = private_tempdir();
         let artifact = artifact(ARCHIVE);
 
         assert!(
@@ -1564,7 +1576,7 @@ mod tests {
 
     #[test]
     fn update_startup_wait_treats_an_uncreated_runtime_directory_as_not_ready() {
-        let directory = tempdir().unwrap();
+        let directory = private_tempdir();
         let runtime_dir = directory.path().join("runtime");
         let paths = wokcore_platform::AppPaths {
             config_file: directory.path().join("config.toml"),
@@ -1580,7 +1592,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_real_lifecycle_cancels_drain_when_loopback_reports_active_requests() {
-        let directory = tempdir().unwrap();
+        let directory = private_tempdir();
         let paths = test_paths(directory.path());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -1702,7 +1714,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_real_lifecycle_rejects_active_requests_when_drain_recovery_is_invalid() {
-        let directory = tempdir().unwrap();
+        let directory = private_tempdir();
         let paths = test_paths(directory.path());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -1777,7 +1789,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_real_lifecycle_stops_the_verified_old_service_and_removes_its_discovery() {
-        let directory = tempdir().unwrap();
+        let directory = private_tempdir();
         let paths = test_paths(directory.path());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -1898,7 +1910,7 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_a_completed_preparation_restarts_the_stopped_old_service() {
-        let directory = tempdir().unwrap();
+        let directory = private_tempdir();
         let paths = test_paths(directory.path());
         let target = directory.path().join(if cfg!(windows) {
             "wokcore.exe"
@@ -2043,7 +2055,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancelling_new_service_verification_terminates_the_unverified_child() {
-        let directory = tempdir().unwrap();
+        let directory = private_tempdir();
         let paths = test_paths(directory.path());
         let target = directory.path().join(if cfg!(windows) {
             "wokcore.exe"
@@ -2095,7 +2107,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_background_child_cleanup_is_reported_to_recovery() {
-        let directory = tempdir().unwrap();
+        let directory = private_tempdir();
         let paths = test_paths(directory.path());
         fs::create_dir_all(&paths.runtime_dir).unwrap();
         let running = Arc::new(AtomicBool::new(true));
@@ -2302,7 +2314,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancelling_an_update_while_drain_is_accepted_cancels_the_drain() {
-        let directory = tempdir().unwrap();
+        let directory = private_tempdir();
         let paths = test_paths(directory.path());
         let target = directory.path().join(if cfg!(windows) {
             "wokcore.exe"
@@ -2411,7 +2423,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancelling_an_update_after_stop_is_accepted_restarts_the_old_service() {
-        let directory = tempdir().unwrap();
+        let directory = private_tempdir();
         let paths = test_paths(directory.path());
         let target = directory.path().join(if cfg!(windows) {
             "wokcore.exe"
@@ -2568,7 +2580,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_install_command_completes_the_signed_stopped_service_flow_on_loopback() {
-        let directory = tempdir().unwrap();
+        let directory = private_tempdir();
         let paths = test_paths(directory.path());
         let target = directory.path().join(if cfg!(windows) {
             "wokcore.exe"
@@ -2991,7 +3003,7 @@ mod tests {
     }
 
     fn install_fixture() -> InstallFixture {
-        let directory = tempdir().unwrap();
+        let directory = private_tempdir();
         let archive = directory.path().join(if cfg!(windows) {
             "artifact.zip"
         } else {
