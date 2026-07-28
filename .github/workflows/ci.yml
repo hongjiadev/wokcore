@@ -24,8 +24,8 @@ jobs:
   quality:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
           toolchain: 1.97.1
           components: clippy, rustfmt
@@ -42,7 +42,7 @@ jobs:
       - name: Test workspace
         run: cargo test --workspace --all-features --locked
       - name: Check dependency policy
-        uses: EmbarkStudios/cargo-deny-action@v2.1.1
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           rust-version: 1.97.1
           command: check
@@ -62,8 +62,8 @@ jobs:
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
           toolchain: 1.97.1
           target: ${{ matrix.target }}
@@ -123,33 +123,172 @@ jobs:
         include:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-          - os: macos-15
+            extension: zip
+          - os: macos-15-intel
             target: x86_64-apple-darwin
+            extension: tar.gz
           - os: macos-15
             target: aarch64-apple-darwin
+            extension: tar.gz
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
-          - os: ubuntu-24.04
+            extension: tar.gz
+          - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+            extension: tar.gz
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
           toolchain: 1.97.1
           target: ${{ matrix.target }}
-      - name: Install Linux ARM64 cross compiler
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes gcc-aarch64-linux-gnu
       - name: Check target
         run: cargo check --workspace --all-features --locked --target ${{ matrix.target }}
+      - name: Resolve package version
+        id: version
+        shell: pwsh
+        run: |
+          $source = [IO.File]::ReadAllText(
+              (Join-Path $env:GITHUB_WORKSPACE "Cargo.toml"),
+              [Text.Encoding]::UTF8
+          )
+          $match = [regex]::Match(
+              $source,
+              '(?ms)^\[workspace\.package\]\s*.*?^version\s*=\s*"([^"]+)"'
+          )
+          if (-not $match.Success) {
+              throw "Workspace package version is missing."
+          }
+          "version=$($match.Groups[1].Value)" >> $env:GITHUB_OUTPUT
+      - name: Build fixed WokCore release executable
+        run: >-
+          cargo build
+          --package wokcore
+          --bin wokcore
+          --release
+          --locked
+          --target ${{ matrix.target }}
+      - name: Verify and package Windows executable
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $executable = Join-Path `
+              "${{ github.workspace }}\target\${{ matrix.target }}\release" `
+              "wokcore.exe"
+          & $executable --version
+          if ($LASTEXITCODE -ne 0) {
+              throw "The fixed WokCore release executable did not start."
+          }
+          powershell.exe -NoProfile -ExecutionPolicy Bypass `
+              -File tests/release/build-package.ps1 `
+              -ExecutablePath $executable `
+              -RepositoryRoot "${{ github.workspace }}" `
+              -OutputDirectory "${{ runner.temp }}\wokcore-release" `
+              -Version "${{ steps.version.outputs.version }}" `
+              -Target "${{ matrix.target }}"
+      - name: Verify and package Unix executable
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          executable="${{ github.workspace }}/target/${{ matrix.target }}/release/wokcore"
+          "$executable" --version
+          bash tests/release/build-package.sh \
+            --executable "$executable" \
+            --repository-root "${{ github.workspace }}" \
+            --output-directory "${{ runner.temp }}/wokcore-release" \
+            --version "${{ steps.version.outputs.version }}" \
+            --target "${{ matrix.target }}"
+      - name: Upload deterministic CI package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ci-wokcore-package-${{ matrix.target }}
+          path: ${{ runner.temp }}/wokcore-release/wokcore-v${{ steps.version.outputs.version }}-${{ matrix.target }}.${{ matrix.extension }}
+          if-no-files-found: error
+          retention-days: 7
+
+  release-contract:
+    needs: target-check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install Minisign
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes minisign
+      - name: Test deterministic release packages
+        run: bash tests/release/build-package.tests.sh
+      - name: Test release manifest and Windows package contracts
+        shell: pwsh
+        run: pwsh tests/release/verify-manifest.tests.ps1
+      - name: Test workflow and public repository contracts
+        shell: pwsh
+        run: |
+          pwsh tests/release/release-workflow.tests.ps1
+          pwsh tests/scripts/check-public-repo-hygiene.tests.ps1
+          pwsh tests/scripts/check-public-repo-hygiene.ps1
+      - name: Download all five native CI packages
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          pattern: ci-wokcore-package-*
+          path: ${{ runner.temp }}/wokcore-release
+          merge-multiple: true
+      - name: Verify a signed five-target manifest
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          dist="${{ runner.temp }}/wokcore-release"
+          secret_key="${{ runner.temp }}/ci-wokcore-minisign.key"
+          public_key="${{ runner.temp }}/ci-wokcore-minisign.pub"
+          manifest="$dist/wokcore-update-v1.json"
+          signature="$manifest.minisig"
+          checksums="$dist/SHA256SUMS"
+          trap 'rm -f -- "$secret_key" "$public_key"' EXIT
+          version="$(
+            sed -nE \
+              '/^\[workspace\.package\]$/,/^\[/s/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' \
+              Cargo.toml
+          )"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]
+          umask 077
+          minisign -G -W -f -p "$public_key" -s "$secret_key"
+          key_id="$(
+            sed -nE 's/^untrusted comment: minisign public key ([0-9A-F]{16})$/\1/p' \
+              "$public_key"
+          )"
+          [[ "$key_id" =~ ^[0-9A-F]{16}$ ]]
+          pwsh tests/release/write-manifest.ps1 \
+            -ArtifactDirectory "$dist" \
+            -Version "$version" \
+            -SigningKeyId "$key_id" \
+            -OutputPath "$manifest" \
+            -ChecksumsPath "$checksums"
+          minisign -S -W \
+            -s "$secret_key" \
+            -m "$manifest" \
+            -x "$signature" \
+            -c "WokCore CI release manifest" \
+            -t "ephemeral CI signature"
+          pwsh tests/release/verify-manifest.ps1 \
+            -ManifestPath "$manifest" \
+            -SignaturePath "$signature" \
+            -PublicKeyPath "$public_key" \
+            -ArtifactDirectory "$dist" \
+            -ChecksumsPath "$checksums" \
+            -ExpectedVersion "$version" \
+            -ExpectedSigningKeyId "$key_id" \
+            -MinisignPath "$(command -v minisign)"
+          rm -f -- "$secret_key" "$public_key"
+          trap - EXIT
 
   performance-policy:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
       - name: Check portable gate shell syntax
@@ -174,7 +313,7 @@ jobs:
       AZURE_OPENAI_API_KEY: ""
       AZURE_OPENAI_ENDPOINT: ""
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
       - name: Test Windows resource gate logic
@@ -182,7 +321,7 @@ jobs:
         run: >-
           powershell.exe -NoProfile -ExecutionPolicy Bypass
           -File tests/performance/windows-resource-gate.tests.ps1
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
           toolchain: 1.97.1
           target: x86_64-pc-windows-msvc
@@ -198,7 +337,7 @@ jobs:
           -TargetDirectory "${{ github.workspace }}\target"
       - name: Upload bounded Windows performance evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: provider-gates-windows-x64
           path: ${{ runner.temp }}\wokcore-performance\windows\provider-gates-report.json
@@ -228,10 +367,10 @@ jobs:
       AZURE_OPENAI_API_KEY: ""
       AZURE_OPENAI_ENDPOINT: ""
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
           toolchain: 1.97.1
           target: ${{ matrix.target }}
@@ -271,7 +410,7 @@ jobs:
           --skip-build
       - name: Upload bounded portable performance evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: provider-gates-${{ matrix.target }}
           path: ${{ runner.temp }}/wokcore-performance/${{ matrix.target }}/provider-gates-${{ matrix.platform }}-${{ env.PERFORMANCE_PROFILE }}.json
@@ -284,6 +423,7 @@ jobs:
       - quality
       - native-platform-test
       - target-check
+      - release-contract
       - performance-policy
       - windows-performance
       - portable-performance
@@ -294,6 +434,7 @@ jobs:
           QUALITY_RESULT: ${{ needs.quality.result }}
           NATIVE_RESULT: ${{ needs.native-platform-test.result }}
           TARGET_RESULT: ${{ needs.target-check.result }}
+          RELEASE_CONTRACT_RESULT: ${{ needs.release-contract.result }}
           PERFORMANCE_POLICY_RESULT: ${{ needs.performance-policy.result }}
           WINDOWS_PERFORMANCE_RESULT: ${{ needs.windows-performance.result }}
           PORTABLE_PERFORMANCE_RESULT: ${{ needs.portable-performance.result }}
@@ -301,6 +442,7 @@ jobs:
           test "$QUALITY_RESULT" = "success"
           test "$NATIVE_RESULT" = "success"
           test "$TARGET_RESULT" = "success"
+          test "$RELEASE_CONTRACT_RESULT" = "success"
           test "$PERFORMANCE_POLICY_RESULT" = "success"
           test "$WINDOWS_PERFORMANCE_RESULT" = "success"
           test "$PORTABLE_PERFORMANCE_RESULT" = "success"

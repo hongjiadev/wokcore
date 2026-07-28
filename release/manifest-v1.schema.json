@@ -1,0 +1,173 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/hongjiadev/wokcore/main/release/manifest-v1.schema.json",
+  "title": "WokCore update manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "product",
+    "api_major",
+    "version",
+    "signing_key_id",
+    "artifacts"
+  ],
+  "$defs": {
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "target",
+        "file",
+        "executable",
+        "size",
+        "sha256",
+        "url"
+      ],
+      "properties": {
+        "target": {
+          "type": "string"
+        },
+        "file": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255
+        },
+        "executable": {
+          "type": "string"
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 536870912
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "url": {
+          "type": "string",
+          "format": "uri",
+          "maxLength": 1024
+        }
+      }
+    }
+  },
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "product": {
+      "type": "string",
+      "const": "wokcore"
+    },
+    "api_major": {
+      "type": "integer",
+      "const": 1
+    },
+    "version": {
+      "type": "string",
+      "minLength": 5,
+      "maxLength": 128,
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(?:\\.(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$"
+    },
+    "signing_key_id": {
+      "type": "string",
+      "pattern": "^[0-9A-F]{16}$"
+    },
+    "artifacts": {
+      "type": "array",
+      "minItems": 5,
+      "maxItems": 5,
+      "prefixItems": [
+        {
+          "$ref": "#/$defs/artifact",
+          "properties": {
+            "target": {
+              "const": "x86_64-pc-windows-msvc"
+            },
+            "file": {
+              "pattern": "^wokcore-v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?-x86_64-pc-windows-msvc\\.zip$"
+            },
+            "executable": {
+              "const": "wokcore.exe"
+            },
+            "url": {
+              "pattern": "^https://github\\.com/hongjiadev/wokcore/releases/download/v[0-9A-Za-z.+-]+/wokcore-v[0-9A-Za-z.+-]+-x86_64-pc-windows-msvc\\.zip$"
+            }
+          }
+        },
+        {
+          "$ref": "#/$defs/artifact",
+          "properties": {
+            "target": {
+              "const": "x86_64-apple-darwin"
+            },
+            "file": {
+              "pattern": "^wokcore-v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?-x86_64-apple-darwin\\.tar\\.gz$"
+            },
+            "executable": {
+              "const": "wokcore"
+            },
+            "url": {
+              "pattern": "^https://github\\.com/hongjiadev/wokcore/releases/download/v[0-9A-Za-z.+-]+/wokcore-v[0-9A-Za-z.+-]+-x86_64-apple-darwin\\.tar\\.gz$"
+            }
+          }
+        },
+        {
+          "$ref": "#/$defs/artifact",
+          "properties": {
+            "target": {
+              "const": "aarch64-apple-darwin"
+            },
+            "file": {
+              "pattern": "^wokcore-v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?-aarch64-apple-darwin\\.tar\\.gz$"
+            },
+            "executable": {
+              "const": "wokcore"
+            },
+            "url": {
+              "pattern": "^https://github\\.com/hongjiadev/wokcore/releases/download/v[0-9A-Za-z.+-]+/wokcore-v[0-9A-Za-z.+-]+-aarch64-apple-darwin\\.tar\\.gz$"
+            }
+          }
+        },
+        {
+          "$ref": "#/$defs/artifact",
+          "properties": {
+            "target": {
+              "const": "x86_64-unknown-linux-gnu"
+            },
+            "file": {
+              "pattern": "^wokcore-v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?-x86_64-unknown-linux-gnu\\.tar\\.gz$"
+            },
+            "executable": {
+              "const": "wokcore"
+            },
+            "url": {
+              "pattern": "^https://github\\.com/hongjiadev/wokcore/releases/download/v[0-9A-Za-z.+-]+/wokcore-v[0-9A-Za-z.+-]+-x86_64-unknown-linux-gnu\\.tar\\.gz$"
+            }
+          }
+        },
+        {
+          "$ref": "#/$defs/artifact",
+          "properties": {
+            "target": {
+              "const": "aarch64-unknown-linux-gnu"
+            },
+            "file": {
+              "pattern": "^wokcore-v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?-aarch64-unknown-linux-gnu\\.tar\\.gz$"
+            },
+            "executable": {
+              "const": "wokcore"
+            },
+            "url": {
+              "pattern": "^https://github\\.com/hongjiadev/wokcore/releases/download/v[0-9A-Za-z.+-]+/wokcore-v[0-9A-Za-z.+-]+-aarch64-unknown-linux-gnu\\.tar\\.gz$"
+            }
+          }
+        }
+      ],
+      "items": false
+    }
+  }
+}

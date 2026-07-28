@@ -65,6 +65,24 @@ foreach ($forbidden in @(
 
 $ciSource = [IO.File]::ReadAllText($ciWorkflow, [Text.Encoding]::UTF8)
 $releaseSource = [IO.File]::ReadAllText($releaseWorkflow, [Text.Encoding]::UTF8)
+$releasePerformanceStart = $releaseSource.IndexOf(
+    "  windows-release-gate:",
+    [StringComparison]::Ordinal
+)
+$releasePerformanceEnd = $releaseSource.IndexOf(
+    "  publish-release:",
+    [StringComparison]::Ordinal
+)
+if (
+    $releasePerformanceStart -lt 0 -or
+    $releasePerformanceEnd -le $releasePerformanceStart
+) {
+    throw "Release performance job boundaries are invalid."
+}
+$releasePerformanceSource = $releaseSource.Substring(
+    $releasePerformanceStart,
+    $releasePerformanceEnd - $releasePerformanceStart
+)
 foreach ($required in @(
     "windows-performance:",
     "portable-performance:",
@@ -74,7 +92,7 @@ foreach ($required in @(
     "run-provider-gates.tests.sh",
     "run-provider-gates.ps1",
     "run-provider-gates.sh",
-    "actions/upload-artifact@v4",
+    "actions/upload-artifact@",
     "persist-credentials: false",
     "contents: read"
 )) {
@@ -92,7 +110,7 @@ foreach ($required in @(
     "ubuntu-24.04",
     "macos-15",
     "--profile soak",
-    "actions/upload-artifact@v4",
+    "actions/upload-artifact@",
     "persist-credentials: false",
     "contents: read"
 )) {
@@ -105,7 +123,7 @@ foreach ($required in @(
         throw "Release workflow is missing a soak invariant: $required"
     }
 }
-foreach ($source in @($ciSource, $releaseSource)) {
+foreach ($source in @($ciSource, $releasePerformanceSource)) {
     foreach ($forbidden in @(
         "secrets.",
         "OPENAI_API_KEY: `${{",
@@ -122,6 +140,19 @@ foreach ($source in @($ciSource, $releaseSource)) {
             throw "A performance workflow exposes a secret context."
         }
     }
+}
+$releaseSecretReferences = @(
+    [regex]::Matches(
+        $releaseSource,
+        "secrets\.[A-Za-z0-9_]+"
+    ) | ForEach-Object Value
+)
+if (
+    $releaseSecretReferences.Count -ne 1 -or
+    $releaseSecretReferences[0] -cne
+        "secrets.WOKCORE_MINISIGN_SECRET_KEY"
+) {
+    throw "Release workflow references an unapproved secret context."
 }
 
 Write-Output "portable provider gate policy tests passed"

@@ -17,6 +17,208 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  release-contract:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install Minisign
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes minisign
+      - name: Test deterministic Unix release packages
+        run: bash tests/release/build-package.tests.sh
+      - name: Test release manifest and Windows package contracts
+        shell: pwsh
+        run: pwsh tests/release/verify-manifest.tests.ps1
+      - name: Test release workflow contract
+        shell: pwsh
+        run: pwsh tests/release/release-workflow.tests.ps1
+      - name: Test public repository hygiene
+        shell: pwsh
+        run: pwsh tests/scripts/check-public-repo-hygiene.tests.ps1
+
+  build-release-package:
+    name: build-release-package (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            extension: zip
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            extension: tar.gz
+          - os: macos-15
+            target: aarch64-apple-darwin
+            extension: tar.gz
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            extension: tar.gz
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            extension: tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          toolchain: 1.97.1
+          target: ${{ matrix.target }}
+      - name: Resolve and validate release version
+        id: version
+        shell: pwsh
+        run: |
+          $source = [IO.File]::ReadAllText(
+              (Join-Path $env:GITHUB_WORKSPACE "Cargo.toml"),
+              [Text.Encoding]::UTF8
+          )
+          $match = [regex]::Match(
+              $source,
+              '(?ms)^\[workspace\.package\]\s*.*?^version\s*=\s*"([^"]+)"'
+          )
+          if (-not $match.Success) {
+              throw "Workspace package version is missing."
+          }
+          $version = $match.Groups[1].Value
+          if ($env:GITHUB_REF_TYPE -eq "tag") {
+              if (-not $env:GITHUB_REF_NAME.StartsWith("v")) {
+                  throw "Release tag must start with v."
+              }
+              $tagVersion = $env:GITHUB_REF_NAME.Substring(1)
+              if ($tagVersion -cne $version) {
+                  throw "Release tag does not match the workspace version."
+              }
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+      - name: Build fixed WokCore release executable
+        run: >-
+          cargo build
+          --package wokcore
+          --bin wokcore
+          --release
+          --locked
+          --target ${{ matrix.target }}
+      - name: Verify and package Windows executable
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $executable = Join-Path `
+              "${{ github.workspace }}\target\${{ matrix.target }}\release" `
+              "wokcore.exe"
+          & $executable --version
+          if ($LASTEXITCODE -ne 0) {
+              throw "The fixed WokCore release executable did not start."
+          }
+          powershell.exe -NoProfile -ExecutionPolicy Bypass `
+              -File tests/release/build-package.ps1 `
+              -ExecutablePath $executable `
+              -RepositoryRoot "${{ github.workspace }}" `
+              -OutputDirectory "${{ runner.temp }}\wokcore-release" `
+              -Version "${{ steps.version.outputs.version }}" `
+              -Target "${{ matrix.target }}"
+      - name: Verify and package Unix executable
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          executable="${{ github.workspace }}/target/${{ matrix.target }}/release/wokcore"
+          "$executable" --version
+          bash tests/release/build-package.sh \
+            --executable "$executable" \
+            --repository-root "${{ github.workspace }}" \
+            --output-directory "${{ runner.temp }}/wokcore-release" \
+            --version "${{ steps.version.outputs.version }}" \
+            --target "${{ matrix.target }}"
+      - name: Upload fixed release package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: wokcore-package-${{ matrix.target }}
+          path: ${{ runner.temp }}/wokcore-release/wokcore-v${{ steps.version.outputs.version }}-${{ matrix.target }}.${{ matrix.extension }}
+          if-no-files-found: error
+          retention-days: 14
+
+  assemble-release:
+    if: github.ref_type == 'tag'
+    needs:
+      - release-contract
+      - build-release-package
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install Minisign
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes minisign
+      - name: Download all target packages
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          pattern: wokcore-package-*
+          path: ${{ runner.temp }}/wokcore-release
+          merge-multiple: true
+      - name: Resolve release version
+        id: version
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          [[ "v$version" == "$GITHUB_REF_NAME" ]]
+          printf 'version=%s\n' "$version" >>"$GITHUB_OUTPUT"
+      - name: Write, sign, and verify release manifest
+        shell: bash
+        env:
+          WOKCORE_MINISIGN_SECRET_KEY: ${{ secrets.WOKCORE_MINISIGN_SECRET_KEY }}
+        run: |
+          set -Eeuo pipefail
+          dist="${{ runner.temp }}/wokcore-release"
+          public_key="${{ github.workspace }}/release/minisign.pub"
+          secret_key="${{ runner.temp }}/wokcore-minisign.key"
+          trap 'rm -f -- "$secret_key"' EXIT
+          [[ -f "$public_key" ]]
+          [[ -n "$WOKCORE_MINISIGN_SECRET_KEY" ]]
+          key_id="$(
+            sed -nE 's/^untrusted comment: minisign public key ([0-9A-F]{16})$/\1/p' \
+              "$public_key"
+          )"
+          [[ "$key_id" =~ ^[0-9A-F]{16}$ ]]
+          umask 077
+          printf '%s' "$WOKCORE_MINISIGN_SECRET_KEY" >"$secret_key"
+          pwsh tests/release/write-manifest.ps1 \
+            -ArtifactDirectory "$dist" \
+            -Version "${{ steps.version.outputs.version }}" \
+            -SigningKeyId "$key_id" \
+            -OutputPath "$dist/wokcore-update-v1.json" \
+            -ChecksumsPath "$dist/SHA256SUMS"
+          minisign -S -W \
+            -s "$secret_key" \
+            -m "$dist/wokcore-update-v1.json" \
+            -x "$dist/wokcore-update-v1.json.minisig" \
+            -c "WokCore release manifest" \
+            -t "wokcore v${{ steps.version.outputs.version }}"
+          pwsh tests/release/verify-manifest.ps1 \
+            -ManifestPath "$dist/wokcore-update-v1.json" \
+            -SignaturePath "$dist/wokcore-update-v1.json.minisig" \
+            -PublicKeyPath "$public_key" \
+            -ArtifactDirectory "$dist" \
+            -ChecksumsPath "$dist/SHA256SUMS" \
+            -ExpectedVersion "${{ steps.version.outputs.version }}" \
+            -ExpectedSigningKeyId "$key_id" \
+            -MinisignPath "$(command -v minisign)"
+          rm -f -- "$secret_key"
+          trap - EXIT
+      - name: Upload verified release bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: wokcore-release-${{ steps.version.outputs.version }}
+          path: ${{ runner.temp }}/wokcore-release/*
+          if-no-files-found: error
+          retention-days: 14
+
   windows-release-gate:
     runs-on: windows-latest
     timeout-minutes: 20
@@ -28,10 +230,10 @@ jobs:
       AZURE_OPENAI_API_KEY: ""
       AZURE_OPENAI_ENDPOINT: ""
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
           toolchain: 1.97.1
           target: x86_64-pc-windows-msvc
@@ -47,7 +249,7 @@ jobs:
           -TargetDirectory "${{ github.workspace }}\target"
       - name: Upload bounded Windows release evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-provider-gates-windows-x64
           path: ${{ runner.temp }}\wokcore-performance\windows\provider-gates-report.json
@@ -76,10 +278,10 @@ jobs:
       AZURE_OPENAI_API_KEY: ""
       AZURE_OPENAI_ENDPOINT: ""
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
           toolchain: 1.97.1
           target: ${{ matrix.target }}
@@ -119,9 +321,113 @@ jobs:
           --skip-build
       - name: Upload bounded portable soak evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-provider-gates-${{ matrix.target }}
           path: ${{ runner.temp }}/wokcore-performance/${{ matrix.target }}/provider-gates-${{ matrix.platform }}-soak.json
           if-no-files-found: warn
           retention-days: 14
+
+  publish-release:
+    if: github.ref_type == 'tag'
+    needs:
+      - assemble-release
+      - windows-release-gate
+      - portable-soak
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install Minisign
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes minisign
+      - name: Download verified release bundle
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          pattern: wokcore-release-*
+          path: ${{ runner.temp }}/wokcore-release
+          merge-multiple: true
+      - name: Publish or replace release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+          dist="${{ runner.temp }}/wokcore-release"
+          version="${GITHUB_REF_NAME#v}"
+          public_key="${{ github.workspace }}/release/minisign.pub"
+          [[ "$GITHUB_REF_NAME" == "v$version" ]]
+          expected=(
+            "SHA256SUMS"
+            "wokcore-update-v1.json"
+            "wokcore-update-v1.json.minisig"
+            "wokcore-v$version-aarch64-apple-darwin.tar.gz"
+            "wokcore-v$version-aarch64-unknown-linux-gnu.tar.gz"
+            "wokcore-v$version-x86_64-apple-darwin.tar.gz"
+            "wokcore-v$version-x86_64-pc-windows-msvc.zip"
+            "wokcore-v$version-x86_64-unknown-linux-gnu.tar.gz"
+          )
+          mapfile -t actual < <(
+            find "$dist" -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort
+          )
+          [[ "${#actual[@]}" -eq 8 ]]
+          [[ "$(printf '%s\n' "${actual[@]}")" == "$(printf '%s\n' "${expected[@]}")" ]]
+          key_id="$(
+            sed -nE 's/^untrusted comment: minisign public key ([0-9A-F]{16})$/\1/p' \
+              "$public_key"
+          )"
+          [[ "$key_id" =~ ^[0-9A-F]{16}$ ]]
+          pwsh tests/release/verify-manifest.ps1 \
+            -ManifestPath "$dist/wokcore-update-v1.json" \
+            -SignaturePath "$dist/wokcore-update-v1.json.minisig" \
+            -PublicKeyPath "$public_key" \
+            -ArtifactDirectory "$dist" \
+            -ChecksumsPath "$dist/SHA256SUMS" \
+            -ExpectedVersion "$version" \
+            -ExpectedSigningKeyId "$key_id" \
+            -MinisignPath "$(command -v minisign)"
+
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --draft
+            mapfile -t previous < <(
+              gh release view "$GITHUB_REF_NAME" \
+                --repo "$GITHUB_REPOSITORY" \
+                --json assets \
+                --jq '.assets[].name'
+            )
+            for asset in "${previous[@]}"; do
+              gh release delete-asset "$GITHUB_REF_NAME" "$asset" \
+                --repo "$GITHUB_REPOSITORY" \
+                --yes
+            done
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --draft \
+              --title "WokCore $GITHUB_REF_NAME" \
+              --generate-notes
+          fi
+          for asset in "${expected[@]}"; do
+            gh release upload "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              "$dist/$asset"
+          done
+          mapfile -t published < <(
+            gh release view "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json assets \
+              --jq '.assets[].name' |
+              LC_ALL=C sort
+          )
+          [[ "${#published[@]}" -eq 8 ]]
+          [[ "$(printf '%s\n' "${published[@]}")" == "$(printf '%s\n' "${expected[@]}")" ]]
+          gh release edit "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft=false
