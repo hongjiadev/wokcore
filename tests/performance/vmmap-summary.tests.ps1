@@ -42,6 +42,34 @@ if (
     throw "Modern vmmap summary should retain the footprint and mark MALLOC resident unavailable."
 }
 
+$modernResident = Invoke-VmmapSummaryParser @'
+Physical footprint:             96.0M
+                                VIRTUAL   RESIDENT    DIRTY
+MALLOC ZONE                         SIZE       SIZE     SIZE
+MALLOC guard page                   4.0K       0.0K     0.0K
+MALLOC_NANO                        16.0M       8.0M     8.0M
+MALLOC_SMALL                       32.0M      12.5M    12.5M
+'@
+$modernResidentResult = $modernResident | ConvertFrom-Json
+if (
+    $modernResidentResult.physical_footprint_kib -ne 98304 -or
+    $modernResidentResult.malloc_resident_kib -ne 20992 -or
+    $modernResidentResult.malloc_resident_parser_status -cne "parsed"
+) {
+    throw "Modern vmmap MALLOC subregions were parsed incorrectly."
+}
+
+$aggregateWithSubregions = Invoke-VmmapSummaryParser @'
+Physical footprint:             128.5M
+                                VIRTUAL   RESIDENT
+MALLOC                           64.0M      32.0M
+MALLOC_SMALL                     32.0M      12.5M
+'@
+$aggregateWithSubregionsResult = $aggregateWithSubregions | ConvertFrom-Json
+if ($aggregateWithSubregionsResult.malloc_resident_kib -ne 32768) {
+    throw "Aggregate MALLOC row must take precedence over subregions."
+}
+
 $previousErrorActionPreference = $ErrorActionPreference
 $ErrorActionPreference = "Continue"
 $invalid = "MALLOC 64.0M 32.0M" | & $python $parser 2>&1

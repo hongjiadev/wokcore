@@ -71,17 +71,41 @@ MODERN_VMMAP="$(
         'MALLOC                           64.0M          3' |
         python3 "$SCRIPT_DIRECTORY/parse-vmmap-summary.py"
 )"
+MODERN_RESIDENT_VMMAP="$(
+    printf '%s\n' \
+        'Physical footprint:             96.0M' \
+        '                                VIRTUAL   RESIDENT    DIRTY' \
+        'MALLOC ZONE                         SIZE       SIZE     SIZE' \
+        'MALLOC guard page                   4.0K       0.0K     0.0K' \
+        'MALLOC_NANO                        16.0M       8.0M     8.0M' \
+        'MALLOC_SMALL                       32.0M      12.5M    12.5M' |
+        python3 "$SCRIPT_DIRECTORY/parse-vmmap-summary.py"
+)"
+AGGREGATE_WITH_SUBREGIONS_VMMAP="$(
+    printf '%s\n' \
+        'Physical footprint:             128.5M' \
+        '                                VIRTUAL   RESIDENT' \
+        'MALLOC                           64.0M      32.0M' \
+        'MALLOC_SMALL                     32.0M      12.5M' |
+        python3 "$SCRIPT_DIRECTORY/parse-vmmap-summary.py"
+)"
 if printf '%s\n' 'MALLOC 64.0M 32.0M' |
     python3 "$SCRIPT_DIRECTORY/parse-vmmap-summary.py" >/dev/null 2>&1; then
     printf 'vmmap parser accepted a missing physical footprint\n' >&2
     exit 1
 fi
-python3 - "$LEGACY_VMMAP" "$MODERN_VMMAP" <<'PY'
+python3 - \
+    "$LEGACY_VMMAP" \
+    "$MODERN_VMMAP" \
+    "$MODERN_RESIDENT_VMMAP" \
+    "$AGGREGATE_WITH_SUBREGIONS_VMMAP" <<'PY'
 import json
 import sys
 
 legacy = json.loads(sys.argv[1])
 modern = json.loads(sys.argv[2])
+modern_resident = json.loads(sys.argv[3])
+aggregate_with_subregions = json.loads(sys.argv[4])
 assert legacy == {
     "malloc_resident_kib": 32768,
     "malloc_resident_parser_status": "parsed",
@@ -91,6 +115,16 @@ assert modern == {
     "malloc_resident_kib": None,
     "malloc_resident_parser_status": "unavailable",
     "physical_footprint_kib": 1024,
+}
+assert modern_resident == {
+    "malloc_resident_kib": 20992,
+    "malloc_resident_parser_status": "parsed",
+    "physical_footprint_kib": 98304,
+}
+assert aggregate_with_subregions == {
+    "malloc_resident_kib": 32768,
+    "malloc_resident_parser_status": "parsed",
+    "physical_footprint_kib": 131584,
 }
 PY
 TEMPORARY_ROOT="$TEST_ROOT"
