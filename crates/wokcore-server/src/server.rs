@@ -1,5 +1,5 @@
 use std::{
-    net::{IpAddr, Ipv4Addr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
 };
 
@@ -191,12 +191,7 @@ impl ServerShutdown {
 impl RunningServer {
     pub async fn start(listener: TcpListener, state: ServerState) -> Result<Self, ServerError> {
         let local_addr = listener.local_addr().map_err(ServerError::Listener)?;
-        if local_addr.ip() != IpAddr::V4(Ipv4Addr::LOCALHOST) {
-            return Err(ServerError::NotIpv4Loopback);
-        }
-        if state.authority.as_ref() != local_addr.to_string() {
-            return Err(ServerError::AuthorityMismatch);
-        }
+        validate_listener_identity(local_addr, state.authority.as_ref())?;
         let auto_shutdown_on_request = !state.coordinated_shutdown;
         let mut requested_shutdown = state.shutdown_receiver();
         let (owner_shutdown, mut listener_shutdown) = watch::channel(false);
@@ -268,6 +263,16 @@ impl RunningServer {
     }
 }
 
+fn validate_listener_identity(local_addr: SocketAddr, authority: &str) -> Result<(), ServerError> {
+    if local_addr.ip() != IpAddr::V4(Ipv4Addr::LOCALHOST) {
+        return Err(ServerError::NotIpv4Loopback);
+    }
+    if authority != local_addr.to_string() {
+        return Err(ServerError::AuthorityMismatch);
+    }
+    Ok(())
+}
+
 impl Drop for RunningServer {
     fn drop(&mut self) {
         self.shutdown.send_replace(true);
@@ -303,7 +308,18 @@ mod tests {
     use tokio::sync::watch;
     use tokio::time::{Duration, timeout};
 
-    use super::{RunningServer, ServerError};
+    use super::{RunningServer, ServerError, validate_listener_identity};
+
+    #[test]
+    fn listener_identity_rejects_other_ipv4_loopback_addresses_without_binding_them() {
+        assert!(matches!(
+            validate_listener_identity(
+                SocketAddr::from(([127, 0, 0, 2], 43127)),
+                "127.0.0.2:43127"
+            ),
+            Err(ServerError::NotIpv4Loopback)
+        ));
+    }
 
     #[tokio::test]
     async fn join_error_consumes_the_completed_task_handle() {

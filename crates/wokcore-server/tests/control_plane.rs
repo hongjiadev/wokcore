@@ -843,15 +843,6 @@ async fn listener_rejects_unspecified_ipv4_bindings() {
 }
 
 #[tokio::test]
-async fn listener_rejects_other_addresses_in_the_ipv4_loopback_block() {
-    let listener = TcpListener::bind("127.0.0.2:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let (state, _, _, _) = state_fixture(&address.to_string()).await;
-
-    assert!(RunningServer::start(listener, state).await.is_err());
-}
-
-#[tokio::test]
 async fn server_owner_can_explicitly_shutdown_and_join_the_listener() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
