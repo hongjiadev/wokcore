@@ -19,13 +19,15 @@ fn main() {
 }
 
 #[cfg(any(target_os = "macos", test))]
-const fn macos_allocator_options() -> [(i32, i64); 3] {
+const fn macos_allocator_options() -> [(i32, i64); 5] {
     // libmimalloc-sys intentionally omits unstable option constants. Its
     // bundled mimalloc v3 ABI assigns 5 to purge_decommits, 15 to
-    // purge_delay, and 36 to page_full_retain. Retaining no full pages is
-    // appropriate for Tokio's general-purpose worker threads and prevents a
-    // completed burst from pinning pages in every size class.
-    [(5, 1), (15, 0), (36, 0)]
+    // purge_delay, 26 to disallow_arena_alloc, 36 to page_full_retain, and 42
+    // to page_cross_thread_max_reclaim. macOS reports arena pages as resident
+    // after a burst even after a forced purge, so direct OS-backed pages are a
+    // better fit for this long-lived process. Tokio workers retain neither
+    // full pages nor abandoned pages reclaimed from other workers.
+    [(5, 1), (15, 0), (26, 1), (36, 0), (42, 0)]
 }
 
 #[cfg(target_os = "macos")]
@@ -66,7 +68,10 @@ fn build_runtime() -> std::io::Result<Runtime> {
 mod tests {
     #[test]
     fn macos_allocator_options_purge_idle_pages_immediately() {
-        assert_eq!(super::macos_allocator_options(), [(5, 1), (15, 0), (36, 0)]);
+        assert_eq!(
+            super::macos_allocator_options(),
+            [(5, 1), (15, 0), (26, 1), (36, 0), (42, 0)]
+        );
     }
 
     #[test]
