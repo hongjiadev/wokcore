@@ -8,9 +8,9 @@ use tokio::{
 
 use super::ServiceLifecycle;
 
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[cfg(any(all(target_os = "linux", target_env = "gnu"), target_os = "macos"))]
 const SYSTEM_IDLE_DELAY: Duration = Duration::from_secs(1);
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[cfg(any(all(target_os = "linux", target_env = "gnu"), target_os = "macos"))]
 const SYSTEM_FOLLOW_UP_IDLE_DELAY: Duration = Duration::from_secs(9);
 
 pub struct PreparedIdleMemoryReclaimer {
@@ -22,7 +22,7 @@ pub struct PreparedIdleMemoryReclaimer {
 
 impl PreparedIdleMemoryReclaimer {
     pub fn for_system(lifecycle: ServiceLifecycle) -> Option<Self> {
-        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        #[cfg(any(all(target_os = "linux", target_env = "gnu"), target_os = "macos"))]
         {
             Some(Self {
                 lifecycle,
@@ -31,7 +31,7 @@ impl PreparedIdleMemoryReclaimer {
                 backend: Arc::new(SystemMemoryReclaimBackend),
             })
         }
-        #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+        #[cfg(not(any(all(target_os = "linux", target_env = "gnu"), target_os = "macos")))]
         {
             let _ = lifecycle;
             None
@@ -158,7 +158,7 @@ trait MemoryReclaimBackend: Send + Sync + 'static {
     fn reclaim(&self);
 }
 
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[cfg(any(all(target_os = "linux", target_env = "gnu"), target_os = "macos"))]
 struct SystemMemoryReclaimBackend;
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
@@ -166,6 +166,20 @@ impl MemoryReclaimBackend for SystemMemoryReclaimBackend {
     fn reclaim(&self) {
         // SAFETY: glibc documents malloc_trim as process-global and thread-safe.
         let _ = unsafe { libc::malloc_trim(0) };
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn malloc_zone_pressure_relief(zone: *mut libc::c_void, goal: usize) -> usize;
+}
+
+#[cfg(target_os = "macos")]
+impl MemoryReclaimBackend for SystemMemoryReclaimBackend {
+    fn reclaim(&self) {
+        // SAFETY: Apple documents a null zone as examining all malloc zones and
+        // a zero goal as requesting maximal pressure relief.
+        let _ = unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) };
     }
 }
 

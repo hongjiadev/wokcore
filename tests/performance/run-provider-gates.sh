@@ -701,9 +701,9 @@ audit_macos_pid() {
         [[ "$line" == *" TCP "* ]] || continue
         endpoint="$(
             awk '{
-                for (index = 1; index <= NF; index++) {
-                    if ($index == "TCP") {
-                        print $(index + 1)
+                for (field_index = 1; field_index <= NF; field_index++) {
+                    if ($field_index == "TCP") {
+                        print $(field_index + 1)
                         exit
                     }
                 }
