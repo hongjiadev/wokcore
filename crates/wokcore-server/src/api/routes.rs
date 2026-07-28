@@ -235,8 +235,9 @@ pub(crate) async fn method_not_allowed(Extension(request_id): Extension<RequestI
 #[cfg(test)]
 mod tests {
     use crate::lifecycle::{LifecyclePhase, LifecycleSnapshot};
+    use wokcore_storage::ClientTokenScope;
 
-    use super::lifecycle_response;
+    use super::{lifecycle_response, parse_authorize_scopes};
 
     #[test]
     fn lifecycle_phase_names_are_stable_snake_case() {
@@ -246,5 +247,60 @@ mod tests {
         });
 
         assert_eq!(response.phase, "awaiting_cancellation");
+    }
+
+    #[test]
+    fn authorization_scope_parser_accepts_every_stable_scope_in_wire_order() {
+        let scopes = [
+            "clients.manage",
+            "providers.write",
+            "service.control",
+            "diagnostics.export",
+            "providers.read",
+            "service.read",
+            "usage.read",
+            "sessions.read",
+            "diagnostics.read",
+            "proxy.use",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+
+        assert_eq!(
+            parse_authorize_scopes(Some(scopes)),
+            Some(vec![
+                ClientTokenScope::ProxyUse,
+                ClientTokenScope::SessionsRead,
+                ClientTokenScope::UsageRead,
+                ClientTokenScope::DiagnosticsRead,
+                ClientTokenScope::DiagnosticsExport,
+                ClientTokenScope::ServiceRead,
+                ClientTokenScope::ServiceControl,
+                ClientTokenScope::ProvidersRead,
+                ClientTokenScope::ProvidersWrite,
+                ClientTokenScope::ClientsManage,
+            ])
+        );
+    }
+
+    #[test]
+    fn authorization_scope_parser_defaults_and_rejects_invalid_lists() {
+        assert_eq!(
+            parse_authorize_scopes(None),
+            Some(vec![ClientTokenScope::ProxyUse])
+        );
+        assert_eq!(parse_authorize_scopes(Some(Vec::new())), None);
+        assert_eq!(
+            parse_authorize_scopes(Some(vec!["unknown".to_owned()])),
+            None
+        );
+        assert_eq!(
+            parse_authorize_scopes(Some(vec![
+                "service.read".to_owned(),
+                "service.read".to_owned(),
+            ])),
+            None
+        );
     }
 }

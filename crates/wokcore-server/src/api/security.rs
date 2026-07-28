@@ -64,7 +64,7 @@ pub(crate) async fn enforce_request_security(
         }
         return ApiError::origin_not_allowed(request_id).into_response();
     }
-    let auth_class = classify_route(request.uri().path());
+    let auth_class = classify_route(request.method(), request.uri().path());
     if auth_class != RouteAuthClass::Public {
         let candidate = bearer_candidate(&request);
         match auth_class {
@@ -223,31 +223,56 @@ fn allowed_during_maintenance(path: &str) -> bool {
     )
 }
 
-fn classify_route(path: &str) -> RouteAuthClass {
+fn classify_route(method: &Method, path: &str) -> RouteAuthClass {
     if matches!(path, "/wokcore/v1/health" | "/wokcore/v1/capabilities") {
         return RouteAuthClass::Public;
     }
-    if matches!(
-        path,
-        "/wokcore/v1/service/status"
-            | "/wokcore/v1/service/drain"
-            | "/wokcore/v1/service/drain/cancel"
-            | "/wokcore/v1/service/stop"
-            | "/wokcore/v1/clients/authorize"
-    ) || is_revoke_path(path)
-    {
-        return RouteAuthClass::Management;
+    if method == Method::GET && path == "/wokcore/v1/service/status" {
+        return RouteAuthClass::ManagementOrClientScope(ClientTokenScope::ServiceRead);
     }
-    if path == "/wokcore/v1/sessions" || is_session_messages_path(path) {
+    if method == Method::POST
+        && matches!(
+            path,
+            "/wokcore/v1/service/drain"
+                | "/wokcore/v1/service/drain/cancel"
+                | "/wokcore/v1/service/stop"
+        )
+    {
+        return RouteAuthClass::ManagementOrClientScope(ClientTokenScope::ServiceControl);
+    }
+    if method == Method::GET
+        && matches!(
+            path,
+            "/wokcore/v1/providers/catalog"
+                | "/wokcore/v1/providers/runtime"
+                | "/wokcore/v1/providers/models"
+        )
+    {
+        return RouteAuthClass::ManagementOrClientScope(ClientTokenScope::ProvidersRead);
+    }
+    if (method == Method::POST && path == "/wokcore/v1/providers/config/validate")
+        || (method == Method::PUT && path == "/wokcore/v1/providers/config")
+        || (method == Method::POST && path == "/wokcore/v1/providers/reload")
+        || (method == Method::POST && path == "/wokcore/v1/provider-secrets")
+        || ((method == Method::PUT || method == Method::DELETE) && is_provider_secret_path(path))
+    {
+        return RouteAuthClass::ManagementOrClientScope(ClientTokenScope::ProvidersWrite);
+    }
+    if (method == Method::POST && path == "/wokcore/v1/clients/authorize")
+        || (method == Method::DELETE && is_revoke_path(path))
+    {
+        return RouteAuthClass::ManagementOrClientScope(ClientTokenScope::ClientsManage);
+    }
+    if method == Method::GET && (path == "/wokcore/v1/sessions" || is_session_messages_path(path)) {
         return RouteAuthClass::ManagementOrClientScope(ClientTokenScope::SessionsRead);
     }
-    if path == "/wokcore/v1/usage" {
+    if method == Method::GET && path == "/wokcore/v1/usage" {
         return RouteAuthClass::ManagementOrClientScope(ClientTokenScope::UsageRead);
     }
-    if path == "/wokcore/v1/logs" {
+    if method == Method::GET && path == "/wokcore/v1/logs" {
         return RouteAuthClass::ManagementOrClientScope(ClientTokenScope::DiagnosticsRead);
     }
-    if path == "/wokcore/v1/diagnostics/export" {
+    if method == Method::GET && path == "/wokcore/v1/diagnostics/export" {
         return RouteAuthClass::ManagementOrClientScope(ClientTokenScope::DiagnosticsExport);
     }
     if path.starts_with("/wokcore/v1/") {
@@ -396,6 +421,13 @@ fn is_revoke_path(path: &str) -> bool {
     )
 }
 
+fn is_provider_secret_path(path: &str) -> bool {
+    let Some(secret_ref) = path.strip_prefix("/wokcore/v1/provider-secrets/") else {
+        return false;
+    };
+    !secret_ref.is_empty() && !secret_ref.contains('/')
+}
+
 fn is_session_messages_path(path: &str) -> bool {
     let Some(segments) = path.strip_prefix("/wokcore/v1/sessions/") else {
         return false;
@@ -405,6 +437,114 @@ fn is_session_messages_path(path: &str) -> bool {
         (segments.next(), segments.next(), segments.next()),
         (Some(session_key), Some("messages"), None) if !session_key.is_empty()
     )
+}
+
+#[cfg(test)]
+mod route_auth_tests {
+    use axum::http::Method;
+    use wokcore_storage::ClientTokenScope;
+
+    use super::{RouteAuthClass, classify_route};
+
+    #[test]
+    fn management_route_scope_matrix_is_exact_and_method_aware() {
+        for (method, path, expected) in [
+            (
+                Method::GET,
+                "/wokcore/v1/service/status",
+                ClientTokenScope::ServiceRead,
+            ),
+            (
+                Method::POST,
+                "/wokcore/v1/service/drain",
+                ClientTokenScope::ServiceControl,
+            ),
+            (
+                Method::POST,
+                "/wokcore/v1/service/drain/cancel",
+                ClientTokenScope::ServiceControl,
+            ),
+            (
+                Method::POST,
+                "/wokcore/v1/service/stop",
+                ClientTokenScope::ServiceControl,
+            ),
+            (
+                Method::GET,
+                "/wokcore/v1/providers/catalog",
+                ClientTokenScope::ProvidersRead,
+            ),
+            (
+                Method::GET,
+                "/wokcore/v1/providers/runtime",
+                ClientTokenScope::ProvidersRead,
+            ),
+            (
+                Method::GET,
+                "/wokcore/v1/providers/models",
+                ClientTokenScope::ProvidersRead,
+            ),
+            (
+                Method::POST,
+                "/wokcore/v1/providers/config/validate",
+                ClientTokenScope::ProvidersWrite,
+            ),
+            (
+                Method::PUT,
+                "/wokcore/v1/providers/config",
+                ClientTokenScope::ProvidersWrite,
+            ),
+            (
+                Method::POST,
+                "/wokcore/v1/providers/reload",
+                ClientTokenScope::ProvidersWrite,
+            ),
+            (
+                Method::POST,
+                "/wokcore/v1/provider-secrets",
+                ClientTokenScope::ProvidersWrite,
+            ),
+            (
+                Method::PUT,
+                "/wokcore/v1/provider-secrets/secret",
+                ClientTokenScope::ProvidersWrite,
+            ),
+            (
+                Method::DELETE,
+                "/wokcore/v1/provider-secrets/secret",
+                ClientTokenScope::ProvidersWrite,
+            ),
+            (
+                Method::POST,
+                "/wokcore/v1/clients/authorize",
+                ClientTokenScope::ClientsManage,
+            ),
+            (
+                Method::DELETE,
+                "/wokcore/v1/clients/client/tokens/token",
+                ClientTokenScope::ClientsManage,
+            ),
+        ] {
+            assert_eq!(
+                classify_route(&method, path),
+                RouteAuthClass::ManagementOrClientScope(expected),
+                "{method} {path}"
+            );
+        }
+
+        for (method, path) in [
+            (Method::GET, "/wokcore/v1/providers/config"),
+            (Method::POST, "/wokcore/v1/providers/catalog"),
+            (Method::GET, "/wokcore/v1/clients/authorize"),
+            (Method::GET, "/wokcore/v1/future-private-route"),
+        ] {
+            assert_eq!(
+                classify_route(&method, path),
+                RouteAuthClass::Management,
+                "{method} {path}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

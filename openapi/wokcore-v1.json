@@ -73,8 +73,12 @@
         "security": [
           {
             "managementBearer": []
+          },
+          {
+            "clientBearer": []
           }
         ],
+        "x-wokcore-required-scope": "service.read",
         "responses": {
           "200": {
             "description": "Service lifecycle status",
@@ -103,8 +107,12 @@
         "security": [
           {
             "managementBearer": []
+          },
+          {
+            "clientBearer": []
           }
         ],
+        "x-wokcore-required-scope": "service.control",
         "responses": {
           "200": {
             "description": "Drain state",
@@ -133,8 +141,12 @@
         "security": [
           {
             "managementBearer": []
+          },
+          {
+            "clientBearer": []
           }
         ],
+        "x-wokcore-required-scope": "service.control",
         "responses": {
           "200": {
             "description": "Running state",
@@ -163,8 +175,12 @@
         "security": [
           {
             "managementBearer": []
+          },
+          {
+            "clientBearer": []
           }
         ],
+        "x-wokcore-required-scope": "service.control",
         "responses": {
           "200": {
             "description": "Stopping state",
@@ -193,8 +209,12 @@
         "security": [
           {
             "managementBearer": []
+          },
+          {
+            "clientBearer": []
           }
         ],
+        "x-wokcore-required-scope": "clients.manage",
         "requestBody": {
           "required": true,
           "content": {
@@ -234,6 +254,7 @@
           {"managementBearer": []},
           {"clientBearer": []}
         ],
+        "x-wokcore-required-scope": "sessions.read",
         "parameters": [
           {
             "name": "source",
@@ -281,6 +302,7 @@
           {"managementBearer": []},
           {"clientBearer": []}
         ],
+        "x-wokcore-required-scope": "sessions.read",
         "parameters": [
           {
             "name": "session_key",
@@ -334,6 +356,7 @@
           {"managementBearer": []},
           {"clientBearer": []}
         ],
+        "x-wokcore-required-scope": "usage.read",
         "parameters": [
           {
             "name": "source",
@@ -400,6 +423,7 @@
           {"managementBearer": []},
           {"clientBearer": []}
         ],
+        "x-wokcore-required-scope": "diagnostics.read",
         "parameters": [
           {"name": "request_id", "in": "query", "schema": {"type": "string", "maxLength": 256}},
           {"name": "trace_id", "in": "query", "schema": {"type": "string", "maxLength": 256}},
@@ -449,6 +473,7 @@
           {"managementBearer": []},
           {"clientBearer": []}
         ],
+        "x-wokcore-required-scope": "diagnostics.export",
         "parameters": [
           {"name": "request_id", "in": "query", "schema": {"type": "string", "maxLength": 256}},
           {"name": "trace_id", "in": "query", "schema": {"type": "string", "maxLength": 256}},
@@ -489,7 +514,8 @@
     "/wokcore/v1/providers/catalog": {
       "get": {
         "operationId": "listProviderCatalog",
-        "security": [{"managementBearer": []}],
+        "security": [{"managementBearer": []}, {"clientBearer": []}],
+        "x-wokcore-required-scope": "providers.read",
         "responses": {
           "200": {
             "description": "Frozen Provider catalog",
@@ -507,7 +533,8 @@
     "/wokcore/v1/providers/runtime": {
       "get": {
         "operationId": "getProviderRuntime",
-        "security": [{"managementBearer": []}],
+        "security": [{"managementBearer": []}, {"clientBearer": []}],
+        "x-wokcore-required-scope": "providers.read",
         "responses": {
           "200": {
             "description": "Active Provider runtime status",
@@ -525,7 +552,8 @@
     "/wokcore/v1/providers/models": {
       "get": {
         "operationId": "listProviderModels",
-        "security": [{"managementBearer": []}],
+        "security": [{"managementBearer": []}, {"clientBearer": []}],
+        "x-wokcore-required-scope": "providers.read",
         "responses": {
           "200": {
             "description": "Active public models",
@@ -543,7 +571,8 @@
     "/wokcore/v1/providers/config/validate": {
       "post": {
         "operationId": "validateProviderConfiguration",
-        "security": [{"managementBearer": []}],
+        "security": [{"managementBearer": []}, {"clientBearer": []}],
+        "x-wokcore-required-scope": "providers.write",
         "requestBody": {
           "required": true,
           "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ProviderCandidate"}}}
@@ -565,7 +594,8 @@
     "/wokcore/v1/providers/config": {
       "put": {
         "operationId": "commitProviderConfiguration",
-        "security": [{"managementBearer": []}],
+        "security": [{"managementBearer": []}, {"clientBearer": []}],
+        "x-wokcore-required-scope": "providers.write",
         "requestBody": {
           "required": true,
           "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ProviderCommitRequest"}}}
@@ -587,7 +617,8 @@
     "/wokcore/v1/providers/reload": {
       "post": {
         "operationId": "reloadProviderConfiguration",
-        "security": [{"managementBearer": []}],
+        "security": [{"managementBearer": []}, {"clientBearer": []}],
+        "x-wokcore-required-scope": "providers.write",
         "responses": {
           "200": {
             "description": "Reloaded Provider configuration",
@@ -605,7 +636,8 @@
     "/wokcore/v1/provider-secrets": {
       "post": {
         "operationId": "createProviderSecret",
-        "security": [{"managementBearer": []}],
+        "security": [{"managementBearer": []}, {"clientBearer": []}],
+        "x-wokcore-required-scope": "providers.write",
         "requestBody": {
           "required": true,
           "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ProviderSecretCreate"}}}
@@ -635,7 +667,8 @@
       ],
       "put": {
         "operationId": "replaceProviderSecret",
-        "security": [{"managementBearer": []}],
+        "security": [{"managementBearer": []}, {"clientBearer": []}],
+        "x-wokcore-required-scope": "providers.write",
         "requestBody": {
           "required": true,
           "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ProviderSecretReplace"}}}
@@ -655,7 +688,8 @@
       },
       "delete": {
         "operationId": "deleteProviderSecret",
-        "security": [{"managementBearer": []}],
+        "security": [{"managementBearer": []}, {"clientBearer": []}],
+        "x-wokcore-required-scope": "providers.write",
         "responses": {
           "200": {
             "description": "Deleted unused Provider secret",
@@ -676,8 +710,12 @@
         "security": [
           {
             "managementBearer": []
+          },
+          {
+            "clientBearer": []
           }
         ],
+        "x-wokcore-required-scope": "clients.manage",
         "parameters": [
           {
             "name": "client_id",
@@ -1109,7 +1147,7 @@
       "ClientTokenScopes": {
         "type": "array",
         "minItems": 1,
-        "maxItems": 5,
+        "maxItems": 10,
         "uniqueItems": true,
         "items": {
           "type": "string",
@@ -1118,7 +1156,12 @@
             "sessions.read",
             "usage.read",
             "diagnostics.read",
-            "diagnostics.export"
+            "diagnostics.export",
+            "service.read",
+            "service.control",
+            "providers.read",
+            "providers.write",
+            "clients.manage"
           ]
         }
       },

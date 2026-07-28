@@ -2092,11 +2092,12 @@ async fn authorize_emits_one_proxy_token_and_stop_completes_before_owner_cleanup
         .send()
         .await
         .unwrap();
-    assert_eq!(
-        proxy_as_management.status(),
-        reqwest::StatusCode::UNAUTHORIZED
-    );
+    assert_eq!(proxy_as_management.status(), reqwest::StatusCode::FORBIDDEN);
     let proxy_error = proxy_as_management.text().await.unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&proxy_error).unwrap()["error"]["code"],
+        "insufficient_scope"
+    );
     assert!(!proxy_error.contains(&token));
     assert!(!proxy_error.contains(&management_canary));
 

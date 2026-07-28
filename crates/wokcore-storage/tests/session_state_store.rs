@@ -361,13 +361,13 @@ fn external_crate_can_rebuild_every_page_key_from_validated_components() {
 }
 
 #[test]
-fn ordered_migration_history_reaches_schema_four() {
+fn ordered_migration_history_reaches_schema_five() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("state.db");
 
     let store = StateStore::open(&path).unwrap();
 
-    assert_eq!(store.health().unwrap().schema_version, 4);
+    assert_eq!(store.health().unwrap().schema_version, 5);
     let connection = Connection::open(path).unwrap();
     let versions = connection
         .prepare("SELECT version FROM schema_migrations ORDER BY version")
@@ -376,7 +376,7 @@ fn ordered_migration_history_reaches_schema_four() {
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(versions, [1, 2, 3, 4]);
+    assert_eq!(versions, [1, 2, 3, 4, 5]);
 }
 
 #[test]
@@ -576,6 +576,11 @@ fn schema_two_tokens_migrate_with_proxy_scope_and_scope_allowlist_is_exact() {
         ("usage.read", ClientTokenScope::UsageRead),
         ("diagnostics.read", ClientTokenScope::DiagnosticsRead),
         ("diagnostics.export", ClientTokenScope::DiagnosticsExport),
+        ("service.read", ClientTokenScope::ServiceRead),
+        ("service.control", ClientTokenScope::ServiceControl),
+        ("providers.read", ClientTokenScope::ProvidersRead),
+        ("providers.write", ClientTokenScope::ProvidersWrite),
+        ("clients.manage", ClientTokenScope::ClientsManage),
     ];
     for (text, expected) in allowed {
         assert_eq!(ClientTokenScope::from_str(text).unwrap(), expected);
@@ -638,7 +643,7 @@ fn schema_two_migration_is_transactional_concurrent_and_preserves_data() {
         .collect::<Vec<_>>();
 
     for handle in handles {
-        assert_eq!(handle.join().unwrap().schema_version, 4);
+        assert_eq!(handle.join().unwrap().schema_version, 5);
     }
     let connection = Connection::open(path).unwrap();
     assert_eq!(
@@ -654,12 +659,12 @@ fn schema_two_migration_is_transactional_concurrent_and_preserves_data() {
     assert_eq!(
         connection
             .query_row(
-                "SELECT COUNT(*) FROM schema_migrations WHERE version IN (3, 4)",
+                "SELECT COUNT(*) FROM schema_migrations WHERE version IN (3, 4, 5)",
                 [],
                 |row| row.get::<_, i64>(0),
             )
             .unwrap(),
-        2
+        3
     );
 }
 
@@ -2100,14 +2105,14 @@ fn schema_four_offline_and_live_read_only_inspection_do_not_write() {
     let before_live = directory_snapshot(directory.path());
 
     let live = ReadOnlyStateStore::open_live(&path).unwrap();
-    assert_eq!(live.health().unwrap().schema_version, 4);
+    assert_eq!(live.health().unwrap().schema_version, 5);
     drop(live);
     assert_eq!(directory_snapshot(directory.path()), before_live);
     drop(store);
     let before_offline = directory_snapshot(directory.path());
 
     let offline = ReadOnlyStateStore::open(&path).unwrap();
-    assert_eq!(offline.health().unwrap().schema_version, 4);
+    assert_eq!(offline.health().unwrap().schema_version, 5);
     drop(offline);
     assert_eq!(directory_snapshot(directory.path()), before_offline);
 }

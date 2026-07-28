@@ -323,7 +323,7 @@ async fn http_management_contract_is_strict_scoped_revisioned_and_content_free()
         ))
         .await
         .unwrap();
-    assert_eq!(scoped.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(scoped.status(), StatusCode::FORBIDDEN);
 
     let catalog = fixture
         .send(Method::GET, "/wokcore/v1/providers/catalog", None, None)

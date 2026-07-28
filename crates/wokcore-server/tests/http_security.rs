@@ -23,7 +23,9 @@ use wokcore_server::{
     lifecycle::ServiceLifecycle,
     runtime::SystemTokenMetadata,
 };
-use wokcore_storage::{ClientTokenMetadata, MemorySecretStore, RuntimeSecretBinding, StorageError};
+use wokcore_storage::{
+    ClientTokenMetadata, ClientTokenScope, MemorySecretStore, RuntimeSecretBinding, StorageError,
+};
 
 const AUTHORITY: &str = "127.0.0.1:43127";
 const CREATED_AT: &str = "2026-07-26T00:00:00Z";
@@ -103,6 +105,14 @@ impl AuthMetadataStore for TestMetadata {
         Ok(())
     }
 
+    fn issue_client_token_with_scopes(
+        &self,
+        _token: &ClientTokenMetadata,
+        _scopes: &[ClientTokenScope],
+    ) -> Result<(), StorageError> {
+        Ok(())
+    }
+
     fn revoke_client_token(
         &self,
         _client_id: &ClientId,
@@ -142,6 +152,46 @@ async fn router_with_request_id_entropy(request_id_entropy: Arc<dyn EntropySourc
         Arc::new(SystemTokenMetadata::new(Arc::new(FixedEntropy))),
         request_id_entropy,
     ))
+}
+
+async fn router_with_client_scope(scope: ClientTokenScope) -> (Router, String) {
+    let secret_scope = SecretScope {
+        provider_id: ProviderId::new("wokcore-runtime").unwrap(),
+        account_id: None,
+        purpose: SecretPurpose::Auxiliary,
+    };
+    let auth = AuthRegistry::bootstrap(
+        Arc::new(MemorySecretStore::default()),
+        Arc::new(TestMetadata::default()),
+        Arc::new(FixedEntropy),
+        secret_scope,
+        CREATED_AT.to_owned(),
+    )
+    .await
+    .unwrap();
+    let token = auth
+        .issue_client_token_with_scopes(
+            "scoped-token".to_owned(),
+            ClientId::new("wokrouter").unwrap(),
+            CREATED_AT.to_owned(),
+            vec![scope],
+        )
+        .await
+        .unwrap()
+        .into_response_value()
+        .expose_secret()
+        .to_owned();
+    let lifecycle = ServiceLifecycle::new();
+    lifecycle.mark_running().unwrap();
+    let app = build_router(ServerState::new_with_runtime_sources(
+        AUTHORITY,
+        Uuid::parse_str("019844f0-4de0-7000-8000-000000000001").unwrap(),
+        Arc::new(auth),
+        lifecycle,
+        Arc::new(SystemTokenMetadata::new(Arc::new(FixedEntropy))),
+        Arc::new(IncrementingEntropy::default()),
+    ));
+    (app, token)
 }
 
 fn request(method: &str, host: Option<&str>, origin: Option<&str>) -> Request<Body> {
@@ -387,6 +437,92 @@ async fn management_routes_reject_missing_malformed_wrong_and_proxy_bearer_token
 }
 
 #[tokio::test]
+async fn scoped_management_routes_enforce_allow_forbid_missing_and_management_compatibility() {
+    for (scope, method, path) in [
+        (
+            ClientTokenScope::ServiceRead,
+            "GET",
+            "/wokcore/v1/service/status",
+        ),
+        (
+            ClientTokenScope::ServiceControl,
+            "POST",
+            "/wokcore/v1/service/drain/cancel",
+        ),
+        (
+            ClientTokenScope::ProvidersRead,
+            "GET",
+            "/wokcore/v1/providers/catalog",
+        ),
+        (
+            ClientTokenScope::ProvidersWrite,
+            "POST",
+            "/wokcore/v1/providers/reload",
+        ),
+        (
+            ClientTokenScope::ClientsManage,
+            "DELETE",
+            "/wokcore/v1/clients/wokrouter/tokens/unknown",
+        ),
+    ] {
+        let (allowed_app, allowed_token) = router_with_client_scope(scope).await;
+        let allowed = allowed_app
+            .oneshot(authorized_request(method, path, &allowed_token))
+            .await
+            .unwrap();
+        assert!(
+            !matches!(
+                allowed.status(),
+                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+            ),
+            "allowed scope failed for {method} {path}"
+        );
+
+        let (wrong_app, wrong_token) = router_with_client_scope(ClientTokenScope::ProxyUse).await;
+        let forbidden = wrong_app
+            .oneshot(authorized_request(method, path, &wrong_token))
+            .await
+            .unwrap();
+        assert_eq!(
+            forbidden.status(),
+            StatusCode::FORBIDDEN,
+            "wrong scope for {method} {path}"
+        );
+        assert_eq!(error_code(forbidden).await, "insufficient_scope");
+
+        let missing = router()
+            .await
+            .oneshot(request_to(
+                method,
+                path,
+                Some(AUTHORITY),
+                None,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            missing.status(),
+            StatusCode::UNAUTHORIZED,
+            "missing token for {method} {path}"
+        );
+
+        let management = router()
+            .await
+            .oneshot(authorized_request(method, path, &management_token()))
+            .await
+            .unwrap();
+        assert!(
+            !matches!(
+                management.status(),
+                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+            ),
+            "management compatibility failed for {method} {path}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn unknown_and_scoped_control_plane_routes_never_fall_through_as_public() {
     for path in [
         "/wokcore/v1/sessions",
@@ -537,4 +673,13 @@ async fn error_code(response: axum::response::Response) -> String {
 async fn response_body(response: axum::response::Response) -> Value {
     let body = to_bytes(response.into_body(), 32 * 1024).await.unwrap();
     serde_json::from_slice(&body).unwrap()
+}
+
+fn authorized_request(method: &str, path: &str, token: &str) -> Request<Body> {
+    let mut request = request_to(method, path, Some(AUTHORITY), None, Body::empty());
+    request.headers_mut().insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+    );
+    request
 }

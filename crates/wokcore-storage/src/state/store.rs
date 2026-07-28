@@ -24,7 +24,8 @@ const SESSION_DIAGNOSTICS_MIGRATION: &str =
     include_str!("../../migrations/0003_session_diagnostics.sql");
 const PROVIDER_METADATA_MIGRATION: &str =
     include_str!("../../migrations/0004_provider_metadata.sql");
-const LATEST_SCHEMA_VERSION: i64 = 4;
+const CLIENT_SCOPE_MIGRATION: &str = include_str!("../../migrations/0005_client_scopes.sql");
+const LATEST_SCHEMA_VERSION: i64 = 5;
 const GLOBAL_CURRENT_SESSION_INDEX_FIRST_PAGE_SQL: &str =
     "SELECT i.session_key, i.source_key, i.generation, i.source_kind,
             i.created_at, i.last_active_at, i.message_count,
@@ -193,6 +194,11 @@ pub enum ClientTokenScope {
     UsageRead,
     DiagnosticsRead,
     DiagnosticsExport,
+    ServiceRead,
+    ServiceControl,
+    ProvidersRead,
+    ProvidersWrite,
+    ClientsManage,
 }
 
 impl ClientTokenScope {
@@ -203,6 +209,11 @@ impl ClientTokenScope {
             Self::UsageRead => "usage.read",
             Self::DiagnosticsRead => "diagnostics.read",
             Self::DiagnosticsExport => "diagnostics.export",
+            Self::ServiceRead => "service.read",
+            Self::ServiceControl => "service.control",
+            Self::ProvidersRead => "providers.read",
+            Self::ProvidersWrite => "providers.write",
+            Self::ClientsManage => "clients.manage",
         }
     }
 
@@ -213,6 +224,11 @@ impl ClientTokenScope {
             Self::UsageRead => 2,
             Self::DiagnosticsRead => 3,
             Self::DiagnosticsExport => 4,
+            Self::ServiceRead => 5,
+            Self::ServiceControl => 6,
+            Self::ProvidersRead => 7,
+            Self::ProvidersWrite => 8,
+            Self::ClientsManage => 9,
         }
     }
 }
@@ -238,6 +254,11 @@ impl FromStr for ClientTokenScope {
             "usage.read" => Ok(Self::UsageRead),
             "diagnostics.read" => Ok(Self::DiagnosticsRead),
             "diagnostics.export" => Ok(Self::DiagnosticsExport),
+            "service.read" => Ok(Self::ServiceRead),
+            "service.control" => Ok(Self::ServiceControl),
+            "providers.read" => Ok(Self::ProvidersRead),
+            "providers.write" => Ok(Self::ProvidersWrite),
+            "clients.manage" => Ok(Self::ClientsManage),
             _ => Err(ClientTokenScopeParseError),
         }
     }
@@ -1170,7 +1191,7 @@ impl ReadOnlyStateStore {
 
     pub fn health(&self) -> Result<StateHealth, StorageError> {
         let versions = schema_versions(&self.connection)?;
-        if versions != [1, 2, 3, LATEST_SCHEMA_VERSION] {
+        if versions != [1, 2, 3, 4, LATEST_SCHEMA_VERSION] {
             return Err(StorageError::StateDatabaseCorrupt {
                 message: "state database has an incompatible migration history".to_owned(),
             });
@@ -1249,7 +1270,7 @@ impl StateStore {
                  PRAGMA query_only = ON;",
             )
             .map_err(map_database_error)?;
-        if schema_versions(&connection)? != [1, 2, 3, LATEST_SCHEMA_VERSION] {
+        if schema_versions(&connection)? != [1, 2, 3, 4, LATEST_SCHEMA_VERSION] {
             return Err(StorageError::StateDatabaseCorrupt {
                 message: "state database has an incompatible migration history".to_owned(),
             });
@@ -1591,7 +1612,7 @@ impl StateStore {
                 message: "client token scopes must not be empty".to_owned(),
             });
         }
-        let mut seen = [false; 5];
+        let mut seen = [false; 10];
         for scope in scopes {
             if std::mem::replace(&mut seen[scope.index()], true) {
                 return Err(StorageError::InvalidStateRecord {
@@ -1715,6 +1736,11 @@ impl StateStore {
                     WHEN 'usage.read' THEN 2
                     WHEN 'diagnostics.read' THEN 3
                     WHEN 'diagnostics.export' THEN 4
+                    WHEN 'service.read' THEN 5
+                    WHEN 'service.control' THEN 6
+                    WHEN 'providers.read' THEN 7
+                    WHEN 'providers.write' THEN 8
+                    WHEN 'clients.manage' THEN 9
                  END",
             )
             .map_err(map_database_error)?;
@@ -5470,6 +5496,7 @@ fn apply_ordered_migrations(connection: &mut Connection) -> Result<(), StorageEr
         (2, RUNTIME_AUTH_MIGRATION),
         (3, SESSION_DIAGNOSTICS_MIGRATION),
         (4, PROVIDER_METADATA_MIGRATION),
+        (5, CLIENT_SCOPE_MIGRATION),
     ] {
         if versions.contains(&version) {
             continue;

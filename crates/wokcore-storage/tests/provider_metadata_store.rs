@@ -39,7 +39,7 @@ fn schema_four_replaces_raw_affinity_tables_and_preserves_unrelated_state() {
     }
 
     let store = StateStore::open(&path).expect("migrated store");
-    assert_eq!(store.health().expect("health").schema_version, 4);
+    assert_eq!(store.health().expect("health").schema_version, 5);
     store.checkpoint_truncate().expect("checkpoint");
     drop(store);
 

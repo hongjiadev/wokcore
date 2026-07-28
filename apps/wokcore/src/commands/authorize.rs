@@ -173,3 +173,61 @@ fn parse_scopes(scopes: Vec<String>) -> Option<Vec<ClientTokenScope>> {
     parsed.dedup();
     (parsed.len() == original_len).then_some(parsed)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::parse_scopes;
+    use wokcore_storage::ClientTokenScope;
+
+    #[test]
+    fn empty_scope_list_defaults_to_proxy_use() {
+        assert_eq!(
+            parse_scopes(Vec::new()),
+            Some(vec![ClientTokenScope::ProxyUse])
+        );
+    }
+
+    #[test]
+    fn every_client_scope_parses_and_sorts_by_stable_wire_order() {
+        let scopes = [
+            "clients.manage",
+            "providers.write",
+            "service.control",
+            "diagnostics.export",
+            "providers.read",
+            "service.read",
+            "usage.read",
+            "sessions.read",
+            "diagnostics.read",
+            "proxy.use",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+
+        assert_eq!(
+            parse_scopes(scopes),
+            Some(vec![
+                ClientTokenScope::ProxyUse,
+                ClientTokenScope::SessionsRead,
+                ClientTokenScope::UsageRead,
+                ClientTokenScope::DiagnosticsRead,
+                ClientTokenScope::DiagnosticsExport,
+                ClientTokenScope::ServiceRead,
+                ClientTokenScope::ServiceControl,
+                ClientTokenScope::ProvidersRead,
+                ClientTokenScope::ProvidersWrite,
+                ClientTokenScope::ClientsManage,
+            ])
+        );
+    }
+
+    #[test]
+    fn unknown_and_duplicate_scopes_are_rejected() {
+        assert_eq!(parse_scopes(vec!["unknown".to_owned()]), None);
+        assert_eq!(
+            parse_scopes(vec!["service.read".to_owned(), "service.read".to_owned()]),
+            None
+        );
+    }
+}

@@ -64,20 +64,35 @@ fn openapi_31_matches_the_exact_control_plane_contract_without_secret_examples()
             assert_eq!(operation["x-wokcore-required-scope"], "proxy.use");
         } else if matches!(path, "/wokcore/v1/health" | "/wokcore/v1/capabilities") {
             assert_eq!(security, json!([]));
-        } else if matches!(
-            path,
-            "/wokcore/v1/sessions"
-                | "/wokcore/v1/sessions/{session_key}/messages"
-                | "/wokcore/v1/usage"
-                | "/wokcore/v1/logs"
-                | "/wokcore/v1/diagnostics/export"
-        ) {
+        } else {
             assert_eq!(
                 security,
                 json!([{"managementBearer":[]},{"clientBearer":[]}])
             );
-        } else {
-            assert_eq!(security, json!([{"managementBearer":[]}]));
+            let required_scope = match path {
+                "/wokcore/v1/service/status" => "service.read",
+                "/wokcore/v1/service/drain"
+                | "/wokcore/v1/service/drain/cancel"
+                | "/wokcore/v1/service/stop" => "service.control",
+                "/wokcore/v1/clients/authorize"
+                | "/wokcore/v1/clients/{client_id}/tokens/{token_id}" => "clients.manage",
+                "/wokcore/v1/sessions" | "/wokcore/v1/sessions/{session_key}/messages" => {
+                    "sessions.read"
+                }
+                "/wokcore/v1/usage" => "usage.read",
+                "/wokcore/v1/logs" => "diagnostics.read",
+                "/wokcore/v1/diagnostics/export" => "diagnostics.export",
+                "/wokcore/v1/providers/catalog"
+                | "/wokcore/v1/providers/runtime"
+                | "/wokcore/v1/providers/models" => "providers.read",
+                "/wokcore/v1/providers/config/validate"
+                | "/wokcore/v1/providers/config"
+                | "/wokcore/v1/providers/reload"
+                | "/wokcore/v1/provider-secrets"
+                | "/wokcore/v1/provider-secrets/{secret_ref}" => "providers.write",
+                _ => panic!("missing required scope for {method} {path}"),
+            };
+            assert_eq!(operation["x-wokcore-required-scope"], required_scope);
         }
         assert_eq!(
             operation["responses"]["default"]["$ref"],
@@ -118,6 +133,30 @@ fn openapi_31_matches_the_exact_control_plane_contract_without_secret_examples()
     assert_eq!(
         document["components"]["schemas"]["AuthorizeResponse"]["properties"]["token"]["readOnly"],
         true
+    );
+    assert_eq!(
+        document["components"]["schemas"]["ClientTokenScopes"],
+        json!({
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 10,
+            "uniqueItems": true,
+            "items": {
+                "type": "string",
+                "enum": [
+                    "proxy.use",
+                    "sessions.read",
+                    "usage.read",
+                    "diagnostics.read",
+                    "diagnostics.export",
+                    "service.read",
+                    "service.control",
+                    "providers.read",
+                    "providers.write",
+                    "clients.manage"
+                ]
+            }
+        })
     );
     assert_eq!(
         document["components"]["schemas"]["ProviderSecretCreate"]["properties"]["secret"]["writeOnly"],
