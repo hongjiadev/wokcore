@@ -1851,7 +1851,7 @@ enum DeleteSynchronizationPoint {
 #[cfg(all(test, unix))]
 mod delete_synchronization_tests {
     use std::{
-        sync::{Arc, Barrier, Mutex},
+        sync::{Arc, Barrier, Mutex, MutexGuard},
         thread::ThreadId,
     };
 
@@ -1866,6 +1866,20 @@ mod delete_synchronization_tests {
     pub(super) struct HookWindow {
         reached: Barrier,
         resume: Barrier,
+    }
+
+    pub(super) struct HookRegistration {
+        thread: ThreadId,
+        _registration: MutexGuard<'static, ()>,
+    }
+
+    impl Drop for HookRegistration {
+        fn drop(&mut self) {
+            let mut hook = HOOK.lock().expect("delete hook mutex is not poisoned");
+            if hook.as_ref().is_some_and(|hook| hook.thread == self.thread) {
+                *hook = None;
+            }
+        }
     }
 
     impl HookWindow {
@@ -1885,24 +1899,27 @@ mod delete_synchronization_tests {
         }
     }
 
+    static REGISTRATION: Mutex<()> = Mutex::new(());
     static HOOK: Mutex<Option<Hook>> = Mutex::new(None);
 
     pub(super) fn install(
         thread: ThreadId,
         point: DeleteSynchronizationPoint,
         window: Arc<HookWindow>,
-    ) {
-        *HOOK.lock().expect("delete hook mutex is not poisoned") = Some(Hook {
+    ) -> HookRegistration {
+        let registration = REGISTRATION
+            .lock()
+            .expect("delete hook registration mutex is not poisoned");
+        let mut hook = HOOK.lock().expect("delete hook mutex is not poisoned");
+        assert!(hook.is_none(), "delete hook registration leaked");
+        *hook = Some(Hook {
             thread,
             point,
             window,
         });
-    }
-
-    pub(super) fn uninstall(thread: ThreadId) {
-        let mut hook = HOOK.lock().expect("delete hook mutex is not poisoned");
-        if hook.as_ref().is_some_and(|hook| hook.thread == thread) {
-            *hook = None;
+        HookRegistration {
+            thread,
+            _registration: registration,
         }
     }
 
@@ -2081,7 +2098,7 @@ mod tests {
         });
         let worker_id = thread_rx.recv().unwrap();
         let window = Arc::new(HookWindow::new());
-        delete_synchronization_tests::install(
+        let _registration = delete_synchronization_tests::install(
             worker_id,
             DeleteSynchronizationPoint::MarkerAndTombstoneProbeBeforeMarkerLock,
             Arc::clone(&window),
@@ -2094,7 +2111,6 @@ mod tests {
         window.resume();
 
         assert!(worker.join().unwrap().unwrap());
-        delete_synchronization_tests::uninstall(worker_id);
         assert!(!tombstone.exists());
         assert!(!marker.exists());
     }
@@ -2230,7 +2246,7 @@ mod tests {
             });
             let worker_id = thread_rx.recv().unwrap();
             let window = Arc::new(HookWindow::new());
-            delete_synchronization_tests::install(
+            let _registration = delete_synchronization_tests::install(
                 worker_id,
                 DeleteSynchronizationPoint::MarkerCreatedBeforeHardening,
                 Arc::clone(&window),
@@ -2244,7 +2260,6 @@ mod tests {
 
             window.resume();
             let reservation = worker.join().unwrap().unwrap();
-            delete_synchronization_tests::uninstall(worker_id);
             assert_eq!(reservation.slot, 0);
             assert!(!source.exists());
             assert!(root.join(&reservation.name).exists());
@@ -2383,7 +2398,7 @@ mod tests {
         });
         let worker_id = thread_rx.recv().unwrap();
         let window = Arc::new(HookWindow::new());
-        delete_synchronization_tests::install(
+        let _registration = delete_synchronization_tests::install(
             worker_id,
             DeleteSynchronizationPoint::QuarantineRename,
             Arc::clone(&window),
@@ -2408,7 +2423,6 @@ mod tests {
         window.resume();
 
         assert!(worker.join().unwrap().is_err());
-        delete_synchronization_tests::uninstall(worker_id);
         assert!(!root.join("segment.jsonl").exists());
         assert_eq!(fs::read(quarantine).unwrap(), b"foreign");
         assert!(fs::read(relocated).unwrap().is_empty());
@@ -2433,7 +2447,7 @@ mod tests {
         });
         let worker_id = thread_rx.recv().unwrap();
         let window = Arc::new(HookWindow::new());
-        delete_synchronization_tests::install(
+        let _registration = delete_synchronization_tests::install(
             worker_id,
             DeleteSynchronizationPoint::QuarantineIdentityBeforeUnlink,
             Arc::clone(&window),
@@ -2458,7 +2472,6 @@ mod tests {
         window.resume();
 
         assert!(worker.join().unwrap().is_err());
-        delete_synchronization_tests::uninstall(worker_id);
         assert_eq!(fs::read(&quarantine).unwrap(), b"foreign");
         assert!(fs::read(relocated).unwrap().is_empty());
     }
