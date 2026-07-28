@@ -32,6 +32,10 @@ MAC_SECURITY_HOME=""
 ORIGINAL_DEFAULT_KEYCHAIN=""
 ORIGINAL_KEYCHAINS=()
 REPORT_PATH=""
+VMMAP_PARSER=""
+MACOS_VMMAP_BASELINE="-"
+MACOS_VMMAP_RECOVERY="-"
+MACOS_VMMAP_DIAGNOSTIC_FAILURE=0
 RUNTIME_ENVIRONMENT=()
 
 usage() {
@@ -222,6 +226,7 @@ configure_platform() {
             PLATFORM="macos"
             command_required lsof
             command_required security
+            command_required vmmap
             ;;
         *)
             fail "portable provider gates support Linux and macOS only"
@@ -257,6 +262,8 @@ configure_paths() {
     umask 077
     mkdir -p -- "$OUTPUT_DIRECTORY"
     REPORT_PATH="$OUTPUT_DIRECTORY/provider-gates-${PLATFORM}-${PROFILE}.json"
+    VMMAP_PARSER="$REPOSITORY_ROOT/tests/performance/parse-vmmap-summary.py"
+    [[ -f "$VMMAP_PARSER" ]] || fail "vmmap summary parser is missing"
 }
 
 build_fixed_executables() {
@@ -769,6 +776,24 @@ resource_snapshot() {
     fi
 }
 
+capture_macos_vmmap_snapshot() {
+    local phase="$1"
+    local pid="$2"
+    [[ "$PLATFORM" == "macos" ]] || return 0
+
+    local parsed
+    parsed="$(
+        vmmap -summary -resident "$pid" 2>/dev/null |
+            python3 "$VMMAP_PARSER"
+    )" || return 1
+
+    case "$phase" in
+        baseline) MACOS_VMMAP_BASELINE="$parsed" ;;
+        recovery) MACOS_VMMAP_RECOVERY="$parsed" ;;
+        *) return 1 ;;
+    esac
+}
+
 monitor_runtime() {
     while [[ ! -e "$MONITOR_STOP_FILE" ]]; do
         if [[ -n "$WOKCORE_PID" ]] && kill -0 "$WOKCORE_PID" 2>/dev/null; then
@@ -1043,7 +1068,9 @@ write_final_report() {
         "$baseline_tasks" \
         "$final_tasks" \
         "$RESOURCE_SAMPLES_FILE" \
-        "$RECOVERY_STARTED_AT" <<'PY'
+        "$RECOVERY_STARTED_AT" \
+        "$MACOS_VMMAP_BASELINE" \
+        "$MACOS_VMMAP_RECOVERY" <<'PY'
 import json
 import os
 import sys
@@ -1074,6 +1101,8 @@ import sys
     final_tasks,
     samples_path,
     recovery_started_at,
+    macos_vmmap_baseline,
+    macos_vmmap_recovery,
 ) = sys.argv[1:]
 failures = (
     []
@@ -1101,6 +1130,40 @@ if samples_path and os.path.isfile(samples_path):
             )
             if len(recovery_timeline) == 64:
                 break
+
+
+def parse_vmmap_snapshot(encoded: str) -> dict[str, int | str | None]:
+    snapshot = json.loads(encoded)
+    if snapshot == {"status": "capture_failed"}:
+        return snapshot
+    if set(snapshot) != {
+        "physical_footprint_kib",
+        "malloc_resident_kib",
+        "malloc_resident_parser_status",
+    }:
+        raise ValueError("invalid vmmap diagnostic fields")
+    physical = snapshot["physical_footprint_kib"]
+    resident = snapshot["malloc_resident_kib"]
+    status = snapshot["malloc_resident_parser_status"]
+    if not isinstance(physical, int) or not 0 < physical <= 16 * 1024 * 1024 * 1024:
+        raise ValueError("invalid vmmap physical footprint")
+    if resident is not None and (
+        not isinstance(resident, int) or not 0 < resident <= 16 * 1024 * 1024 * 1024
+    ):
+        raise ValueError("invalid vmmap MALLOC resident")
+    if status not in {"parsed", "unavailable"}:
+        raise ValueError("invalid vmmap MALLOC parser status")
+    if (status == "parsed") != (resident is not None):
+        raise ValueError("inconsistent vmmap MALLOC diagnostic")
+    return snapshot
+
+
+macos_vmmap = None
+if platform == "macos":
+    macos_vmmap = {
+        "baseline": parse_vmmap_snapshot(macos_vmmap_baseline),
+        "recovery": parse_vmmap_snapshot(macos_vmmap_recovery),
+    }
 report = {
     "schema_version": 1,
     "passed": passed == "true",
@@ -1138,6 +1201,8 @@ report = {
         "recovery_timeline": recovery_timeline,
     },
 }
+if macos_vmmap is not None:
+    report["resources"]["macos_vmmap"] = macos_vmmap
 encoded = json.dumps(report, separators=(",", ":"), sort_keys=True)
 if not encoded or len(encoded.encode("utf-8")) >= 131072:
     raise SystemExit(1)
@@ -1174,6 +1239,10 @@ run_profile() {
     local baseline_fd
     local baseline_tasks
     IFS=$'\t' read -r baseline_rss baseline_fd baseline_tasks <<<"$baseline"
+    if ! capture_macos_vmmap_snapshot baseline "$WOKCORE_PID"; then
+        MACOS_VMMAP_BASELINE='{"status":"capture_failed"}'
+        MACOS_VMMAP_DIAGNOSTIC_FAILURE=1
+    fi
     : >"$RESOURCE_SAMPLES_FILE"
     TOTAL_STARTED=0
     TOTAL_COMPLETED=0
@@ -1220,6 +1289,10 @@ run_profile() {
     local final_fd
     local final_tasks
     IFS=$'\t' read -r recovery_rss final_fd final_tasks <<<"$recovery"
+    if ! capture_macos_vmmap_snapshot recovery "$WOKCORE_PID"; then
+        MACOS_VMMAP_RECOVERY='{"status":"capture_failed"}'
+        MACOS_VMMAP_DIAGNOSTIC_FAILURE=1
+    fi
     local peak_rss
     peak_rss="$(
         awk -F '\t' '
@@ -1248,6 +1321,8 @@ run_profile() {
         failures+=("runtime_process")
     [[ ! -e "$NETWORK_VIOLATION_FILE" ]] ||
         failures+=("non_loopback_network")
+    [[ "$MACOS_VMMAP_DIAGNOSTIC_FAILURE" -eq 0 ]] ||
+        failures+=("vmmap_diagnostic")
     ((recovery_rss <= recovery_limit)) ||
         failures+=("recovery_rss")
     ((final_fd <= baseline_fd + 32)) ||

@@ -10,6 +10,8 @@ grep -q 'wait_for_wokcore_ready' "$SCRIPT_DIRECTORY/run-provider-gates.sh"
 grep -q '"status" "--json"' "$SCRIPT_DIRECTORY/run-provider-gates.sh"
 grep -q 'report_wokcore_start_failure' "$SCRIPT_DIRECTORY/run-provider-gates.sh"
 grep -q 'tail -c 4096' "$SCRIPT_DIRECTORY/run-provider-gates.sh"
+grep -q 'vmmap -summary -resident' "$SCRIPT_DIRECTORY/run-provider-gates.sh"
+grep -q 'vmmap_diagnostic' "$SCRIPT_DIRECTORY/run-provider-gates.sh"
 
 (
     PROFILE=""
@@ -54,6 +56,42 @@ done
 
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
+LEGACY_VMMAP="$(
+    printf '%s\n' \
+        'Physical footprint:             128.5M' \
+        '                                VIRTUAL   RESIDENT' \
+        'MALLOC                           64.0M      32.0M' |
+        python3 "$SCRIPT_DIRECTORY/parse-vmmap-summary.py"
+)"
+MODERN_VMMAP="$(
+    printf '%s\n' \
+        'Physical footprint:             1024K' \
+        '                                VIRTUAL   REGION' \
+        'MALLOC                           64.0M          3' |
+        python3 "$SCRIPT_DIRECTORY/parse-vmmap-summary.py"
+)"
+if printf '%s\n' 'MALLOC 64.0M 32.0M' |
+    python3 "$SCRIPT_DIRECTORY/parse-vmmap-summary.py" >/dev/null 2>&1; then
+    printf 'vmmap parser accepted a missing physical footprint\n' >&2
+    exit 1
+fi
+python3 - "$LEGACY_VMMAP" "$MODERN_VMMAP" <<'PY'
+import json
+import sys
+
+legacy = json.loads(sys.argv[1])
+modern = json.loads(sys.argv[2])
+assert legacy == {
+    "malloc_resident_kib": 32768,
+    "malloc_resident_parser_status": "parsed",
+    "physical_footprint_kib": 131584,
+}
+assert modern == {
+    "malloc_resident_kib": None,
+    "malloc_resident_parser_status": "unavailable",
+    "physical_footprint_kib": 1024,
+}
+PY
 TEMPORARY_ROOT="$TEST_ROOT"
 REPORT_PATH="$TEST_ROOT/report.json"
 PLATFORM="linux"
@@ -216,6 +254,45 @@ for forbidden in (
 ):
     assert forbidden not in encoded
 PY
+
+PLATFORM="macos"
+MACOS_VMMAP_BASELINE="$LEGACY_VMMAP"
+MACOS_VMMAP_RECOVERY="$MODERN_VMMAP"
+REPORT_PATH="$TEST_ROOT/macos-report.json"
+write_final_report \
+    true \
+    "" \
+    300 \
+    20000 \
+    70000 \
+    24000 \
+    85536 \
+    20 \
+    22 \
+    4 \
+    4
+python3 - "$REPORT_PATH" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    report = json.load(handle)
+assert report["resources"]["macos_vmmap"] == {
+    "baseline": {
+        "malloc_resident_kib": 32768,
+        "malloc_resident_parser_status": "parsed",
+        "physical_footprint_kib": 131584,
+    },
+    "recovery": {
+        "malloc_resident_kib": None,
+        "malloc_resident_parser_status": "unavailable",
+        "physical_footprint_kib": 1024,
+    },
+}
+PY
+PLATFORM="linux"
+MACOS_VMMAP_BASELINE="-"
+MACOS_VMMAP_RECOVERY="-"
 
 REPORT_PATH="$TEST_ROOT/failure-report.json"
 write_final_report \

@@ -29,7 +29,7 @@ wokcore-protocols = { version = "0.1.0", path = "../../crates/wokcore-protocols"
 wokcore-server = { version = "0.1.0", path = "../../crates/wokcore-server" }
 wokcore-storage = { version = "0.1.0", path = "../../crates/wokcore-storage" }
 
-[target.'cfg(target_os = "macos")'.dependencies]
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 libmimalloc-sys.workspace = true
 mimalloc.workspace = true
 

@@ -32,6 +32,10 @@ foreach ($required in @(
     'security create-keychain',
     'network_loopback_only',
     'recovery_rss_kib',
+    'vmmap -summary -resident',
+    'macos_vmmap',
+    'vmmap_diagnostic',
+    'parse-vmmap-summary.py',
     'final_fd_count',
     'final_task_count',
     '131072'
