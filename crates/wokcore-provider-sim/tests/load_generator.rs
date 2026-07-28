@@ -59,7 +59,7 @@ async fn load_generator_opens_five_hundred_uncapped_streams_with_bounded_evidenc
     let config = LoadConfig::new(simulator.url("/").as_str())
         .unwrap()
         .with_concurrency(500)
-        .with_duration(Duration::from_secs(5))
+        .with_duration(Duration::from_secs(15))
         .with_protocol_mix(vec![ProtocolWeight::new(LoadProtocol::Responses, 1)])
         .with_payload_profile(LoadPayloadProfile::Standard32K);
 

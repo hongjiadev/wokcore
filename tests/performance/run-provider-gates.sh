@@ -385,6 +385,7 @@ isolate_environment() {
         "$TMPDIR"
 
     if [[ "$PLATFORM" == "macos" ]]; then
+        export CFFIXED_USER_HOME="$HOME"
         configure_macos_keychain
     fi
 
@@ -431,6 +432,11 @@ isolate_environment() {
         "no_proxy=$no_proxy"
         "LANG=${LANG:-C.UTF-8}"
     )
+    if [[ "$PLATFORM" == "macos" ]]; then
+        RUNTIME_ENVIRONMENT+=(
+            "CFFIXED_USER_HOME=$CFFIXED_USER_HOME"
+        )
+    fi
     if [[ "$PLATFORM" == "linux" ]]; then
         RUNTIME_ENVIRONMENT+=(
             "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS"
