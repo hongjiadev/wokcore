@@ -671,11 +671,22 @@ impl StartedService {
 }
 
 fn map_auth_error(error: AuthError) -> ServeError {
+    if let Some(event_code) = auth_startup_event_code(&error) {
+        report_startup_failure(event_code);
+    }
     match error {
         AuthError::Storage(error @ StorageError::StateDatabaseCorrupt { .. }) => {
             ServeError::Storage(error)
         }
         _ => ServeError::Auth,
+    }
+}
+
+fn auth_startup_event_code(error: &AuthError) -> Option<&'static str> {
+    match error {
+        AuthError::SecretStoreRead => Some("startup_auth_secret_read_failed"),
+        AuthError::SecretStoreWrite => Some("startup_auth_secret_write_failed"),
+        _ => None,
     }
 }
 
@@ -790,4 +801,22 @@ enum ServeError {
     Cancelled,
     Readiness,
     Server,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::auth_startup_event_code;
+    use wokcore_server::auth::AuthError;
+
+    #[test]
+    fn authentication_secret_failures_have_stable_startup_stage_codes() {
+        assert_eq!(
+            auth_startup_event_code(&AuthError::SecretStoreRead),
+            Some("startup_auth_secret_read_failed")
+        );
+        assert_eq!(
+            auth_startup_event_code(&AuthError::SecretStoreWrite),
+            Some("startup_auth_secret_write_failed")
+        );
+    }
 }

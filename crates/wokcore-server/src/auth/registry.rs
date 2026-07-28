@@ -240,7 +240,7 @@ impl AuthRegistry {
             let value = secrets
                 .get(&binding.secret_ref)
                 .await
-                .map_err(|_| AuthError::SecretStore)?;
+                .map_err(|_| AuthError::SecretStoreRead)?;
             if !is_admin_token(value.expose_secret()) {
                 return Err(AuthError::InvalidManagementSecret);
             }
@@ -250,7 +250,7 @@ impl AuthRegistry {
             let secret_ref = secrets
                 .put(&management_scope, material.into_secret_value())
                 .await
-                .map_err(|_| AuthError::SecretStore)?;
+                .map_err(|_| AuthError::SecretStoreWrite)?;
             let binding_ref = secret_ref.clone();
             let binding_created_at = created_at.clone();
             let bind_result = run_metadata(Arc::clone(&metadata), move |metadata| {
@@ -282,7 +282,7 @@ impl AuthRegistry {
             let value = secrets
                 .get(&binding.secret_ref)
                 .await
-                .map_err(|_| AuthError::SecretStore)?;
+                .map_err(|_| AuthError::SecretStoreRead)?;
             if !is_admin_token(value.expose_secret()) {
                 return Err(AuthError::InvalidManagementSecret);
             }
@@ -522,8 +522,10 @@ async fn await_mutation_task<T>(
 pub enum AuthError {
     #[error("runtime authentication metadata operation failed")]
     Storage(#[source] StorageError),
-    #[error("runtime secret store operation failed")]
-    SecretStore,
+    #[error("runtime secret store read operation failed")]
+    SecretStoreRead,
+    #[error("runtime secret store write operation failed")]
+    SecretStoreWrite,
     #[error("runtime management secret has an invalid format")]
     InvalidManagementSecret,
     #[error("runtime management secret binding failed after orphan metadata was recorded")]

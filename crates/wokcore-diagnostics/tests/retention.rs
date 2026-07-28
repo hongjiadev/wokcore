@@ -57,6 +57,37 @@ fn create_segment(root: &std::path::Path, index: u64, modified: SystemTime) -> u
     encoded.len()
 }
 
+fn assert_only_expected_segment(root: &std::path::Path, expected: &str) {
+    let mut names = fs::read_dir(root)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    names.sort();
+
+    assert!(
+        names.iter().any(|name| name == expected),
+        "expected retained segment {expected:?}, found {names:?}"
+    );
+    let unexpected = names
+        .iter()
+        .filter(|name| name.as_str() != expected && !is_allowed_internal_retention_entry(name))
+        .collect::<Vec<_>>();
+    assert!(
+        unexpected.is_empty(),
+        "unexpected retention entries remained: {unexpected:?}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn is_allowed_internal_retention_entry(name: &str) -> bool {
+    name == ".wokcore-diagnostic-parent.lock"
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_allowed_internal_retention_entry(_name: &str) -> bool {
+    false
+}
+
 #[test]
 fn retention_runs_only_after_startup_and_rotation() {
     let directory = tempdir().unwrap();
@@ -239,10 +270,7 @@ fn retention_pages_through_more_than_4096_owned_segments_with_bounded_state() {
     );
     assert_eq!(report.removed_files(), 4_100);
     assert!(!root.join("segment-00000000000000000001.jsonl").exists());
-    assert_eq!(
-        fs::read_dir(&root).unwrap().filter_map(Result::ok).count(),
-        1
-    );
+    assert_only_expected_segment(&root, "segment-00000000000000004101.jsonl");
     assert!(root.join("segment-00000000000000004101.jsonl").exists());
 }
 
@@ -271,10 +299,7 @@ fn size_retention_scans_512_candidates_in_three_linear_passes() {
         .div_ceil(RETENTION_PAGE_ENTRIES);
     assert_eq!(report.pages_scanned(), pages_per_pass * 3);
     assert_eq!(report.removed_files(), 511);
-    assert_eq!(
-        fs::read_dir(&root).unwrap().filter_map(Result::ok).count(),
-        1
-    );
+    assert_only_expected_segment(&root, "segment-00000000000000000512.jsonl");
     assert!(root.join("segment-00000000000000000512.jsonl").exists());
 }
 
