@@ -10,6 +10,29 @@ use wokcore_platform::diagnostics::{
     MAX_DIAGNOSTIC_DELETE_TOMBSTONES, MAX_DIAGNOSTIC_WRITE_CHUNK_BYTES,
 };
 
+#[cfg(unix)]
+fn assert_no_diagnostic_residue(root: &std::path::Path) {
+    let residue = fs::read_dir(root)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| {
+            #[cfg(target_os = "macos")]
+            {
+                return name != OsStr::new(".wokcore-diagnostic-parent.lock");
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = name;
+                true
+            }
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        residue.is_empty(),
+        "unexpected diagnostic residue: {residue:?}"
+    );
+}
+
 #[test]
 fn pinned_diagnostic_file_updates_only_the_opened_identity() {
     let fixture = tempdir().unwrap();
@@ -265,7 +288,7 @@ fn read_lease_blocks_removal_until_the_lease_is_dropped() {
     assert!(!root.join("leased.jsonl").exists());
     assert!(directory.entries(1).unwrap().is_empty());
     #[cfg(unix)]
-    assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+    assert_no_diagnostic_residue(&root);
 }
 
 #[test]
@@ -358,7 +381,11 @@ fn staged_commit_rejects_an_owned_temporary_changed_outside_the_writer() {
     let temporary = fs::read_dir(&root)
         .unwrap()
         .map(|entry| entry.unwrap().path())
-        .find(|path| path.file_name().is_some_and(|name| name != "snapshot.bin"))
+        .find(|path| {
+            path.file_name().is_some_and(|name| {
+                name != "snapshot.bin" && name != ".wokcore-diagnostic-parent.lock"
+            })
+        })
         .unwrap();
     let external = OpenOptions::new().append(true).open(temporary);
     #[cfg(windows)]
@@ -375,7 +402,7 @@ fn staged_commit_rejects_an_owned_temporary_changed_outside_the_writer() {
         drop(external);
         assert_eq!(staged.commit().unwrap_err(), DiagnosticStoreError::Changed);
         assert!(!root.join("snapshot.bin").exists());
-        assert!(fs::read_dir(&root).unwrap().next().is_none());
+        assert_no_diagnostic_residue(&root);
     }
 }
 

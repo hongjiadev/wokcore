@@ -25,10 +25,12 @@ const fn macos_allocator_options() -> [(i32, i64); 5] {
     // purge_delay, 26 to disallow_arena_alloc, 36 to page_full_retain, and 42
     // to page_cross_thread_max_reclaim. macOS reports arena pages as resident
     // after a burst even after a forced purge, so direct OS-backed pages are a
-    // better fit for this long-lived process. A negative page_full_retain
-    // value keeps pages owned by their persistent Tokio worker, so its park
-    // hook can collect remote frees instead of leaving abandoned page queues.
-    [(5, 1), (15, 0), (26, 1), (36, -1), (42, 0)]
+    // better fit for this long-lived process. A page_full_retain value of zero
+    // permits full pages to be abandoned without retaining one
+    // per size class. An unlimited cross-thread reclaim value lets persistent
+    // Tokio workers reclaim their originating pages before the park hook
+    // forces an immediate purge.
+    [(5, 1), (15, 0), (26, 1), (36, 0), (42, -1)]
 }
 
 #[cfg(target_os = "macos")]
@@ -71,7 +73,7 @@ mod tests {
     fn macos_allocator_options_purge_idle_pages_immediately() {
         assert_eq!(
             super::macos_allocator_options(),
-            [(5, 1), (15, 0), (26, 1), (36, -1), (42, 0)]
+            [(5, 1), (15, 0), (26, 1), (36, 0), (42, -1)]
         );
     }
 
