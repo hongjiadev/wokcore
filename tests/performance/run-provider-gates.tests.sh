@@ -67,6 +67,14 @@ TOTAL_COMPLETED=768
 TOTAL_CANCELLED=256
 TOTAL_ERRORS=0
 MAX_PEAK_ACTIVE=256
+RESOURCE_SAMPLES_FILE="$TEST_ROOT/resource-samples.tsv"
+RECOVERY_STARTED_AT=100
+printf '%s\n' \
+    $'99\t70000\t20\t4' \
+    $'100\t68000\t20\t4' \
+    $'105\t42000\t19\t4' \
+    $'130\t24000\t22\t4' \
+    >"$RESOURCE_SAMPLES_FILE"
 
 ARTIFACT_DIRECTORY="$TEST_ROOT/startup-diagnostics"
 mkdir -p "$ARTIFACT_DIRECTORY"
@@ -174,6 +182,26 @@ assert report["loads"]["peak_active"] == 256
 assert report["loads"]["cancelled"] == 256
 assert report["network_loopback_only"] is True
 assert report["resources"]["recovery_rss_kib"] == 24000
+assert report["resources"]["recovery_timeline"] == [
+    {
+        "elapsed_seconds": 0,
+        "fd_count": 20,
+        "rss_kib": 68000,
+        "task_count": 4,
+    },
+    {
+        "elapsed_seconds": 5,
+        "fd_count": 19,
+        "rss_kib": 42000,
+        "task_count": 4,
+    },
+    {
+        "elapsed_seconds": 30,
+        "fd_count": 22,
+        "rss_kib": 24000,
+        "task_count": 4,
+    },
+]
 assert os.path.getsize(path) < 131072
 encoded = json.dumps(report).lower()
 for forbidden in (

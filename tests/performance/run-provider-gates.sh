@@ -8,6 +8,7 @@ SKIP_BUILD=0
 PROFILE_SECONDS=0
 PROFILE_CONCURRENCY=0
 RECOVERY_SECONDS=0
+RECOVERY_STARTED_AT=0
 PLATFORM=""
 REPOSITORY_ROOT=""
 MAIN_REPOSITORY=""
@@ -1040,7 +1041,9 @@ write_final_report() {
         "$baseline_fd" \
         "$final_fd" \
         "$baseline_tasks" \
-        "$final_tasks" <<'PY'
+        "$final_tasks" \
+        "$RESOURCE_SAMPLES_FILE" \
+        "$RECOVERY_STARTED_AT" <<'PY'
 import json
 import os
 import sys
@@ -1069,12 +1072,35 @@ import sys
     final_fd,
     baseline_tasks,
     final_tasks,
+    samples_path,
+    recovery_started_at,
 ) = sys.argv[1:]
 failures = (
     []
     if failure_csv == "-"
     else [value for value in failure_csv.split(",") if value]
 )
+recovery_timeline = []
+if samples_path and os.path.isfile(samples_path):
+    recovery_epoch = int(recovery_started_at)
+    with open(samples_path, "r", encoding="utf-8") as handle:
+        for line in handle:
+            fields = line.rstrip("\n").split("\t")
+            if len(fields) != 4 or not all(field.isdigit() for field in fields):
+                continue
+            timestamp, rss, descriptors, tasks = map(int, fields)
+            if timestamp < recovery_epoch:
+                continue
+            recovery_timeline.append(
+                {
+                    "elapsed_seconds": timestamp - recovery_epoch,
+                    "rss_kib": rss,
+                    "fd_count": descriptors,
+                    "task_count": tasks,
+                }
+            )
+            if len(recovery_timeline) == 64:
+                break
 report = {
     "schema_version": 1,
     "passed": passed == "true",
@@ -1109,6 +1135,7 @@ report = {
         "final_fd_count": int(final_fd),
         "baseline_task_count": int(baseline_tasks),
         "final_task_count": int(final_tasks),
+        "recovery_timeline": recovery_timeline,
     },
 }
 encoded = json.dumps(report, separators=(",", ":"), sort_keys=True)
@@ -1182,6 +1209,7 @@ run_profile() {
     local profile_elapsed
     profile_elapsed=$(( $(date +%s) - profile_started ))
 
+    RECOVERY_STARTED_AT="$(date +%s)"
     sleep "$RECOVERY_SECONDS"
     local recovery
     recovery="$(resource_snapshot "$WOKCORE_PID")" || {
