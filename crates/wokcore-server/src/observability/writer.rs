@@ -26,6 +26,7 @@ use wokcore_diagnostics::{
     segment::{
         BoxedDurableWriterOwner, DiagnosticDropSummary, DurableDropRequests, DurableProcessError,
         DurableProcessOutcome, DurableProducer, DurableWorkOutcome, SegmentError,
+        SegmentRecoveryFailure, SegmentRecoveryOperation,
     },
     snapshot::{SnapshotOwner, SnapshotRecorder, SnapshotShutdown},
 };
@@ -385,6 +386,10 @@ impl DiagnosticWriterError {
             Self::Recovery(DurableProcessError::Segment(SegmentError::InvalidData)) => {
                 "startup_diagnostics_segment_invalid"
             }
+            Self::Recovery(DurableProcessError::Segment(SegmentError::Recovery {
+                operation,
+                failure,
+            })) => recovery_event_code(*operation, *failure),
             Self::Recovery(DurableProcessError::Segment(_)) => "startup_diagnostics_io_failed",
             Self::Recovery(DurableProcessError::Retention(_)) => {
                 "startup_diagnostics_retention_failed"
@@ -394,6 +399,50 @@ impl DiagnosticWriterError {
             }
             Self::Build => "startup_diagnostics_recorder_build_failed",
             Self::Durable | Self::Task | Self::Barrier => "startup_diagnostics_open_failed",
+        }
+    }
+}
+
+fn recovery_event_code(
+    operation: SegmentRecoveryOperation,
+    failure: SegmentRecoveryFailure,
+) -> &'static str {
+    match (operation, failure) {
+        (SegmentRecoveryOperation::OpenDirectory, SegmentRecoveryFailure::InvalidBoundary) => {
+            "startup_diagnostics_open_directory_invalid"
+        }
+        (SegmentRecoveryOperation::OpenDirectory, SegmentRecoveryFailure::Io) => {
+            "startup_diagnostics_open_directory_io_failed"
+        }
+        (SegmentRecoveryOperation::Enumerate, SegmentRecoveryFailure::InvalidBoundary) => {
+            "startup_diagnostics_enumerate_invalid"
+        }
+        (SegmentRecoveryOperation::Enumerate, SegmentRecoveryFailure::Io) => {
+            "startup_diagnostics_enumerate_io_failed"
+        }
+        (SegmentRecoveryOperation::OpenSegment, SegmentRecoveryFailure::InvalidBoundary) => {
+            "startup_diagnostics_open_segment_invalid"
+        }
+        (SegmentRecoveryOperation::OpenSegment, SegmentRecoveryFailure::Io) => {
+            "startup_diagnostics_open_segment_io_failed"
+        }
+        (SegmentRecoveryOperation::ScanSegment, SegmentRecoveryFailure::InvalidBoundary) => {
+            "startup_diagnostics_scan_segment_invalid"
+        }
+        (SegmentRecoveryOperation::ScanSegment, SegmentRecoveryFailure::Io) => {
+            "startup_diagnostics_scan_segment_io_failed"
+        }
+        (SegmentRecoveryOperation::CreateSegment, SegmentRecoveryFailure::InvalidBoundary) => {
+            "startup_diagnostics_create_segment_invalid"
+        }
+        (SegmentRecoveryOperation::CreateSegment, SegmentRecoveryFailure::Io) => {
+            "startup_diagnostics_create_segment_io_failed"
+        }
+        (SegmentRecoveryOperation::TruncateSegment, SegmentRecoveryFailure::InvalidBoundary) => {
+            "startup_diagnostics_truncate_segment_invalid"
+        }
+        (SegmentRecoveryOperation::TruncateSegment, SegmentRecoveryFailure::Io) => {
+            "startup_diagnostics_truncate_segment_io_failed"
         }
     }
 }
@@ -843,7 +892,9 @@ impl From<DurableProcessError> for DiagnosticWriterError {
 
 #[cfg(test)]
 mod startup_diagnostic_tests {
-    use wokcore_diagnostics::segment::{DurableProcessError, SegmentError};
+    use wokcore_diagnostics::segment::{
+        DurableProcessError, SegmentError, SegmentRecoveryFailure, SegmentRecoveryOperation,
+    };
 
     use super::DiagnosticWriterError;
 
@@ -864,5 +915,43 @@ mod startup_diagnostic_tests {
         let error = DiagnosticWriterError::Recovery(DurableProcessError::Segment(SegmentError::Io));
 
         assert_eq!(error.startup_event_code(), "startup_diagnostics_io_failed");
+    }
+
+    #[test]
+    fn startup_recovery_identifies_the_failed_storage_boundary() {
+        let cases = [
+            (
+                SegmentRecoveryOperation::OpenDirectory,
+                SegmentRecoveryFailure::InvalidBoundary,
+                "startup_diagnostics_open_directory_invalid",
+            ),
+            (
+                SegmentRecoveryOperation::Enumerate,
+                SegmentRecoveryFailure::Io,
+                "startup_diagnostics_enumerate_io_failed",
+            ),
+            (
+                SegmentRecoveryOperation::OpenSegment,
+                SegmentRecoveryFailure::InvalidBoundary,
+                "startup_diagnostics_open_segment_invalid",
+            ),
+            (
+                SegmentRecoveryOperation::CreateSegment,
+                SegmentRecoveryFailure::Io,
+                "startup_diagnostics_create_segment_io_failed",
+            ),
+            (
+                SegmentRecoveryOperation::TruncateSegment,
+                SegmentRecoveryFailure::InvalidBoundary,
+                "startup_diagnostics_truncate_segment_invalid",
+            ),
+        ];
+
+        for (operation, failure, expected) in cases {
+            let error = DiagnosticWriterError::Recovery(DurableProcessError::Segment(
+                SegmentError::Recovery { operation, failure },
+            ));
+            assert_eq!(error.startup_event_code(), expected);
+        }
     }
 }

@@ -874,7 +874,28 @@ pub enum SegmentError {
     EventExceedsSegment,
     #[error("diagnostic segment contains invalid data")]
     InvalidData,
+    #[error("diagnostic segment recovery storage boundary failed")]
+    Recovery {
+        operation: SegmentRecoveryOperation,
+        failure: SegmentRecoveryFailure,
+    },
     #[error("diagnostic segment operation failed")]
+    Io,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SegmentRecoveryOperation {
+    OpenDirectory,
+    Enumerate,
+    OpenSegment,
+    ScanSegment,
+    CreateSegment,
+    TruncateSegment,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SegmentRecoveryFailure {
+    InvalidBoundary,
     Io,
 }
 
@@ -944,7 +965,9 @@ impl SegmentWriter {
     }
 
     pub fn recover(&mut self) -> Result<RecoveryReport, SegmentError> {
-        let directory = DiagnosticDirectory::open(&self.root).map_err(map_platform_error)?;
+        let directory = DiagnosticDirectory::open(&self.root).map_err(|error| {
+            map_recovery_platform_error(SegmentRecoveryOperation::OpenDirectory, error)
+        })?;
         let mut after = None::<OsString>;
         let maximum_size =
             u64::try_from(self.segment_limit).map_err(|_| SegmentError::InvalidData)?;
@@ -954,7 +977,9 @@ impl SegmentWriter {
         loop {
             let page = directory
                 .entries_page(after.as_deref(), 128)
-                .map_err(map_platform_error)?;
+                .map_err(|error| {
+                    map_recovery_platform_error(SegmentRecoveryOperation::Enumerate, error)
+                })?;
             let next = page.next_after().map(OsString::from);
             for entry in page.into_entries() {
                 let Some(name) = entry.name().to_str() else {
@@ -965,7 +990,9 @@ impl SegmentWriter {
                 };
                 let mut file = directory
                     .open_update(&entry, maximum_size)
-                    .map_err(map_platform_error)?;
+                    .map_err(|error| {
+                        map_recovery_platform_error(SegmentRecoveryOperation::OpenSegment, error)
+                    })?;
                 let scan = scan_segment(&mut file)?;
                 if let Some((_, previous, previous_scan)) = pending.take() {
                     if previous_scan.status != SegmentScanStatus::Complete {
@@ -997,7 +1024,9 @@ impl SegmentWriter {
             let active_index = 1;
             let active = directory
                 .create_new(&segment_name(active_index), b"", maximum_size)
-                .map_err(map_platform_error)?;
+                .map_err(|error| {
+                    map_recovery_platform_error(SegmentRecoveryOperation::CreateSegment, error)
+                })?;
             (
                 active_index,
                 active,
@@ -1018,7 +1047,9 @@ impl SegmentWriter {
             0
         };
         if truncated_bytes != 0 {
-            active.truncate(valid_len).map_err(map_platform_error)?;
+            active.truncate(valid_len).map_err(|error| {
+                map_recovery_platform_error(SegmentRecoveryOperation::TruncateSegment, error)
+            })?;
         }
         self.next_segment = active_index
             .checked_add(1)
@@ -1183,8 +1214,9 @@ fn scan_segment(file: &mut DiagnosticFile) -> Result<SegmentScan, SegmentError> 
         crate::event::MAX_PREPARED_EVENT_BYTES,
         crate::event::MAX_PREPARED_EVENT_BYTES,
         |offset, maximum_bytes| {
-            file.read_range(offset, maximum_bytes)
-                .map_err(map_platform_error)
+            file.read_range(offset, maximum_bytes).map_err(|error| {
+                map_recovery_platform_error(SegmentRecoveryOperation::ScanSegment, error)
+            })
         },
     )
 }
@@ -1337,6 +1369,22 @@ fn map_platform_error(error: DiagnosticStoreError) -> SegmentError {
         | DiagnosticStoreError::SizeLimitExceeded => SegmentError::InvalidData,
         _ => SegmentError::Io,
     }
+}
+
+fn map_recovery_platform_error(
+    operation: SegmentRecoveryOperation,
+    error: DiagnosticStoreError,
+) -> SegmentError {
+    let failure = match error {
+        DiagnosticStoreError::UnsafePath
+        | DiagnosticStoreError::Changed
+        | DiagnosticStoreError::Unavailable
+        | DiagnosticStoreError::SizeLimitExceeded => SegmentRecoveryFailure::InvalidBoundary,
+        DiagnosticStoreError::EnumerationLimitExceeded
+        | DiagnosticStoreError::CleanupLimitExceeded
+        | DiagnosticStoreError::Io => SegmentRecoveryFailure::Io,
+    };
+    SegmentError::Recovery { operation, failure }
 }
 
 #[cfg(test)]
