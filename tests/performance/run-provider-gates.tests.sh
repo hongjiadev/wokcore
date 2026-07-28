@@ -60,6 +60,7 @@ LEGACY_VMMAP="$(
     printf '%s\n' \
         'Physical footprint:             128.5M' \
         '                                VIRTUAL   RESIDENT' \
+        'MALLOC ZONE                         SIZE       SIZE' \
         'MALLOC                           64.0M      32.0M' |
         python3 "$SCRIPT_DIRECTORY/parse-vmmap-summary.py"
 )"

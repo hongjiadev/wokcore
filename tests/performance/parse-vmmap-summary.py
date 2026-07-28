@@ -10,12 +10,14 @@ import sys
 
 
 MAX_DIAGNOSTIC_KIB = 16 * 1024 * 1024 * 1024
+SIZE_TOKEN_PATTERN = r"\d+(?:\.\d+)?[BKMG]"
 SIZE_PATTERN = re.compile(r"(?P<value>\d+(?:\.\d+)?)(?P<unit>[BKMG])")
 PHYSICAL_FOOTPRINT_PATTERN = re.compile(
     r"^\s*Physical footprint:\s*(?P<size>\S+)\s*$", re.MULTILINE
 )
 MALLOC_RESIDENT_PATTERN = re.compile(
-    r"^\s*MALLOC\s+(?P<virtual>\S+)\s+(?P<resident>\S+)(?:\s+.*)?$",
+    rf"^\s*MALLOC\s+(?P<virtual>{SIZE_TOKEN_PATTERN})\s+"
+    rf"(?P<resident>{SIZE_TOKEN_PATTERN})(?:\s+.*)?$",
     re.MULTILINE,
 )
 RESIDENT_SUMMARY_PATTERN = re.compile(r"^\s*VIRTUAL\s+RESIDENT(?:\s|$)", re.MULTILINE)

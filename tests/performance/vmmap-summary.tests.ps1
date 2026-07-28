@@ -16,6 +16,7 @@ function Invoke-VmmapSummaryParser {
 $legacy = Invoke-VmmapSummaryParser @'
 Physical footprint:             128.5M
                                 VIRTUAL   RESIDENT
+MALLOC ZONE                         SIZE       SIZE
 MALLOC                           64.0M      32.0M
 '@
 $legacyResult = $legacy | ConvertFrom-Json
