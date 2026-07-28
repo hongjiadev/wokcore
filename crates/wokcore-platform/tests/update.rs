@@ -17,6 +17,11 @@ use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 const FIXTURE_PUBLIC_KEY: &str = include_str!("fixtures/update/minisign.pub");
 const FIXTURE_MANIFEST: &[u8] = include_bytes!("fixtures/update/wokcore-update-v1.json");
 const FIXTURE_SIGNATURE: &[u8] = include_bytes!("fixtures/update/wokcore-update-v1.json.minisig");
+const INSTALL_FIXTURE_PUBLIC_KEY: &str = include_str!("fixtures/update/install-minisign.pub");
+const INSTALL_FIXTURE_MANIFEST: &[u8] =
+    include_bytes!("fixtures/update/install-wokcore-update-v1.json");
+const INSTALL_FIXTURE_SIGNATURE: &[u8] =
+    include_bytes!("fixtures/update/install-wokcore-update-v1.json.minisig");
 
 #[test]
 fn signed_update_fixtures_remain_byte_exact() {
@@ -34,6 +39,24 @@ fn signed_update_fixtures_remain_byte_exact() {
     assert_eq!(
         format!("{:x}", Sha256::digest(FIXTURE_SIGNATURE)),
         "8abe48528f8f1bf22d3dd151a2066ccd4f16fda99237f49ed4f7826456bab130"
+    );
+    assert_eq!(INSTALL_FIXTURE_PUBLIC_KEY.len(), 113);
+    assert_eq!(
+        format!(
+            "{:x}",
+            Sha256::digest(INSTALL_FIXTURE_PUBLIC_KEY.as_bytes())
+        ),
+        "380eb1a56f24a4ac61acf7441d45e53f213a654f046247c295436bfceced4ab2"
+    );
+    assert_eq!(INSTALL_FIXTURE_MANIFEST.len(), 1701);
+    assert_eq!(
+        format!("{:x}", Sha256::digest(INSTALL_FIXTURE_MANIFEST)),
+        "c9e61b63a38067d3e8ceed3bc3cd051cc2562175502856f5a341fa6012d930b5"
+    );
+    assert_eq!(INSTALL_FIXTURE_SIGNATURE.len(), 292);
+    assert_eq!(
+        format!("{:x}", Sha256::digest(INSTALL_FIXTURE_SIGNATURE)),
+        "fbf1193e515298b3163b72e9c6bf547d0b611ab3d60bd51fd3c48806c333c7a8"
     );
 }
 

@@ -82,7 +82,7 @@ $privateWorkflowArtifacts = @(
     "plan", "plans", "spec", "specs", "workflow", "workflows"
 )
 $allowedUpdateFixturePaths = [Collections.Generic.HashSet[string]]::new(
-    [StringComparer]::OrdinalIgnoreCase
+    [StringComparer]::Ordinal
 )
 foreach ($path in @(
         "crates/wokcore-platform/tests/fixtures/update/minisign.pub",
@@ -103,7 +103,7 @@ $violations = foreach ($line in $IndexLines) {
     $mode = $Matches.mode
     $path = $Matches.path.Replace("\", "/")
     $lowerPath = $path.ToLowerInvariant()
-    $isAllowedUpdateFixture = $allowedUpdateFixturePaths.Contains($lowerPath)
+    $isAllowedUpdateFixture = $allowedUpdateFixturePaths.Contains($path)
     $hasPrivateWorkflowName = $false
     foreach ($segment in $path.Split("/")) {
         $tokens = @(($segment.ToLowerInvariant() -split "[-_.]+") | Where-Object { $_ })
@@ -118,15 +118,9 @@ $violations = foreach ($line in $IndexLines) {
             break
         }
     }
-    if (-not $isAllowedUpdateFixture -and (
-        $mode -eq "120000" -or
-        $path -match "(^|/)docs/superpowers(/|$)" -or
-        $path -match "(^|/)\.superpowers(/|$)" -or
-        $path -match "(^|/)\.subpowers(/|$)" -or
-        $path -match "(^|/)\.wokdocs(/|$)" -or
+    $isSignedReleasePayload =
         $lowerPath -match
             "\.(key|sec|secret|private|pem|p12|pfx|zip|tgz|tar\.gz|minisig|exe|dll|dylib|so)$" -or
-        $lowerPath -match "(^|/)(target|dist|artifacts?)(/|$)" -or
         $lowerPath -match
             "(^|/)(sha256sums|wokcore-update-v1\.json|wokcore-update-v1\.json\.minisig)$" -or
         $lowerPath -match
@@ -135,9 +129,17 @@ $violations = foreach ($line in $IndexLines) {
             "release/wokcore",
             "wokcore",
             "wokcore.exe"
-        ) -or
+        )
+    if (
+        $mode -eq "120000" -or
+        $path -match "(^|/)docs/superpowers(/|$)" -or
+        $path -match "(^|/)\.superpowers(/|$)" -or
+        $path -match "(^|/)\.subpowers(/|$)" -or
+        $path -match "(^|/)\.wokdocs(/|$)" -or
+        $lowerPath -match "(^|/)(target|dist|artifacts?)(/|$)" -or
+        ($isSignedReleasePayload -and -not $isAllowedUpdateFixture) -or
         $hasPrivateWorkflowName
-    )) {
+    ) {
         $line
     }
 }
