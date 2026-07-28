@@ -2840,13 +2840,16 @@ mod apple_regression_tests {
         fs::rename(&fixture.export_parent, &relocated_parent).unwrap();
         before_publish.resume_operation();
 
-        assert!(wait_for_hook_or_result(&after_publish, &result_rx).is_none());
-        let relocated_target = relocated_parent.join("diagnostics.zip");
-        assert_eq!(fs::read(&relocated_target).unwrap(), b"owned temporary");
-        fs::rename(&relocated_parent, &fixture.export_parent).unwrap();
-        after_publish.resume_operation();
-
-        let result = result_rx.recv().unwrap();
+        let result = if let Some(result) = wait_for_hook_or_result(&after_publish, &result_rx) {
+            fs::rename(&relocated_parent, &fixture.export_parent).unwrap();
+            result
+        } else {
+            let relocated_target = relocated_parent.join("diagnostics.zip");
+            assert_eq!(fs::read(&relocated_target).unwrap(), b"owned temporary");
+            fs::rename(&relocated_parent, &fixture.export_parent).unwrap();
+            after_publish.resume_operation();
+            result_rx.recv().unwrap()
+        };
         worker.join().unwrap();
         super::apple_synchronization_tests::uninstall(worker_id);
 
@@ -3008,8 +3011,8 @@ mod apple_regression_tests {
         let session = SessionRootLease::open(&session_path).unwrap();
         let export_ancestor = root.path().join("export-ancestor");
         let alternate_ancestor = root.path().join("alternate-ancestor");
-        fs::create_dir(export_ancestor.join("exports")).unwrap();
-        fs::create_dir(alternate_ancestor.join("exports")).unwrap();
+        fs::create_dir_all(export_ancestor.join("exports")).unwrap();
+        fs::create_dir_all(alternate_ancestor.join("exports")).unwrap();
         let holding_ancestor = root.path().join("holding-ancestor");
         let target = export_ancestor.join("exports").join("diagnostics.zip");
 

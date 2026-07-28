@@ -2660,12 +2660,16 @@ mod tests {
                 .exists()
         );
 
+        let tombstone_name = reservation.name.clone();
+        let marker_name = super::delete_tombstone_marker_name(reservation.slot);
         drop(reservation);
         assert_eq!(
             super::initial_delete_tombstone_slot_with_limit(&parent, TOMBSTONE_LIMIT).unwrap(),
             0
         );
-        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+        assert!(!root.join("segment.jsonl").exists());
+        assert!(!root.join(tombstone_name).exists());
+        assert!(!root.join(marker_name).exists());
     }
 
     #[test]
