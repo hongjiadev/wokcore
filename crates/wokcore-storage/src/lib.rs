@@ -74,6 +74,10 @@ pub enum StorageError {
     SecretNotFound,
     #[error("a different secret already exists for this credential scope")]
     SecretAlreadyExists,
+    #[error("the secret backend is unavailable without exposing platform details")]
+    SecretBackendUnavailable,
+    #[error("the secret backend reported a platform failure without exposing platform details")]
+    SecretBackendPlatformFailure,
     #[error("the secret backend failed without exposing secret material")]
     SecretBackendFailure,
     #[error("the selected secret backend is read-only")]

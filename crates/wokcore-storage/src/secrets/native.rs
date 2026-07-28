@@ -118,6 +118,10 @@ fn map_join_failure() -> StorageError {
 fn map_keyring_error(error: KeyringError) -> StorageError {
     match error {
         KeyringError::NoEntry => StorageError::SecretNotFound,
+        KeyringError::NoStorageAccess(_) | KeyringError::NoDefaultStore => {
+            StorageError::SecretBackendUnavailable
+        }
+        KeyringError::PlatformFailure(_) => StorageError::SecretBackendPlatformFailure,
         KeyringError::BadEncoding(mut bytes) => {
             bytes.zeroize();
             StorageError::SecretBackendFailure
@@ -145,23 +149,34 @@ mod tests {
     }
 
     #[test]
-    fn native_backend_diagnostics_and_secret_bytes_map_to_a_generic_error() {
+    fn native_backend_categories_are_stable_without_exposing_diagnostics() {
         let diagnostic = ["private", "backend", "diagnostic"].join("-");
         let secret = ["native", "secret", "bytes"].join("-").into_bytes();
-        let errors = [
-            map_keyring_error(keyring::Error::PlatformFailure(Box::new(
-                BackendDiagnostic(diagnostic.clone()),
-            ))),
+        let unavailable = map_keyring_error(keyring::Error::NoStorageAccess(Box::new(
+            BackendDiagnostic(diagnostic.clone()),
+        )));
+        let platform = map_keyring_error(keyring::Error::PlatformFailure(Box::new(
+            BackendDiagnostic(diagnostic.clone()),
+        )));
+        let generic = [
             map_keyring_error(keyring::Error::BadEncoding(secret)),
             map_join_failure(),
         ];
 
-        for error in errors {
+        assert!(matches!(
+            unavailable,
+            StorageError::SecretBackendUnavailable
+        ));
+        assert!(matches!(
+            platform,
+            StorageError::SecretBackendPlatformFailure
+        ));
+        for error in generic {
             assert!(matches!(error, StorageError::SecretBackendFailure));
-            let rendered = format!("{error:?} {error}");
-            assert!(!rendered.contains(&diagnostic));
-            assert!(!rendered.contains("native-secret-bytes"));
         }
+        let rendered = format!("{unavailable:?} {unavailable} {platform:?} {platform}");
+        assert!(!rendered.contains(&diagnostic));
+        assert!(!rendered.contains("native-secret-bytes"));
     }
 
     #[test]

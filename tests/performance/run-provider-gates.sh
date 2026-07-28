@@ -334,21 +334,26 @@ PY
 }
 
 prepare_macos_runtime_keychain() {
+    local observed_default
     local probe_account="wokcore-performance-$$"
     local probe_service="dev.wokcore.performance-probe"
 
     security list-keychains -d user -s "$MAC_KEYCHAIN_PATH"
     security default-keychain -d user -s "$MAC_KEYCHAIN_PATH"
     security unlock-keychain -p "$MAC_KEYCHAIN_PASSWORD" "$MAC_KEYCHAIN_PATH"
+    observed_default="$(
+        trim_security_path "$(security default-keychain -d user)"
+    )"
+    if [[ "$(real_path "$observed_default")" != "$(real_path "$MAC_KEYCHAIN_PATH")" ]]; then
+        fail "the isolated macOS keychain is not the runtime default"
+    fi
     security add-generic-password \
         -a "$probe_account" \
         -s "$probe_service" \
-        -w "$MAC_KEYCHAIN_PASSWORD" \
-        "$MAC_KEYCHAIN_PATH" >/dev/null
+        -w "$MAC_KEYCHAIN_PASSWORD" >/dev/null
     security delete-generic-password \
         -a "$probe_account" \
-        -s "$probe_service" \
-        "$MAC_KEYCHAIN_PATH" >/dev/null
+        -s "$probe_service" >/dev/null
     MAC_KEYCHAIN_PASSWORD=""
 }
 

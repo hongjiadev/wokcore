@@ -17,7 +17,9 @@ use wokcore_core::{
 use wokcore_platform::{DiscoveryRecord, DiscoveryStore, PlatformError, RuntimeLease};
 use wokcore_server::{
     RunningServer, ServerShutdown, ServerState,
-    auth::{AuthError, AuthMetadataStore, AuthRegistry, StateAuthMetadataStore},
+    auth::{
+        AuthError, AuthMetadataStore, AuthRegistry, AuthSecretStoreFailure, StateAuthMetadataStore,
+    },
     lifecycle::{PreparedIdleMemoryReclaimer, RunningIdleMemoryReclaimer, ServiceLifecycle},
     observability::{
         DiagnosticWriterError, PreparedDiagnosticWriter, PreparedScheduler, PreparedStateWriter,
@@ -684,8 +686,24 @@ fn map_auth_error(error: AuthError) -> ServeError {
 
 fn auth_startup_event_code(error: &AuthError) -> Option<&'static str> {
     match error {
-        AuthError::SecretStoreRead => Some("startup_auth_secret_read_failed"),
-        AuthError::SecretStoreWrite => Some("startup_auth_secret_write_failed"),
+        AuthError::SecretStoreRead(AuthSecretStoreFailure::Unavailable) => {
+            Some("startup_auth_secret_read_unavailable")
+        }
+        AuthError::SecretStoreRead(AuthSecretStoreFailure::PlatformFailure) => {
+            Some("startup_auth_secret_read_platform_failed")
+        }
+        AuthError::SecretStoreRead(AuthSecretStoreFailure::Other) => {
+            Some("startup_auth_secret_read_failed")
+        }
+        AuthError::SecretStoreWrite(AuthSecretStoreFailure::Unavailable) => {
+            Some("startup_auth_secret_write_unavailable")
+        }
+        AuthError::SecretStoreWrite(AuthSecretStoreFailure::PlatformFailure) => {
+            Some("startup_auth_secret_write_platform_failed")
+        }
+        AuthError::SecretStoreWrite(AuthSecretStoreFailure::Other) => {
+            Some("startup_auth_secret_write_failed")
+        }
         _ => None,
     }
 }
@@ -806,16 +824,24 @@ enum ServeError {
 #[cfg(test)]
 mod tests {
     use super::auth_startup_event_code;
-    use wokcore_server::auth::AuthError;
+    use wokcore_server::auth::{AuthError, AuthSecretStoreFailure};
 
     #[test]
     fn authentication_secret_failures_have_stable_startup_stage_codes() {
         assert_eq!(
-            auth_startup_event_code(&AuthError::SecretStoreRead),
-            Some("startup_auth_secret_read_failed")
+            auth_startup_event_code(&AuthError::SecretStoreRead(
+                AuthSecretStoreFailure::Unavailable
+            )),
+            Some("startup_auth_secret_read_unavailable")
         );
         assert_eq!(
-            auth_startup_event_code(&AuthError::SecretStoreWrite),
+            auth_startup_event_code(&AuthError::SecretStoreWrite(
+                AuthSecretStoreFailure::PlatformFailure
+            )),
+            Some("startup_auth_secret_write_platform_failed")
+        );
+        assert_eq!(
+            auth_startup_event_code(&AuthError::SecretStoreWrite(AuthSecretStoreFailure::Other)),
             Some("startup_auth_secret_write_failed")
         );
     }
