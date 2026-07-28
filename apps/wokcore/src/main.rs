@@ -19,14 +19,15 @@ fn main() {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
-const fn portable_allocator_options() -> [(i32, i64); 6] {
+const fn portable_allocator_options() -> [(i32, i64); 5] {
     // libmimalloc-sys intentionally omits unstable option constants. Its
     // bundled mimalloc v3 ABI assigns 5 to purge_decommits, 15 to
-    // purge_delay, 26 to disallow_arena_alloc, 35 to page_reclaim_on_free, 36
-    // to page_full_retain, and 42 to page_cross_thread_max_reclaim. Direct
-    // OS-backed pages and an immediate purge keep burst memory reclaimable;
-    // page_reclaim_on_free lets a Tokio worker reclaim pages freed remotely.
-    [(5, 1), (15, 0), (26, 1), (35, 1), (36, 0), (42, -1)]
+    // purge_delay, 26 to disallow_arena_alloc, 36 to page_full_retain, and 42
+    // to page_cross_thread_max_reclaim. Direct OS-backed pages, immediate
+    // purging, and no retained full pages keep burst memory reclaimable. The
+    // unlimited reclaim limit applies when an originating Tokio worker
+    // encounters one of its abandoned pages.
+    [(5, 1), (15, 0), (26, 1), (36, 0), (42, -1)]
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -66,10 +67,10 @@ fn build_runtime() -> std::io::Result<Runtime> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn portable_allocator_options_reclaim_remote_frees_immediately() {
+    fn portable_allocator_options_purge_idle_pages_immediately() {
         assert_eq!(
             super::portable_allocator_options(),
-            [(5, 1), (15, 0), (26, 1), (35, 1), (36, 0), (42, -1)]
+            [(5, 1), (15, 0), (26, 1), (36, 0), (42, -1)]
         );
     }
 

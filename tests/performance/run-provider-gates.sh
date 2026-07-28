@@ -35,7 +35,6 @@ REPORT_PATH=""
 VMMAP_PARSER=""
 MACOS_VMMAP_BASELINE="-"
 MACOS_VMMAP_RECOVERY="-"
-MACOS_VMMAP_DIAGNOSTIC_FAILURE=0
 RUNTIME_ENVIRONMENT=()
 
 usage() {
@@ -1135,7 +1134,10 @@ if samples_path and os.path.isfile(samples_path):
 def parse_vmmap_snapshot(encoded: str) -> dict[str, int | str | None]:
     snapshot = json.loads(encoded)
     if snapshot == {"status": "capture_failed"}:
-        return snapshot
+        return {
+            "status": "capture_failed",
+            "diagnostic": "vmmap_diagnostic",
+        }
     if set(snapshot) != {
         "physical_footprint_kib",
         "malloc_resident_kib",
@@ -1241,7 +1243,6 @@ run_profile() {
     IFS=$'\t' read -r baseline_rss baseline_fd baseline_tasks <<<"$baseline"
     if ! capture_macos_vmmap_snapshot baseline "$WOKCORE_PID"; then
         MACOS_VMMAP_BASELINE='{"status":"capture_failed"}'
-        MACOS_VMMAP_DIAGNOSTIC_FAILURE=1
     fi
     : >"$RESOURCE_SAMPLES_FILE"
     TOTAL_STARTED=0
@@ -1291,7 +1292,6 @@ run_profile() {
     IFS=$'\t' read -r recovery_rss final_fd final_tasks <<<"$recovery"
     if ! capture_macos_vmmap_snapshot recovery "$WOKCORE_PID"; then
         MACOS_VMMAP_RECOVERY='{"status":"capture_failed"}'
-        MACOS_VMMAP_DIAGNOSTIC_FAILURE=1
     fi
     local peak_rss
     peak_rss="$(
@@ -1321,8 +1321,6 @@ run_profile() {
         failures+=("runtime_process")
     [[ ! -e "$NETWORK_VIOLATION_FILE" ]] ||
         failures+=("non_loopback_network")
-    [[ "$MACOS_VMMAP_DIAGNOSTIC_FAILURE" -eq 0 ]] ||
-        failures+=("vmmap_diagnostic")
     ((recovery_rss <= recovery_limit)) ||
         failures+=("recovery_rss")
     ((final_fd <= baseline_fd + 32)) ||

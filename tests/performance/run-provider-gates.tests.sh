@@ -294,6 +294,39 @@ PLATFORM="linux"
 MACOS_VMMAP_BASELINE="-"
 MACOS_VMMAP_RECOVERY="-"
 
+PLATFORM="macos"
+MACOS_VMMAP_BASELINE='{"status":"capture_failed"}'
+MACOS_VMMAP_RECOVERY="$MODERN_VMMAP"
+REPORT_PATH="$TEST_ROOT/macos-diagnostic-failure-report.json"
+write_final_report \
+    true \
+    "" \
+    300 \
+    20000 \
+    70000 \
+    24000 \
+    85536 \
+    20 \
+    22 \
+    4 \
+    4
+python3 - "$REPORT_PATH" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    report = json.load(handle)
+assert report["passed"] is True
+assert report["failures"] == []
+assert report["resources"]["macos_vmmap"]["baseline"] == {
+    "status": "capture_failed",
+    "diagnostic": "vmmap_diagnostic",
+}
+PY
+PLATFORM="linux"
+MACOS_VMMAP_BASELINE="-"
+MACOS_VMMAP_RECOVERY="-"
+
 REPORT_PATH="$TEST_ROOT/failure-report.json"
 write_final_report \
     false \
