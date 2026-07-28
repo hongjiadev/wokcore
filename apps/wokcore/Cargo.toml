@@ -28,6 +28,7 @@ wokcore-server = { version = "0.1.0", path = "../../crates/wokcore-server" }
 wokcore-storage = { version = "0.1.0", path = "../../crates/wokcore-storage" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+libmimalloc-sys.workspace = true
 mimalloc.workspace = true
 
 [dev-dependencies]
