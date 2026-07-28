@@ -33,6 +33,7 @@ struct ServerState {
 struct Counters {
     started: AtomicU64,
     active: AtomicUsize,
+    peak_active: AtomicUsize,
     completed: AtomicU64,
 }
 
@@ -47,6 +48,7 @@ pub struct Simulator {
 pub struct SimulatorSummary {
     started: u64,
     active: usize,
+    peak_active: usize,
     completed: u64,
 }
 
@@ -59,6 +61,11 @@ impl SimulatorSummary {
     #[must_use]
     pub fn active(self) -> usize {
         self.active
+    }
+
+    #[must_use]
+    pub fn peak_active(self) -> usize {
+        self.peak_active
     }
 
     #[must_use]
@@ -155,7 +162,11 @@ async fn summary(State(state): State<ServerState>) -> axum::Json<SimulatorSummar
 
 async fn serve_scenario(State(state): State<ServerState>) -> Response {
     let ordinal = state.counters.started.fetch_add(1, Ordering::Relaxed) as usize;
-    state.counters.active.fetch_add(1, Ordering::Relaxed);
+    let active = state.counters.active.fetch_add(1, Ordering::Relaxed) + 1;
+    state
+        .counters
+        .peak_active
+        .fetch_max(active, Ordering::Relaxed);
     let lifecycle = ActiveRequest::new(Arc::clone(&state.counters));
     let scenario = state.scenario.for_attempt(ordinal);
     let schedule = match scenario.schedule() {
@@ -231,6 +242,7 @@ fn snapshot(counters: &Counters) -> SimulatorSummary {
     SimulatorSummary {
         started: counters.started.load(Ordering::Relaxed),
         active: counters.active.load(Ordering::Relaxed),
+        peak_active: counters.peak_active.load(Ordering::Relaxed),
         completed: counters.completed.load(Ordering::Relaxed),
     }
 }

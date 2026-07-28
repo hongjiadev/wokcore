@@ -59,6 +59,7 @@ async fn load_generator_opens_five_hundred_uncapped_streams_with_bounded_evidenc
     let config = LoadConfig::new(simulator.url("/").as_str())
         .unwrap()
         .with_concurrency(500)
+        .with_ramp(Duration::from_millis(100))
         .with_duration(Duration::from_secs(15))
         .with_protocol_mix(vec![ProtocolWeight::new(LoadProtocol::Responses, 1)])
         .with_payload_profile(LoadPayloadProfile::Standard32K);
@@ -67,10 +68,15 @@ async fn load_generator_opens_five_hundred_uncapped_streams_with_bounded_evidenc
     assert_eq!(report.started(), 500);
     assert_eq!(report.peak_active(), 500);
     assert_eq!(report.active(), 0);
-    assert_eq!(report.completed(), 500);
-    assert_eq!(report.errors(), 0);
+    assert_eq!(report.errors(), 0, "{report:?}");
+    assert_eq!(report.completed(), 500, "{report:?}");
     assert!(report.bytes_received() > 0);
     assert_eq!(report.protocol_started()["responses"], 500);
+    let simulator_summary = simulator.summary();
+    assert_eq!(simulator_summary.started(), 500);
+    assert_eq!(simulator_summary.active(), 0);
+    assert_eq!(simulator_summary.peak_active(), 500);
+    assert_eq!(simulator_summary.completed(), 500);
 
     let json = serde_json::to_string(&report).unwrap();
     assert!(json.len() < 16 * 1024);
