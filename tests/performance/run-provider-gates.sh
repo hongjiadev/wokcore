@@ -331,6 +331,24 @@ PY
     security unlock-keychain -p "$MAC_KEYCHAIN_PASSWORD" "$MAC_KEYCHAIN_PATH"
     security list-keychains -d user -s "$MAC_KEYCHAIN_PATH"
     security default-keychain -d user -s "$MAC_KEYCHAIN_PATH"
+}
+
+prepare_macos_runtime_keychain() {
+    local probe_account="wokcore-performance-$$"
+    local probe_service="dev.wokcore.performance-probe"
+
+    security list-keychains -d user -s "$MAC_KEYCHAIN_PATH"
+    security default-keychain -d user -s "$MAC_KEYCHAIN_PATH"
+    security unlock-keychain -p "$MAC_KEYCHAIN_PASSWORD" "$MAC_KEYCHAIN_PATH"
+    security add-generic-password \
+        -a "$probe_account" \
+        -s "$probe_service" \
+        -w "$MAC_KEYCHAIN_PASSWORD" \
+        "$MAC_KEYCHAIN_PATH" >/dev/null
+    security delete-generic-password \
+        -a "$probe_account" \
+        -s "$probe_service" \
+        "$MAC_KEYCHAIN_PATH" >/dev/null
     MAC_KEYCHAIN_PASSWORD=""
 }
 
@@ -389,6 +407,7 @@ isolate_environment() {
 
     if [[ "$PLATFORM" == "macos" ]]; then
         export CFFIXED_USER_HOME="$MAC_SECURITY_HOME"
+        prepare_macos_runtime_keychain
     fi
 
     unset \

@@ -116,7 +116,7 @@ STARTUP_DIAGNOSTICS="$(report_wokcore_start_failure 2>&1)"
     printf '%s\n' "${RUNTIME_ENVIRONMENT[@]}" |
         grep -Fx "CFFIXED_USER_HOME=$ORIGINAL_SECURITY_HOME" >/dev/null
 
-    python3 - "$SECURITY_CALLS" "$HOME" <<'PY'
+    python3 - "$SECURITY_CALLS" <<'PY'
 import sys
 
 calls = []
@@ -124,16 +124,19 @@ with open(sys.argv[1], "r", encoding="utf-8") as handle:
     for line in handle:
         home, command = line.rstrip("\n").split("\t", 1)
         calls.append((home, command))
-assert len(calls) >= 7, calls
+assert len(calls) >= 12, calls
 original_home = calls[0][0]
-isolated_home = sys.argv[2]
-assert original_home != isolated_home, (calls, isolated_home)
-assert all(home == original_home for home, _ in calls), calls
+isolated_home = calls[7][0]
+assert original_home != isolated_home, calls
+assert all(home == original_home for home, _ in calls[:7]), calls
+assert all(home == isolated_home for home, _ in calls[7:]), calls
 assert isolated_home.endswith("/macos-runtime/home"), calls
 assert calls[0][1] == "list-keychains", calls
 assert calls[1][1] == "default-keychain", calls
 assert any(command == "create-keychain" for _, command in calls[2:]), calls
 assert any(command == "default-keychain" for _, command in calls[2:]), calls
+assert any(command == "add-generic-password" for _, command in calls[7:]), calls
+assert any(command == "delete-generic-password" for _, command in calls[7:]), calls
 PY
 )
 

@@ -79,6 +79,24 @@ fn durable_draft(identity: u64) -> Result<DiagnosticEventDraft, DiagnosticBuildE
     ))
 }
 
+fn diagnostic_entries(root: &std::path::Path) -> Vec<fs::DirEntry> {
+    fs::read_dir(root)
+        .unwrap()
+        .map(|entry| entry.unwrap())
+        .filter(|entry| !is_internal_diagnostic_entry(&entry.file_name()))
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
+fn is_internal_diagnostic_entry(name: &std::ffi::OsStr) -> bool {
+    name == std::ffi::OsStr::new(".wokcore-diagnostic-parent.lock")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_internal_diagnostic_entry(_name: &std::ffi::OsStr) -> bool {
+    false
+}
+
 async fn prepared(identity: u64) -> wokcore_diagnostics::event::PreparedDiagnosticEvent {
     let (recorder, owner) = DiagnosticRecorder::new();
     let owner_task = tokio::spawn(owner.run());
@@ -860,7 +878,7 @@ async fn pinned_segment_and_snapshot_roots_fail_closed_after_parent_replacement(
             b"foreign"
         );
         assert_eq!(
-            fs::read_dir(&segment_root).unwrap().count(),
+            diagnostic_entries(&segment_root).len(),
             1,
             "the replacement root must receive no diagnostic file"
         );
@@ -891,7 +909,7 @@ async fn pinned_segment_and_snapshot_roots_fail_closed_after_parent_replacement(
             fs::read(snapshot_root.join("foreign.bin")).unwrap(),
             b"foreign"
         );
-        assert_eq!(fs::read_dir(&snapshot_root).unwrap().count(), 1);
+        assert_eq!(diagnostic_entries(&snapshot_root).len(), 1);
     }
 }
 
@@ -948,7 +966,7 @@ async fn snapshot_storms_coalesce_without_file_churn_and_honor_cooldown() {
         SnapshotRequestOutcome::Accepted
     );
     assert!(owner.try_process_next().unwrap().written());
-    let first_listing = fs::read_dir(&root).unwrap().count();
+    let first_listing = diagnostic_entries(&root).len();
     assert_eq!(first_listing, 1);
 
     for second in 1_001..1_060 {
@@ -963,7 +981,7 @@ async fn snapshot_storms_coalesce_without_file_churn_and_honor_cooldown() {
         );
         assert!(owner.try_process_next().unwrap().suppressed());
     }
-    assert_eq!(fs::read_dir(&root).unwrap().count(), first_listing);
+    assert_eq!(diagnostic_entries(&root).len(), first_listing);
     assert_eq!(recorder.metrics().cooldown_suppressed(), 59);
 
     assert_eq!(
@@ -976,7 +994,7 @@ async fn snapshot_storms_coalesce_without_file_churn_and_honor_cooldown() {
         SnapshotRequestOutcome::Accepted
     );
     assert!(owner.try_process_next().unwrap().written());
-    assert_eq!(fs::read_dir(&root).unwrap().count(), 2);
+    assert_eq!(diagnostic_entries(&root).len(), 2);
     assert_eq!(Duration::from_secs(60).as_secs(), 60);
 }
 
@@ -1048,7 +1066,7 @@ async fn snapshot_cooldown_uses_explicit_opaque_request_correlation() {
         assert!(owner.try_process_next().unwrap().written());
     }
 
-    assert_eq!(fs::read_dir(&root).unwrap().count(), 2);
+    assert_eq!(diagnostic_entries(&root).len(), 2);
     assert_eq!(
         recorder.try_request(SnapshotRequest::with_correlation(
             SnapshotCause::UpstreamFailure,
@@ -1059,7 +1077,7 @@ async fn snapshot_cooldown_uses_explicit_opaque_request_correlation() {
         SnapshotRequestOutcome::Accepted
     );
     assert!(owner.try_process_next().unwrap().suppressed());
-    assert_eq!(fs::read_dir(&root).unwrap().count(), 2);
+    assert_eq!(diagnostic_entries(&root).len(), 2);
 }
 
 #[tokio::test]
@@ -1603,7 +1621,7 @@ async fn durable_startup_runs_without_events_and_failure_does_not_consume_queue(
         .recover_startup(std::time::SystemTime::now())
         .unwrap();
     assert_eq!(cached_recovery, first_recovery);
-    assert_eq!(fs::read_dir(&startup_root).unwrap().count(), 1);
+    assert_eq!(diagnostic_entries(&startup_root).len(), 1);
 
     let missing_root = directory.path().join("missing");
     let (producer, mut owner) = DurableProducer::new(&missing_root, |_| Ok::<_, ()>(()));
@@ -1749,9 +1767,9 @@ async fn snapshots_retain_ten_and_enforce_default_and_hard_write_budgets() {
         );
         assert!(owner.try_process_next().unwrap().written());
     }
-    let files = fs::read_dir(&root).unwrap().filter_map(Result::ok).count();
+    let files = diagnostic_entries(&root).len();
     assert_eq!(files, MAX_FAILURE_SNAPSHOTS);
-    for entry in fs::read_dir(&root).unwrap().filter_map(Result::ok) {
+    for entry in diagnostic_entries(&root) {
         assert!(
             usize::try_from(entry.metadata().unwrap().len()).unwrap() <= MAX_FAILURE_SNAPSHOT_BYTES
         );
@@ -1779,7 +1797,7 @@ async fn snapshots_retain_ten_and_enforce_default_and_hard_write_budgets() {
     assert!(budget_owner.try_process_next().unwrap().written());
     assert!(budget_owner.try_process_next().unwrap().suppressed());
     assert_eq!(budget_recorder.metrics().budget_suppressed(), 1);
-    assert_eq!(fs::read_dir(budget_root).unwrap().count(), 1);
+    assert_eq!(diagnostic_entries(&budget_root).len(), 1);
 }
 
 #[tokio::test]
