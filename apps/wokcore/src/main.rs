@@ -5,6 +5,11 @@ use tokio::runtime::{Builder, Runtime};
 #[global_allocator]
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn mi_thread_set_in_threadpool();
+}
+
 fn main() {
     #[cfg(target_os = "macos")]
     configure_macos_allocator();
@@ -14,11 +19,13 @@ fn main() {
 }
 
 #[cfg(any(target_os = "macos", test))]
-const fn macos_allocator_options() -> [(i32, i64); 2] {
+const fn macos_allocator_options() -> [(i32, i64); 3] {
     // libmimalloc-sys intentionally omits unstable option constants. Its
-    // bundled mimalloc v3 ABI assigns 5 to purge_decommits and 15 to
-    // purge_delay; both positions are shared with its optional v2 ABI.
-    [(5, 1), (15, 0)]
+    // bundled mimalloc v3 ABI assigns 5 to purge_decommits, 15 to
+    // purge_delay, and 36 to page_full_retain. Retaining no full pages is
+    // appropriate for Tokio's general-purpose worker threads and prevents a
+    // completed burst from pinning pages in every size class.
+    [(5, 1), (15, 0), (36, 0)]
 }
 
 #[cfg(target_os = "macos")]
@@ -36,6 +43,14 @@ fn build_runtime() -> std::io::Result<Runtime> {
     let mut builder = Builder::new_multi_thread();
     builder.enable_all();
     #[cfg(target_os = "macos")]
+    builder.on_thread_start(|| {
+        // SAFETY: the bundled mimalloc v3 API documents this call for worker
+        // threads that can execute arbitrary tasks, which is Tokio's model.
+        unsafe {
+            mi_thread_set_in_threadpool();
+        }
+    });
+    #[cfg(target_os = "macos")]
     builder.on_thread_park(|| {
         // Requests can be allocated and released on different Tokio workers.
         // Collecting from the owning worker when it becomes idle lets mimalloc
@@ -51,7 +66,7 @@ fn build_runtime() -> std::io::Result<Runtime> {
 mod tests {
     #[test]
     fn macos_allocator_options_purge_idle_pages_immediately() {
-        assert_eq!(super::macos_allocator_options(), [(5, 1), (15, 0)]);
+        assert_eq!(super::macos_allocator_options(), [(5, 1), (15, 0), (36, 0)]);
     }
 
     #[test]
