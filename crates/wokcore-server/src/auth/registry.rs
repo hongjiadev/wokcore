@@ -196,6 +196,13 @@ struct AuthRegistryState {
 }
 
 impl AuthRegistry {
+    pub fn installation_id(&self) -> String {
+        let mut digest = Sha256::new();
+        digest.update(b"wokcore.installation-id.v1");
+        digest.update(self.state.management_digest.into_bytes());
+        format!("{:x}", digest.finalize())
+    }
+
     pub fn session_domain_key(&self) -> [u8; 32] {
         let mut digest = Sha256::new();
         digest.update(b"wokcore.session-domain-key.v1");
@@ -352,6 +359,15 @@ impl AuthRegistry {
         })
     }
 
+    pub async fn client_token_active(&self, client_id: &ClientId, token_id: &str) -> bool {
+        let _mutation = self.state.mutation.lock().await;
+        self.state
+            .clients
+            .load()
+            .values()
+            .any(|active| active.client_id == *client_id && active.token_id == token_id)
+    }
+
     pub async fn issue_client_token(
         &self,
         token_id: String,
@@ -376,20 +392,22 @@ impl AuthRegistry {
     ) -> Result<TokenMaterial, AuthError> {
         validate_scopes(&scopes)?;
         let state = Arc::clone(&self.state);
+        let mutation = Arc::clone(&state.mutation).lock_owned().await;
         await_mutation_task(task::spawn(async move {
-            Self::issue_client_token_owned(state, token_id, client_id, issued_at, scopes).await
+            Self::issue_client_token_owned(state, mutation, token_id, client_id, issued_at, scopes)
+                .await
         }))
         .await
     }
 
     async fn issue_client_token_owned(
         state: Arc<AuthRegistryState>,
+        _mutation: tokio::sync::OwnedMutexGuard<()>,
         token_id: String,
         client_id: ClientId,
         issued_at: String,
         scopes: Vec<ClientTokenScope>,
     ) -> Result<TokenMaterial, AuthError> {
-        let _mutation = state.mutation.lock().await;
         let material = TokenMaterial::generate_proxy(state.entropy.as_ref())?;
         let digest = material.digest();
         let metadata = ClientTokenMetadata {
@@ -424,19 +442,20 @@ impl AuthRegistry {
         revoked_at: String,
     ) -> Result<bool, AuthError> {
         let state = Arc::clone(&self.state);
+        let mutation = Arc::clone(&state.mutation).lock_owned().await;
         await_mutation_task(task::spawn(async move {
-            Self::revoke_client_token_owned(state, client_id, token_id, revoked_at).await
+            Self::revoke_client_token_owned(state, mutation, client_id, token_id, revoked_at).await
         }))
         .await
     }
 
     async fn revoke_client_token_owned(
         state: Arc<AuthRegistryState>,
+        _mutation: tokio::sync::OwnedMutexGuard<()>,
         client_id: ClientId,
         token_id: String,
         revoked_at: String,
     ) -> Result<bool, AuthError> {
-        let _mutation = state.mutation.lock().await;
         let persisted_client_id = client_id.clone();
         let persisted_token_id = token_id.clone();
         let changed = run_metadata(Arc::clone(&state.metadata), move |store| {

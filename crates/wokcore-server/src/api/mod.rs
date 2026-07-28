@@ -13,7 +13,7 @@ use axum::{
     Router,
     extract::DefaultBodyLimit,
     middleware,
-    routing::{MethodFilter, delete, get, on, post, put},
+    routing::{MethodFilter, get, on, post, put},
 };
 
 use crate::ServerState;
@@ -31,8 +31,8 @@ use providers::{
 pub(crate) use request_id::RequestId;
 use request_id::apply_response_envelope;
 use routes::{
-    authorize, cancel_drain, capabilities, drain, health, method_not_allowed, not_found, revoke,
-    service_status, stop,
+    authorize, cancel_drain, capabilities, client_token_status, drain, health, method_not_allowed,
+    not_found, revoke, service_status, stop,
 };
 use security::enforce_request_security;
 use sessions::{list_sessions, session_messages, usage};
@@ -100,7 +100,7 @@ pub fn build_router(state: ServerState) -> Router {
         )
         .route(
             "/wokcore/v1/clients/{client_id}/tokens/{token_id}",
-            delete(revoke),
+            get(client_token_status).delete(revoke),
         )
         .route(
             "/v1/responses",

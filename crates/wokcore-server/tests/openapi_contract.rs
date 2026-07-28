@@ -22,6 +22,7 @@ fn openapi_31_matches_the_exact_control_plane_contract_without_secret_examples()
     let expected = [
         ("/wokcore/v1/capabilities", "get"),
         ("/wokcore/v1/clients/authorize", "post"),
+        ("/wokcore/v1/clients/{client_id}/tokens/{token_id}", "get"),
         (
             "/wokcore/v1/clients/{client_id}/tokens/{token_id}",
             "delete",

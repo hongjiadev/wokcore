@@ -806,6 +806,38 @@ async fn cancelled_issue_finishes_persistence_and_snapshot_without_delivering_ma
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn token_status_waits_for_a_cancelled_owned_issue_to_finish() {
+    let (registry, _secrets, metadata, _management_raw) = existing_registry(0xa1).await;
+    let (started, release, completed) = metadata.arm_issue_gate();
+    let registry_for_issue = Arc::clone(&registry);
+    let issue = tokio::spawn(async move {
+        registry_for_issue
+            .issue_client_token(
+                "token-status-race".to_owned(),
+                ClientId::new("wokrouter").unwrap(),
+                CREATED_AT.to_owned(),
+            )
+            .await
+    });
+
+    started.recv_timeout(Duration::from_secs(5)).unwrap();
+    issue.abort();
+    let registry_for_status = Arc::clone(&registry);
+    let status = tokio::spawn(async move {
+        registry_for_status
+            .client_token_active(&ClientId::new("wokrouter").unwrap(), "token-status-race")
+            .await
+    });
+    tokio::task::yield_now().await;
+    assert!(!status.is_finished());
+
+    release.wait();
+    assert!(issue.await.unwrap_err().is_cancelled());
+    completed.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(status.await.unwrap());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelled_revoke_finishes_commit_and_snapshot_then_retry_is_idempotent() {
     let (registry, _secrets, metadata, _management_raw) = existing_registry(0x91).await;
     let raw = registry

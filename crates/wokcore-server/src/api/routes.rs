@@ -19,8 +19,8 @@ use crate::ServerState;
 use super::{
     error::ApiError,
     model::{
-        AuthorizeRequest, AuthorizeResponse, CapabilitiesResponse, HealthResponse,
-        LifecycleResponse, RevokeResponse,
+        AuthorizeRequest, AuthorizeResponse, CapabilitiesResponse, ClientTokenStatusResponse,
+        HealthResponse, LifecycleResponse, RevokeResponse,
     },
     request_id::{RequestId, record_lifecycle_diagnostic},
 };
@@ -34,6 +34,7 @@ pub(crate) async fn health(State(state): State<ServerState>) -> Json<HealthRespo
 
 const CAPABILITIES: &[&str] = &[
     "client_token.issue",
+    "client_token.inspect",
     "client_token.revoke",
     "diagnostics.events.v1",
     "diagnostics.export.v1",
@@ -58,6 +59,7 @@ pub(crate) async fn capabilities(State(state): State<ServerState>) -> Json<Capab
         provider_protocols: IMPLEMENTED_PROVIDER_PROTOCOLS,
         capabilities: CAPABILITIES,
         instance_id: state.instance_id.to_string(),
+        installation_id: state.auth.installation_id(),
     })
 }
 
@@ -138,10 +140,13 @@ pub(crate) async fn authorize(
     };
     let scopes = parse_authorize_scopes(request.scopes)
         .ok_or_else(|| ApiError::invalid_request_body(request_id))?;
-    let token_id = state
-        .token_metadata
-        .new_token_id()
-        .map_err(|_| ApiError::internal_failure(request_id))?;
+    let token_id = match request.token_id {
+        Some(token_id) => token_id.to_string(),
+        None => state
+            .token_metadata
+            .new_token_id()
+            .map_err(|_| ApiError::internal_failure(request_id))?,
+    };
     let issued_at = state
         .token_metadata
         .now()
@@ -182,6 +187,20 @@ fn parse_authorize_scopes(scopes: Option<Vec<String>>) -> Option<Vec<ClientToken
     parsed.sort_unstable();
     parsed.dedup();
     (parsed.len() == original_len).then_some(parsed)
+}
+
+pub(crate) async fn client_token_status(
+    Extension(request_id): Extension<RequestId>,
+    State(state): State<ServerState>,
+    path: Result<Path<(String, String)>, PathRejection>,
+) -> Result<Json<ClientTokenStatusResponse>, ApiError> {
+    let Path((client_id, token_id)) =
+        path.map_err(|_| ApiError::invalid_path_parameters(request_id))?;
+    let client_id =
+        ClientId::new(client_id).map_err(|_| ApiError::invalid_client_id(request_id))?;
+    Ok(Json(ClientTokenStatusResponse {
+        active: state.auth.client_token_active(&client_id, &token_id).await,
+    }))
 }
 
 pub(crate) async fn revoke(

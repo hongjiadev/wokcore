@@ -145,7 +145,7 @@ pub(crate) async fn enforce_request_security(
             let response = next.run(request).await;
             return hold_admission_until_body_end(response, guard);
         }
-        if is_metadata_mutation_path(request.uri().path()) {
+        if is_metadata_mutation(request.method(), request.uri().path()) {
             let guard = match state.lifecycle.admission_controller().try_enter() {
                 Ok(guard) => guard,
                 Err(_) => return ApiError::service_maintenance(request_id).into_response(),
@@ -259,7 +259,7 @@ fn classify_route(method: &Method, path: &str) -> RouteAuthClass {
         return RouteAuthClass::ManagementOrClientScope(ClientTokenScope::ProvidersWrite);
     }
     if (method == Method::POST && path == "/wokcore/v1/clients/authorize")
-        || (method == Method::DELETE && is_revoke_path(path))
+        || ((method == Method::GET || method == Method::DELETE) && is_client_token_path(path))
     {
         return RouteAuthClass::ManagementOrClientScope(ClientTokenScope::ClientsManage);
     }
@@ -395,16 +395,17 @@ fn is_multipart_form_data(value: &str) -> bool {
     !boundary.is_empty()
 }
 
-fn is_metadata_mutation_path(path: &str) -> bool {
-    path == "/wokcore/v1/clients/authorize"
-        || path == "/wokcore/v1/providers/config"
-        || path == "/wokcore/v1/providers/reload"
-        || path == "/wokcore/v1/provider-secrets"
-        || path.starts_with("/wokcore/v1/provider-secrets/")
-        || is_revoke_path(path)
+fn is_metadata_mutation(method: &Method, path: &str) -> bool {
+    (method == Method::POST && path == "/wokcore/v1/clients/authorize")
+        || (method == Method::PUT && path == "/wokcore/v1/providers/config")
+        || (method == Method::POST && path == "/wokcore/v1/providers/reload")
+        || (method == Method::POST && path == "/wokcore/v1/provider-secrets")
+        || ((method == Method::PUT || method == Method::DELETE)
+            && path.starts_with("/wokcore/v1/provider-secrets/"))
+        || (method == Method::DELETE && is_client_token_path(path))
 }
 
-fn is_revoke_path(path: &str) -> bool {
+fn is_client_token_path(path: &str) -> bool {
     let Some(segments) = path.strip_prefix("/wokcore/v1/clients/") else {
         return false;
     };

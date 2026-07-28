@@ -316,10 +316,18 @@ async fn health_and_capabilities_are_public_minimal_and_versioned() {
     assert_eq!(body["minimum_management_api_major"], 1);
     assert_eq!(body["maximum_management_api_major"], 1);
     assert_eq!(body["instance_id"], INSTANCE_ID);
+    let installation_id = body["installation_id"].as_str().unwrap();
+    assert_eq!(installation_id.len(), 64);
+    assert!(
+        installation_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    );
     assert_eq!(
         body["capabilities"],
         json!([
             "client_token.issue",
+            "client_token.inspect",
             "client_token.revoke",
             "diagnostics.events.v1",
             "diagnostics.export.v1",
@@ -446,6 +454,53 @@ async fn authorize_returns_raw_proxy_once_and_revoke_removes_it() {
         .unwrap();
     assert_eq!(revoked.status(), StatusCode::OK);
     assert_eq!(json_body(revoked).await, json!({"revoked":true}));
+}
+
+#[tokio::test]
+async fn authorize_accepts_a_preallocated_token_id_and_reports_its_active_state() {
+    let fixture = fixture().await;
+    let requested_token_id = "019844f0-4de0-7000-8000-000000000099";
+    let authorize = fixture
+        .app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/wokcore/v1/clients/authorize",
+            Some(&fixture.management),
+            Some(json!({
+                "client_id": "wokrouter",
+                "token_id": requested_token_id
+            })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(authorize.status(), StatusCode::CREATED);
+    assert_eq!(json_body(authorize).await["token_id"], requested_token_id);
+
+    let path = format!("/wokcore/v1/clients/wokrouter/tokens/{requested_token_id}");
+    let active = fixture
+        .app
+        .clone()
+        .oneshot(request("GET", &path, Some(&fixture.management), None))
+        .await
+        .unwrap();
+    assert_eq!(active.status(), StatusCode::OK);
+    assert_eq!(json_body(active).await, json!({"active":true}));
+
+    let revoked = fixture
+        .app
+        .clone()
+        .oneshot(request("DELETE", &path, Some(&fixture.management), None))
+        .await
+        .unwrap();
+    assert_eq!(revoked.status(), StatusCode::OK);
+    let inactive = fixture
+        .app
+        .oneshot(request("GET", &path, Some(&fixture.management), None))
+        .await
+        .unwrap();
+    assert_eq!(inactive.status(), StatusCode::OK);
+    assert_eq!(json_body(inactive).await, json!({"active":false}));
 }
 
 #[tokio::test]

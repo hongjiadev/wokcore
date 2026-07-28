@@ -12,6 +12,8 @@ pub(crate) struct HealthResponse {
 pub(crate) struct AuthorizeRequest {
     pub client_id: ClientId,
     #[serde(default)]
+    pub token_id: Option<uuid::Uuid>,
+    #[serde(default)]
     pub scopes: Option<Vec<String>>,
 }
 
@@ -24,6 +26,7 @@ pub(crate) struct CapabilitiesResponse {
     pub provider_protocols: &'static [&'static str],
     pub capabilities: &'static [&'static str],
     pub instance_id: String,
+    pub installation_id: String,
 }
 
 #[derive(Serialize)]
@@ -43,4 +46,9 @@ pub(crate) struct AuthorizeResponse {
 #[derive(Serialize)]
 pub(crate) struct RevokeResponse {
     pub revoked: bool,
+}
+
+#[derive(Serialize)]
+pub(crate) struct ClientTokenStatusResponse {
+    pub active: bool,
 }

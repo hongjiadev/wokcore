@@ -705,6 +705,57 @@
       }
     },
     "/wokcore/v1/clients/{client_id}/tokens/{token_id}": {
+      "get": {
+        "operationId": "getClientTokenStatus",
+        "security": [
+          {
+            "managementBearer": []
+          },
+          {
+            "clientBearer": []
+          }
+        ],
+        "x-wokcore-required-scope": "clients.manage",
+        "parameters": [
+          {
+            "name": "client_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/ClientId"
+            }
+          },
+          {
+            "name": "token_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Active client token state",
+            "headers": {
+              "X-Request-Id": {"$ref": "#/components/headers/XRequestId"},
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
+              "X-Content-Type-Options": {"$ref": "#/components/headers/XContentTypeOptions"}
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientTokenStatusResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
       "delete": {
         "operationId": "revokeClientToken",
         "security": [
@@ -1044,7 +1095,8 @@
           "maximum_management_api_major",
           "provider_protocols",
           "capabilities",
-          "instance_id"
+          "instance_id",
+          "installation_id"
         ],
         "properties": {
           "wokcore_version": {
@@ -1076,6 +1128,10 @@
           "instance_id": {
             "type": "string",
             "format": "uuid"
+          },
+          "installation_id": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
           }
         }
       },
@@ -1112,6 +1168,10 @@
         "properties": {
           "client_id": {
             "$ref": "#/components/schemas/ClientId"
+          },
+          "token_id": {
+            "type": "string",
+            "format": "uuid"
           },
           "scopes": {
             "$ref": "#/components/schemas/ClientTokenScopes"
@@ -1856,6 +1916,18 @@
         ],
         "properties": {
           "revoked": {
+            "type": "boolean"
+          }
+        }
+      },
+      "ClientTokenStatusResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "active"
+        ],
+        "properties": {
+          "active": {
             "type": "boolean"
           }
         }
