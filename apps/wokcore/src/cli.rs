@@ -1,6 +1,6 @@
 use std::{ffi::OsString, path::PathBuf};
 
-use clap::{Args, Parser, Subcommand};
+use clap::{ArgGroup, Args, Parser, Subcommand};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -34,6 +34,8 @@ pub enum Command {
     Diagnostics(Diagnostics),
     /// Manage Provider catalog, routing, and secret references.
     Providers(Providers),
+    /// Check for or install a signed WokCore update.
+    Update(Update),
 }
 
 #[derive(Debug, Args)]
@@ -163,6 +165,25 @@ pub enum ProvidersCommand {
 
 #[derive(Debug, Args)]
 pub struct RequiredJson {
+    /// Emit the stable JSON response.
+    #[arg(long, required = true)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+#[command(group(
+    ArgGroup::new("update_action")
+        .required(true)
+        .multiple(false)
+        .args(["check", "install"])
+))]
+pub struct Update {
+    /// Check whether a newer signed WokCore release is available.
+    #[arg(long)]
+    pub check: bool,
+    /// Install a newer signed WokCore release.
+    #[arg(long)]
+    pub install: bool,
     /// Emit the stable JSON response.
     #[arg(long, required = true)]
     pub json: bool,

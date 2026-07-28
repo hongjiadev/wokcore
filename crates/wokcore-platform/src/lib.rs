@@ -5,10 +5,11 @@ pub mod process_metrics;
 pub mod runtime;
 pub mod sessions;
 pub mod system;
+pub mod update;
 
 pub use runtime::{DiscoveryRecord, DiscoveryStore, MAX_DISCOVERY_BYTES, RuntimeLease};
 pub use system::paths::{AppPaths, EnvironmentSnapshot, Platform};
-pub use system::process::is_process_running;
+pub use system::process::{is_process_running, process_matches_executable};
 
 #[derive(Debug, thiserror::Error)]
 pub enum PlatformError {

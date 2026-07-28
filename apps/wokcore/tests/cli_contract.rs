@@ -23,6 +23,7 @@ Commands:
   logs         Read redacted WokCore diagnostic events
   diagnostics  Work with bounded diagnostic support packages
   providers    Manage Provider catalog, routing, and secret references
+  update       Check for or install a signed WokCore update
   help         Print this message or the help of the given subcommand(s)
 
 Options:
@@ -91,6 +92,10 @@ fn only_the_documented_commands_and_options_are_accepted() {
         (
             "providers",
             "Manage Provider catalog, routing, and secret references\n\nUsage: wokcore providers <COMMAND>\n\nCommands:\n  catalog   List the frozen Provider catalog\n  status    Show active Provider configuration and reload status\n  models    List active public models\n  validate  Validate a Provider candidate JSON document\n  commit    Atomically commit a Provider candidate JSON document\n  reload    Reload Provider configuration from durable storage\n  secret    Manage opaque Provider secret references\n  help      Print this message or the help of the given subcommand(s)\n\nOptions:\n  -h, --help  Print help\n",
+        ),
+        (
+            "update",
+            "Check for or install a signed WokCore update\n\nUsage: wokcore update --json <--check|--install>\n\nOptions:\n      --check    Check whether a newer signed WokCore release is available\n      --install  Install a newer signed WokCore release\n      --json     Emit the stable JSON response\n  -h, --help     Print help\n",
         ),
     ];
 
@@ -259,6 +264,7 @@ fn json_commands_report_path_discovery_failure_as_stable_json() {
         &["authorize", "--client", "wokrouter", "--json"],
         &["sessions", "list", "--json"],
         &["logs", "--jsonl"],
+        &["update", "--check", "--json"],
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_wokcore"))
             .args(arguments)

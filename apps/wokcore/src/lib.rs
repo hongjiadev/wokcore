@@ -1,8 +1,17 @@
 //! WokCore local service command behavior.
 
-use std::{future::Future, io, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    future::Future,
+    io,
+    path::{Path, PathBuf},
+    pin::Pin,
+    sync::Arc,
+    time::Duration,
+};
 
+use async_trait::async_trait;
 use secrecy::{SecretString, zeroize::Zeroizing};
+use url::{Host, Url};
 use uuid::Uuid;
 use wokcore_platform::{AppPaths, DiscoveryRecord, DiscoveryStore, PlatformError};
 use wokcore_server::{
@@ -60,6 +69,29 @@ pub trait ProcessIdentity: Send + Sync {
     fn current_pid(&self) -> u32;
 
     fn is_running(&self, pid: u32) -> bool;
+
+    fn matches_executable(&self, pid: u32, _expected: &Path) -> bool {
+        self.is_running(pid)
+    }
+}
+
+#[async_trait]
+pub(crate) trait UpdateProcess: Send + Sync {
+    fn current_executable(&self) -> Result<PathBuf, RuntimeValueError>;
+
+    async fn spawn_service(
+        &self,
+        executable: &Path,
+    ) -> Result<Box<dyn UpdateChild>, RuntimeValueError>;
+}
+
+#[async_trait]
+pub(crate) trait UpdateChild: Send {
+    fn pid(&self) -> Option<u32>;
+
+    async fn kill(&mut self) -> Result<(), RuntimeValueError>;
+
+    fn detach(&mut self);
 }
 
 pub trait ShutdownSignal: Send + Sync {
@@ -131,6 +163,14 @@ pub struct RunDependencies {
     pub(crate) session_roots: Option<SessionRootPaths>,
     pub(crate) upstream_executor: Option<Arc<dyn UpstreamExecutor>>,
     pub(crate) drain_timeout: Duration,
+    pub(crate) update_source: Option<UpdateSource>,
+    pub(crate) update_process: Arc<dyn UpdateProcess>,
+}
+
+#[derive(Clone)]
+pub(crate) struct UpdateSource {
+    pub(crate) origin: Url,
+    pub(crate) public_key: Arc<str>,
 }
 
 impl RunDependencies {
@@ -158,6 +198,8 @@ impl RunDependencies {
             session_roots: None,
             upstream_executor: None,
             drain_timeout: Duration::from_secs(30),
+            update_source: None,
+            update_process: Arc::new(UnavailableUpdateProcess),
         }
     }
 
@@ -196,6 +238,34 @@ impl RunDependencies {
         self.drain_timeout = drain_timeout;
         self
     }
+
+    pub(crate) fn with_update_process(mut self, update_process: Arc<dyn UpdateProcess>) -> Self {
+        self.update_process = update_process;
+        self
+    }
+
+    #[doc(hidden)]
+    pub fn with_loopback_update_source(
+        mut self,
+        origin: Url,
+        public_key: impl Into<Arc<str>>,
+    ) -> Result<Self, RuntimeValueError> {
+        if origin.scheme() != "http"
+            || !origin.username().is_empty()
+            || origin.password().is_some()
+            || origin.query().is_some()
+            || origin.fragment().is_some()
+            || !origin.path().ends_with('/')
+            || !matches!(origin.host(), Some(Host::Ipv4(address)) if address.is_loopback())
+        {
+            return Err(RuntimeValueError);
+        }
+        self.update_source = Some(UpdateSource {
+            origin,
+            public_key: public_key.into(),
+        });
+        Ok(self)
+    }
 }
 
 struct PlatformDiscoveryPublisher;
@@ -221,6 +291,22 @@ struct UnavailableSecretInput;
 impl SecretInput for UnavailableSecretInput {
     fn read_secret(&self, _maximum_bytes: usize) -> io::Result<SecretString> {
         Err(io::Error::other("secret input is unavailable"))
+    }
+}
+
+struct UnavailableUpdateProcess;
+
+#[async_trait]
+impl UpdateProcess for UnavailableUpdateProcess {
+    fn current_executable(&self) -> Result<PathBuf, RuntimeValueError> {
+        Err(RuntimeValueError)
+    }
+
+    async fn spawn_service(
+        &self,
+        _executable: &Path,
+    ) -> Result<Box<dyn UpdateChild>, RuntimeValueError> {
+        Err(RuntimeValueError)
     }
 }
 

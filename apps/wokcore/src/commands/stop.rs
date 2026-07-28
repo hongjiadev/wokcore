@@ -54,10 +54,26 @@ async fn stop_owned(
     result
 }
 
-async fn drain_and_stop(
+pub(super) async fn drain_and_stop(
     client: &ControlClient,
     management: &SecretString,
 ) -> Result<(), ControlClientError> {
+    let drained = request_drain(client, management).await?;
+    if drained.phase != "draining" || drained.active_requests != 0 {
+        return Err(ControlClientError::Internal);
+    }
+
+    let stopped = request_stop(client, management).await?;
+    if stopped.phase != "stopping" || stopped.active_requests != 0 {
+        return Err(ControlClientError::Internal);
+    }
+    Ok(())
+}
+
+pub(super) async fn request_drain(
+    client: &ControlClient,
+    management: &SecretString,
+) -> Result<LifecycleResponse, ControlClientError> {
     let drain = client
         .post_json::<()>("/wokcore/v1/service/drain", management, None)
         .await?;
@@ -69,12 +85,13 @@ async fn drain_and_stop(
     if !drain_status.is_success() {
         return Err(ControlClientError::Internal);
     }
-    let drained: LifecycleResponse =
-        serde_json::from_slice(&drain_body).map_err(|_| ControlClientError::Internal)?;
-    if drained.phase != "draining" || drained.active_requests != 0 {
-        return Err(ControlClientError::Internal);
-    }
+    serde_json::from_slice(&drain_body).map_err(|_| ControlClientError::Internal)
+}
 
+pub(super) async fn request_stop(
+    client: &ControlClient,
+    management: &SecretString,
+) -> Result<LifecycleResponse, ControlClientError> {
     let stop = client
         .post_json::<()>("/wokcore/v1/service/stop", management, None)
         .await?;
@@ -86,28 +103,30 @@ async fn drain_and_stop(
     if !stop_status.is_success() {
         return Err(ControlClientError::Internal);
     }
-    let stopped: LifecycleResponse =
-        serde_json::from_slice(&stop_body).map_err(|_| ControlClientError::Internal)?;
-    if stopped.phase != "stopping" || stopped.active_requests != 0 {
-        return Err(ControlClientError::Internal);
-    }
-    Ok(())
+    serde_json::from_slice(&stop_body).map_err(|_| ControlClientError::Internal)
 }
 
-async fn best_effort_cancel_drain(client: &ControlClient, management: &SecretString) {
-    let _ = timeout(CANCEL_DRAIN_TIMEOUT, async {
+pub(super) async fn best_effort_cancel_drain(client: &ControlClient, management: &SecretString) {
+    let _ = request_cancel_drain(client, management).await;
+}
+
+pub(super) async fn request_cancel_drain(
+    client: &ControlClient,
+    management: &SecretString,
+) -> Result<LifecycleResponse, ControlClientError> {
+    timeout(CANCEL_DRAIN_TIMEOUT, async {
         let response = client
             .post_json::<()>("/wokcore/v1/service/drain/cancel", management, None)
             .await?;
         let status = response.status();
-        let _ = response_body(response).await?;
-        if status.is_success() {
-            Ok(())
-        } else {
-            Err(ControlClientError::Internal)
+        let body = response_body(response).await?;
+        if !status.is_success() {
+            return Err(ControlClientError::Internal);
         }
+        serde_json::from_slice(&body).map_err(|_| ControlClientError::Internal)
     })
-    .await;
+    .await
+    .map_err(|_| ControlClientError::Internal)?
 }
 
 fn map_owned_stop(
@@ -162,9 +181,9 @@ fn render_error(error: ControlClientError, output: &mut dyn CommandOutput, json:
 }
 
 #[derive(Deserialize)]
-struct LifecycleResponse {
-    phase: String,
-    active_requests: usize,
+pub(super) struct LifecycleResponse {
+    pub(super) phase: String,
+    pub(super) active_requests: usize,
 }
 
 #[cfg(test)]

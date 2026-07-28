@@ -10,6 +10,7 @@ mod sessions;
 mod status;
 mod stop;
 mod terminal;
+mod update;
 
 use std::io;
 
@@ -32,6 +33,7 @@ pub(crate) async fn run(
         Command::Logs(options) => logs::run(options, dependencies, output).await,
         Command::Diagnostics(options) => diagnostics::run(options, dependencies, output).await,
         Command::Providers(options) => providers::run(options, dependencies, output).await,
+        Command::Update(options) => update::run(options, dependencies, output).await,
     }
 }
 

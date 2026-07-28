@@ -14,8 +14,10 @@ clap.workspace = true
 futures-core.workspace = true
 reqwest.workspace = true
 secrecy.workspace = true
+semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 url.workspace = true
@@ -33,4 +35,7 @@ mimalloc.workspace = true
 
 [dev-dependencies]
 axum.workspace = true
-tempfile.workspace = true
+flate2.workspace = true
+sha2.workspace = true
+tar.workspace = true
+zip.workspace = true

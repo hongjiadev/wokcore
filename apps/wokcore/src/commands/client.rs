@@ -17,6 +17,7 @@ const MANAGEMENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const MANAGEMENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(40);
 const MANAGEMENT_READ_TIMEOUT: Duration = Duration::from_secs(40);
 
+#[derive(Clone)]
 pub(super) struct ControlClient {
     record: DiscoveryRecord,
     authority: String,
@@ -50,6 +51,10 @@ impl ControlClient {
             authority,
             client,
         })
+    }
+
+    pub(super) fn record(&self) -> &DiscoveryRecord {
+        &self.record
     }
 
     pub(super) async fn management_secret(

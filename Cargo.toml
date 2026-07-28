@@ -30,6 +30,7 @@ base64 = "0.22.1"
 bytes = "1.12.1"
 clap = { version = "4.6.4", features = ["derive"] }
 fs4 = "0.13"
+flate2 = "1.1.9"
 futures-core = "0.3.31"
 futures-util = "0.3.31"
 getrandom = "0.4.3"
@@ -38,18 +39,21 @@ keyring = "4.1.5"
 libc = "0.2.189"
 libmimalloc-sys = { version = "0.1.49", features = ["extended"] }
 mimalloc = "0.1.52"
+minisign-verify = "0.2.5"
 notify = "8.2.0"
 prost = "0.14"
 reqwest = { version = "0.13.4", default-features = false, features = ["http2", "json", "rustls", "stream"] }
 rusqlite = { version = "0.40.1", features = ["bundled", "hooks", "limits", "serialize"] }
 secrecy = "0.10.3"
+semver = "1.0.28"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 sha2 = "0.10.9"
 subtle = "2.6.1"
+tar = { version = "0.4.46", default-features = false }
 tempfile = "3"
 thiserror = "2.0.19"
-tokio = { version = "1.53.1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.53.1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 toml_edit = { version = "0.25", features = ["serde"] }
 tower = { version = "0.5", default-features = false, features = ["util"] }
 url = { version = "2.5.8", features = ["serde"] }
@@ -66,3 +70,4 @@ windows-sys = { version = "0.61.2", features = [
   "Win32_System_Threading",
 ] }
 zeroize = "1.9.0"
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }

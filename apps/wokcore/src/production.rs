@@ -1,14 +1,17 @@
 use std::{
     future::Future,
     io::{self, Read, Write},
+    path::{Path, PathBuf},
     pin::Pin,
+    process::Stdio,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use async_trait::async_trait;
 use secrecy::{SecretString, zeroize::Zeroizing};
 use uuid::Uuid;
-use wokcore_platform::{AppPaths, is_process_running};
+use wokcore_platform::{AppPaths, is_process_running, process_matches_executable};
 use wokcore_server::{
     auth::{EntropySource, OsEntropy},
     observability::SessionRootPaths,
@@ -18,7 +21,7 @@ use wokcore_storage::NativeSecretStore;
 
 use crate::{
     Clock, CommandOutput, ExitCode, IdSource, ProcessIdentity, RunDependencies, RuntimeValueError,
-    SecretInput, ShutdownSignal,
+    SecretInput, ShutdownSignal, UpdateChild, UpdateProcess,
     cli::{Cli, Command},
     run_with_dependencies,
     runtime::production_upstream_executor,
@@ -63,7 +66,8 @@ pub async fn run_production(cli: Cli) -> ExitCode {
         Arc::new(SystemProcessIdentity),
         Arc::new(ControlCSignal),
     )
-    .with_secret_input(Arc::new(StandardSecretInput));
+    .with_secret_input(Arc::new(StandardSecretInput))
+    .with_update_process(Arc::new(SystemUpdateProcess));
     if let Some(upstream_executor) = upstream_executor {
         dependencies = dependencies.with_upstream_executor(upstream_executor);
     }
@@ -87,6 +91,7 @@ fn requests_json(cli: &Cli) -> bool {
         Command::Logs(options) => options.jsonl,
         Command::Diagnostics(_) => false,
         Command::Providers(_) => true,
+        Command::Update(options) => options.json,
     }
 }
 
@@ -133,6 +138,65 @@ impl ProcessIdentity for SystemProcessIdentity {
 
     fn is_running(&self, pid: u32) -> bool {
         is_process_running(pid)
+    }
+
+    fn matches_executable(&self, pid: u32, expected: &Path) -> bool {
+        process_matches_executable(pid, expected)
+    }
+}
+
+struct SystemUpdateProcess;
+
+#[async_trait]
+impl UpdateProcess for SystemUpdateProcess {
+    fn current_executable(&self) -> Result<PathBuf, RuntimeValueError> {
+        std::env::current_exe().map_err(|_| RuntimeValueError)
+    }
+
+    async fn spawn_service(
+        &self,
+        executable: &Path,
+    ) -> Result<Box<dyn UpdateChild>, RuntimeValueError> {
+        let child = tokio::process::Command::new(executable)
+            .args(["serve", "--json"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(false)
+            .spawn()
+            .map_err(|_| RuntimeValueError)?;
+        Ok(Box::new(SystemUpdateChild {
+            child,
+            detached: false,
+        }))
+    }
+}
+
+struct SystemUpdateChild {
+    child: tokio::process::Child,
+    detached: bool,
+}
+
+#[async_trait]
+impl UpdateChild for SystemUpdateChild {
+    fn pid(&self) -> Option<u32> {
+        self.child.id()
+    }
+
+    async fn kill(&mut self) -> Result<(), RuntimeValueError> {
+        self.child.kill().await.map_err(|_| RuntimeValueError)
+    }
+
+    fn detach(&mut self) {
+        self.detached = true;
+    }
+}
+
+impl Drop for SystemUpdateChild {
+    fn drop(&mut self) {
+        if !self.detached {
+            let _ = self.child.start_kill();
+        }
     }
 }
 
