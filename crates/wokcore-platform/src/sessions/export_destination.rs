@@ -919,15 +919,53 @@ fn publish_relative_noreplace(
 
 #[cfg(target_vendor = "apple")]
 fn publish_relative_noreplace(
-    _parent: &DirectoryChain,
+    parent: &DirectoryChain,
     temporary: &mut ExportTemporary,
     temporary_name: Option<&OsStr>,
     target_name: &OsStr,
 ) -> Result<(), SessionError> {
-    if temporary_name.is_none() {
-        return Err(SessionError::UnsafePath);
+    use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
+
+    const RENAME_EXCL: libc::c_uint = 0x0000_0004;
+
+    unsafe extern "C" {
+        fn renameatx_np(
+            from_fd: libc::c_int,
+            from: *const libc::c_char,
+            to_fd: libc::c_int,
+            to: *const libc::c_char,
+            flags: libc::c_uint,
+        ) -> libc::c_int;
     }
-    temporary.rename_noreplace(target_name)
+
+    let temporary_name = temporary_name.ok_or(SessionError::UnsafePath)?;
+    temporary.prepare_posix_publish()?;
+    validate_directory_chain(parent)?;
+    let temporary_name =
+        std::ffi::CString::new(temporary_name.as_bytes()).map_err(|_| SessionError::UnsafePath)?;
+    let target_name =
+        std::ffi::CString::new(target_name.as_bytes()).map_err(|_| SessionError::UnsafePath)?;
+    let result = unsafe {
+        renameatx_np(
+            parent.file().as_raw_fd(),
+            temporary_name.as_ptr(),
+            parent.file().as_raw_fd(),
+            target_name.as_ptr(),
+            RENAME_EXCL,
+        )
+    };
+    if result != 0 {
+        let source = io::Error::last_os_error();
+        return Err(
+            if matches!(source.raw_os_error(), Some(libc::EEXIST | libc::ENOTEMPTY)) {
+                SessionError::UnsafePath
+            } else {
+                SessionError::Io { source }
+            },
+        );
+    }
+    temporary.finish_posix_publish()?;
+    validate_directory_chain(parent)
 }
 
 #[cfg(windows)]
@@ -1139,16 +1177,13 @@ mod apple {
 
     // CoreServices/CarbonCore/Files.h 64-bit ABI, as mirrored by objc2-generated
     // CoreServices/CarbonCore/Files.rs: FSIORefNum is c_int, OSStatus is i32,
-    // OSErr is i16, UniCharCount/FSCatalogInfoBitmap/OptionBits are u32.
+    // OSErr is i16 and UniCharCount/FSCatalogInfoBitmap are u32.
     type OsStatus = i32;
     type OsErr = i16;
     type FsIoRefNum = libc::c_int;
     type UniCharCount = u32;
     type CatalogInfoBitmap = u32;
-    type OptionBits = u32;
     type ByteCount = usize;
-    type CfIndex = isize;
-    type CfStringRef = *const CfString;
 
     const NO_ERR: OsErr = 0;
     const DUPLICATE_FILE_NAME_ERROR: OsErr = -48;
@@ -1156,12 +1191,6 @@ mod apple {
     const READ_WRITE_PERMISSION: i8 = 3;
     const AT_MARK: u16 = 0;
     const FROM_START: u16 = 1;
-    const DO_NOT_MOVE_ACROSS_VOLUMES: OptionBits = 4;
-
-    #[repr(C)]
-    struct CfString {
-        _private: [u8; 0],
-    }
 
     #[repr(C)]
     #[derive(Clone, Copy)]
@@ -1282,25 +1311,8 @@ mod apple {
             parent: *mut FsRef,
         ) -> OsErr;
         fn FSCompareFSRefs(first: *const FsRef, second: *const FsRef) -> OsErr;
-        fn FSMoveObjectSync(
-            source: *const FsRef,
-            destination_directory: *const FsRef,
-            destination_name: CfStringRef,
-            target: *mut FsRef,
-            options: OptionBits,
-        ) -> OsStatus;
         fn FSUnlinkObject(reference: *const FsRef) -> OsErr;
         fn FSDeleteObject(reference: *const FsRef) -> OsErr;
-    }
-
-    #[link(name = "CoreFoundation", kind = "framework")]
-    unsafe extern "C" {
-        fn CFStringCreateWithCharacters(
-            allocator: *const c_void,
-            characters: *const u16,
-            count: CfIndex,
-        ) -> CfStringRef;
-        fn CFRelease(value: *const c_void);
     }
 
     pub(super) struct PublishWatcher {
@@ -1482,27 +1494,6 @@ mod apple {
             if self.unlink().is_err() {
                 let _ = self.delete();
             }
-        }
-    }
-
-    struct OwnedCfString(CfStringRef);
-
-    impl OwnedCfString {
-        fn new(characters: &[u16]) -> Result<Self, SessionError> {
-            let count =
-                CfIndex::try_from(characters.len()).map_err(|_| SessionError::UnsafePath)?;
-            let raw =
-                unsafe { CFStringCreateWithCharacters(ptr::null(), characters.as_ptr(), count) };
-            if raw.is_null() {
-                return Err(carbon_error("CFStringCreateWithCharacters", -1));
-            }
-            Ok(Self(raw))
-        }
-    }
-
-    impl Drop for OwnedCfString {
-        fn drop(&mut self) {
-            unsafe { CFRelease(self.0.cast()) };
         }
     }
 
@@ -1700,7 +1691,7 @@ mod apple {
             Ok(())
         }
 
-        pub(super) fn rename_noreplace(&mut self, name: &OsStr) -> Result<(), SessionError> {
+        pub(super) fn prepare_posix_publish(&self) -> Result<(), SessionError> {
             if self.fork.is_some() || !self.object.owned {
                 return Err(SessionError::UnsafePath);
             }
@@ -1709,26 +1700,14 @@ mod apple {
             super::apple_synchronization_tests::hit(
                 super::AppleSynchronizationPoint::BeforeObjectBoundPublish,
             );
-            let name = unicode_name(name)?;
-            let name = OwnedCfString::new(&name)?;
-            let mut published = MaybeUninit::<FsRef>::uninit();
-            let status = unsafe {
-                FSMoveObjectSync(
-                    &raw const self.object.reference,
-                    &raw const self.original_parent,
-                    name.0,
-                    published.as_mut_ptr(),
-                    DO_NOT_MOVE_ACROSS_VOLUMES,
-                )
-            };
-            if status != OsStatus::from(NO_ERR) {
-                return Err(if status == OsStatus::from(DUPLICATE_FILE_NAME_ERROR) {
-                    SessionError::UnsafePath
-                } else {
-                    carbon_error("FSMoveObjectSync", status)
-                });
+            Ok(())
+        }
+
+        pub(super) fn finish_posix_publish(&self) -> Result<(), SessionError> {
+            if self.fork.is_some() || !self.object.owned {
+                return Err(SessionError::UnsafePath);
             }
-            self.object.reference = unsafe { published.assume_init() };
+            self.verify_current_parent()?;
             #[cfg(test)]
             super::apple_synchronization_tests::hit(
                 super::AppleSynchronizationPoint::AfterObjectBoundPublish,
@@ -2723,7 +2702,7 @@ mod apple_regression_tests {
         fs,
         io::Write,
         path::Path,
-        sync::{Arc, mpsc},
+        sync::{Arc, Barrier, mpsc},
         thread,
         time::{Duration, Instant},
     };
@@ -2742,6 +2721,39 @@ mod apple_regression_tests {
         assert_parent_fsref_swap_restore_fails_closed(
             AppleSynchronizationPoint::BeforeIdentityOpen,
         );
+    }
+
+    #[test]
+    fn concurrent_relative_publishes_do_not_share_legacy_move_state() {
+        const WORKERS: usize = 16;
+
+        let barrier = Arc::new(Barrier::new(WORKERS));
+        let workers = (0..WORKERS)
+            .map(|index| {
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    let root = tempfile::tempdir().unwrap();
+                    let session_path = root.path().join("sessions");
+                    let export_parent = root.path().join("exports");
+                    fs::create_dir(&session_path).unwrap();
+                    fs::create_dir(&export_parent).unwrap();
+                    let session = SessionRootLease::open(&session_path).unwrap();
+                    let target = export_parent.join(format!("diagnostics-{index}.zip"));
+                    let mut destination =
+                        PinnedExportDestination::create(&target, &[&session]).unwrap();
+                    destination.write_all(b"owned temporary").unwrap();
+
+                    barrier.wait();
+                    destination.commit().unwrap();
+
+                    assert_eq!(fs::read(target).unwrap(), b"owned temporary");
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for worker in workers {
+            worker.join().unwrap();
+        }
     }
 
     #[test]

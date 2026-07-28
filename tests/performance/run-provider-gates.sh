@@ -365,6 +365,7 @@ PY
 isolate_environment() {
     if [[ "$PLATFORM" == "macos" ]]; then
         capture_macos_keychain_configuration
+        configure_macos_keychain
     fi
 
     export HOME="$TEMPORARY_ROOT/home"
@@ -385,8 +386,7 @@ isolate_environment() {
         "$TMPDIR"
 
     if [[ "$PLATFORM" == "macos" ]]; then
-        export CFFIXED_USER_HOME="$HOME"
-        configure_macos_keychain
+        unset CFFIXED_USER_HOME
     fi
 
     unset \
@@ -432,11 +432,6 @@ isolate_environment() {
         "no_proxy=$no_proxy"
         "LANG=${LANG:-C.UTF-8}"
     )
-    if [[ "$PLATFORM" == "macos" ]]; then
-        RUNTIME_ENVIRONMENT+=(
-            "CFFIXED_USER_HOME=$CFFIXED_USER_HOME"
-        )
-    fi
     if [[ "$PLATFORM" == "linux" ]]; then
         RUNTIME_ENVIRONMENT+=(
             "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS"
