@@ -81,6 +81,19 @@ $privateWorkflowArtifacts = @(
     "review", "reviews", "progress", "handoff", "handoffs",
     "plan", "plans", "spec", "specs", "workflow", "workflows"
 )
+$allowedUpdateFixturePaths = [Collections.Generic.HashSet[string]]::new(
+    [StringComparer]::OrdinalIgnoreCase
+)
+foreach ($path in @(
+        "crates/wokcore-platform/tests/fixtures/update/minisign.pub",
+        "crates/wokcore-platform/tests/fixtures/update/wokcore-update-v1.json",
+        "crates/wokcore-platform/tests/fixtures/update/wokcore-update-v1.json.minisig",
+        "crates/wokcore-platform/tests/fixtures/update/install-minisign.pub",
+        "crates/wokcore-platform/tests/fixtures/update/install-wokcore-update-v1.json",
+        "crates/wokcore-platform/tests/fixtures/update/install-wokcore-update-v1.json.minisig"
+    )) {
+    $allowedUpdateFixturePaths.Add($path) | Out-Null
+}
 
 $violations = foreach ($line in $IndexLines) {
     if ($line -notmatch "^(?<mode>\d{6}) [0-9a-f]{40} \d+\t(?<path>.+)$") {
@@ -90,6 +103,7 @@ $violations = foreach ($line in $IndexLines) {
     $mode = $Matches.mode
     $path = $Matches.path.Replace("\", "/")
     $lowerPath = $path.ToLowerInvariant()
+    $isAllowedUpdateFixture = $allowedUpdateFixturePaths.Contains($lowerPath)
     $hasPrivateWorkflowName = $false
     foreach ($segment in $path.Split("/")) {
         $tokens = @(($segment.ToLowerInvariant() -split "[-_.]+") | Where-Object { $_ })
@@ -104,7 +118,7 @@ $violations = foreach ($line in $IndexLines) {
             break
         }
     }
-    if (
+    if (-not $isAllowedUpdateFixture -and (
         $mode -eq "120000" -or
         $path -match "(^|/)docs/superpowers(/|$)" -or
         $path -match "(^|/)\.superpowers(/|$)" -or
@@ -123,7 +137,7 @@ $violations = foreach ($line in $IndexLines) {
             "wokcore.exe"
         ) -or
         $hasPrivateWorkflowName
-    ) {
+    )) {
         $line
     }
 }

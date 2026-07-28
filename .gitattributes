@@ -1,0 +1,6 @@
+/crates/wokcore-platform/tests/fixtures/update/minisign.pub text eol=lf
+/crates/wokcore-platform/tests/fixtures/update/wokcore-update-v1.json text eol=lf
+/crates/wokcore-platform/tests/fixtures/update/wokcore-update-v1.json.minisig text eol=lf
+/crates/wokcore-platform/tests/fixtures/update/install-minisign.pub text eol=lf
+/crates/wokcore-platform/tests/fixtures/update/install-wokcore-update-v1.json text eol=lf
+/crates/wokcore-platform/tests/fixtures/update/install-wokcore-update-v1.json.minisig text eol=lf

@@ -1189,7 +1189,6 @@ mod tests {
     use std::{
         fs,
         future::Future,
-        io::Write,
         path::Path,
         pin::Pin,
         sync::{
@@ -1198,6 +1197,9 @@ mod tests {
         },
         time::Duration,
     };
+
+    #[cfg(windows)]
+    use std::io::Write;
 
     use async_trait::async_trait;
     use axum::{

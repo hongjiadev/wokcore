@@ -12,7 +12,13 @@ $clean = @(
     "100644 0000000000000000000000000000000000000000 0`tdocs/api-spec.md",
     "100644 0000000000000000000000000000000000000000 0`t.github/workflows/ci.yml",
     "100644 0000000000000000000000000000000000000000 0`tnotes/daily-progress.md",
-    "100644 0000000000000000000000000000000000000000 0`trelease/minisign.pub"
+    "100644 0000000000000000000000000000000000000000 0`trelease/minisign.pub",
+    "100644 0000000000000000000000000000000000000000 0`tcrates/wokcore-platform/tests/fixtures/update/minisign.pub",
+    "100644 0000000000000000000000000000000000000000 0`tcrates/wokcore-platform/tests/fixtures/update/wokcore-update-v1.json",
+    "100644 0000000000000000000000000000000000000000 0`tcrates/wokcore-platform/tests/fixtures/update/wokcore-update-v1.json.minisig",
+    "100644 0000000000000000000000000000000000000000 0`tcrates/wokcore-platform/tests/fixtures/update/install-minisign.pub",
+    "100644 0000000000000000000000000000000000000000 0`tcrates/wokcore-platform/tests/fixtures/update/install-wokcore-update-v1.json",
+    "100644 0000000000000000000000000000000000000000 0`tcrates/wokcore-platform/tests/fixtures/update/install-wokcore-update-v1.json.minisig"
 )
 & $checker -IndexLines $clean
 
@@ -38,7 +44,8 @@ foreach ($forbidden in @(
     "100644 0000000000000000000000000000000000000000 0`tkeys/minisign.key",
     "100644 0000000000000000000000000000000000000000 0`trelease/private.pem",
     "100644 0000000000000000000000000000000000000000 0`tdist/SHA256SUMS",
-    "100644 0000000000000000000000000000000000000000 0`twokcore-v1.2.3-x86_64-pc-windows-msvc.zip"
+    "100644 0000000000000000000000000000000000000000 0`twokcore-v1.2.3-x86_64-pc-windows-msvc.zip",
+    "100644 0000000000000000000000000000000000000000 0`tcrates/wokcore-platform/tests/fixtures/update/unapproved.minisig"
 )) {
     $failed = $false
     try {

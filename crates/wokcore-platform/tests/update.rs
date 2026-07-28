@@ -19,6 +19,25 @@ const FIXTURE_MANIFEST: &[u8] = include_bytes!("fixtures/update/wokcore-update-v
 const FIXTURE_SIGNATURE: &[u8] = include_bytes!("fixtures/update/wokcore-update-v1.json.minisig");
 
 #[test]
+fn signed_update_fixtures_remain_byte_exact() {
+    assert_eq!(FIXTURE_PUBLIC_KEY.len(), 113);
+    assert_eq!(
+        format!("{:x}", Sha256::digest(FIXTURE_PUBLIC_KEY.as_bytes())),
+        "85b51eeaea961a2cfdbb36329d42eac8711888d7005afbeda40aad690547209c"
+    );
+    assert_eq!(FIXTURE_MANIFEST.len(), 1701);
+    assert_eq!(
+        format!("{:x}", Sha256::digest(FIXTURE_MANIFEST)),
+        "ce1ffbaa21831968fdc12f55f7064459b94f9f903389bf9a0b202a4ea0217a42"
+    );
+    assert_eq!(FIXTURE_SIGNATURE.len(), 289);
+    assert_eq!(
+        format!("{:x}", Sha256::digest(FIXTURE_SIGNATURE)),
+        "8abe48528f8f1bf22d3dd151a2066ccd4f16fda99237f49ed4f7826456bab130"
+    );
+}
+
+#[test]
 fn signed_manifest_selects_only_the_native_upgrade_and_rejects_downgrades() {
     let available = verify_manifest(
         FIXTURE_MANIFEST,

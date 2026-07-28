@@ -46,7 +46,7 @@ $samples = @(
 $evidence = ConvertTo-WokCorePhaseEvidence `
     -Samples $samples `
     -PhaseName "active" `
-    -ExecutableName "E:\Projects\wokcore\target\release\wokcore.exe"
+    -ExecutableName "X:\private-workspace\target\release\wokcore.exe"
 if ($evidence.PeakPrivateWorkingSetBytes -ne 67108864) {
     throw "Peak private working set aggregation failed."
 }
@@ -104,7 +104,7 @@ if ($csv.Length -ge 4096) {
     throw "CSV evidence exceeded its bounded aggregate size."
 }
 foreach ($forbidden in @(
-    "E:\Projects",
+    "X:\private-workspace",
     "command",
     "environment",
     "username",
