@@ -28,7 +28,7 @@ impl PreparedIdleMemoryReclaimer {
                 lifecycle,
                 idle_delay: SYSTEM_IDLE_DELAY,
                 follow_up_idle_delay: SYSTEM_FOLLOW_UP_IDLE_DELAY,
-                backend: Arc::new(SystemMemoryReclaimBackend),
+                backend: Arc::new(NativeMemoryReclaimBackend),
             })
         }
         #[cfg(not(any(all(target_os = "linux", target_env = "gnu"), target_os = "macos")))]
@@ -159,10 +159,10 @@ trait MemoryReclaimBackend: Send + Sync + 'static {
 }
 
 #[cfg(any(all(target_os = "linux", target_env = "gnu"), target_os = "macos"))]
-struct SystemMemoryReclaimBackend;
+struct NativeMemoryReclaimBackend;
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
-impl MemoryReclaimBackend for SystemMemoryReclaimBackend {
+impl MemoryReclaimBackend for NativeMemoryReclaimBackend {
     fn reclaim(&self) {
         // SAFETY: glibc documents malloc_trim as process-global and thread-safe.
         let _ = unsafe { libc::malloc_trim(0) };
@@ -170,16 +170,24 @@ impl MemoryReclaimBackend for SystemMemoryReclaimBackend {
 }
 
 #[cfg(target_os = "macos")]
-unsafe extern "C" {
-    fn malloc_zone_pressure_relief(zone: *mut libc::c_void, goal: usize) -> usize;
+fn purge_all_jemalloc_arenas() -> bool {
+    // SAFETY: arena.4096.purge is jemalloc's void mallctl command for purging
+    // unused dirty pages from every arena, so all value pointers remain null.
+    unsafe {
+        tikv_jemalloc_sys::mallctl(
+            c"arena.4096.purge".as_ptr(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+        ) == 0
+    }
 }
 
 #[cfg(target_os = "macos")]
-impl MemoryReclaimBackend for SystemMemoryReclaimBackend {
+impl MemoryReclaimBackend for NativeMemoryReclaimBackend {
     fn reclaim(&self) {
-        // SAFETY: Apple documents a null zone as examining all malloc zones and
-        // a zero goal as requesting maximal pressure relief.
-        let _ = unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) };
+        let _ = purge_all_jemalloc_arenas();
     }
 }
 
@@ -216,6 +224,12 @@ mod tests {
         fn reclaim(&self) {
             self.calls.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_memory_reclaimer_targets_all_jemalloc_arenas() {
+        assert!(super::purge_all_jemalloc_arenas());
     }
 
     async fn wait_for_calls(backend: &CountingBackend, expected: usize) {

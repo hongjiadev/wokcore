@@ -29,6 +29,11 @@ wokcore-protocols = { version = "0.1.0", path = "../../crates/wokcore-protocols"
 wokcore-server = { version = "0.1.0", path = "../../crates/wokcore-server" }
 wokcore-storage = { version = "0.1.0", path = "../../crates/wokcore-storage" }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+libc.workspace = true
+tikv-jemalloc-sys.workspace = true
+tikv-jemallocator.workspace = true
+
 [dev-dependencies]
 axum.workspace = true
 flate2.workspace = true

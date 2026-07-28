@@ -5,8 +5,22 @@ $repositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\.."))
 $runner = Join-Path $PSScriptRoot "run-provider-gates.sh"
 $ciWorkflow = Join-Path $repositoryRoot ".github\workflows\ci.yml"
 $releaseWorkflow = Join-Path $repositoryRoot ".github\workflows\release.yml"
+$workspaceManifest = Join-Path $repositoryRoot "Cargo.toml"
+$appManifest = Join-Path $repositoryRoot "apps\wokcore\Cargo.toml"
+$serverManifest = Join-Path $repositoryRoot "crates\wokcore-server\Cargo.toml"
+$appMain = Join-Path $repositoryRoot "apps\wokcore\src\main.rs"
+$memoryBackend = Join-Path $repositoryRoot "crates\wokcore-server\src\lifecycle\memory.rs"
 
-foreach ($path in @($runner, $ciWorkflow, $releaseWorkflow)) {
+foreach ($path in @(
+    $runner,
+    $ciWorkflow,
+    $releaseWorkflow,
+    $workspaceManifest,
+    $appManifest,
+    $serverManifest,
+    $appMain,
+    $memoryBackend
+)) {
     if (-not [IO.File]::Exists($path)) {
         throw "Portable Provider gate input is missing: $path"
     }
@@ -69,6 +83,76 @@ foreach ($forbidden in @(
 
 $ciSource = [IO.File]::ReadAllText($ciWorkflow, [Text.Encoding]::UTF8)
 $releaseSource = [IO.File]::ReadAllText($releaseWorkflow, [Text.Encoding]::UTF8)
+$workspaceManifestSource = [IO.File]::ReadAllText(
+    $workspaceManifest,
+    [Text.Encoding]::UTF8
+)
+$appManifestSource = [IO.File]::ReadAllText(
+    $appManifest,
+    [Text.Encoding]::UTF8
+)
+$serverManifestSource = [IO.File]::ReadAllText(
+    $serverManifest,
+    [Text.Encoding]::UTF8
+)
+$appMainSource = [IO.File]::ReadAllText($appMain, [Text.Encoding]::UTF8)
+$memoryBackendSource = [IO.File]::ReadAllText(
+    $memoryBackend,
+    [Text.Encoding]::UTF8
+)
+foreach ($contract in @(
+    @{
+        Source = $workspaceManifestSource
+        Required = @(
+            'tikv-jemalloc-sys = "=0.7.1"',
+            'tikv-jemallocator = "=0.7.0"'
+        )
+    },
+    @{
+        Source = $appManifestSource
+        Required = @(
+            "[target.'cfg(target_os = `"macos`")'.dependencies]",
+            "tikv-jemalloc-sys.workspace = true",
+            "tikv-jemallocator.workspace = true"
+        )
+    },
+    @{
+        Source = $serverManifestSource
+        Required = @(
+            "[target.'cfg(target_os = `"macos`")'.dependencies]",
+            "tikv-jemalloc-sys.workspace = true"
+        )
+    },
+    @{
+        Source = $appMainSource
+        Required = @(
+            "#[global_allocator]",
+            "_rjem_malloc_conf",
+            "narenas:2,dirty_decay_ms:0,muzzy_decay_ms:0",
+            'c"opt.narenas"',
+            'c"opt.dirty_decay_ms"',
+            'c"opt.muzzy_decay_ms"'
+        )
+    },
+    @{
+        Source = $memoryBackendSource
+        Required = @(
+            "tikv_jemalloc_sys::mallctl",
+            "arena.4096.purge"
+        )
+    }
+)) {
+    foreach ($required in $contract.Required) {
+        if (
+            $contract.Source.IndexOf(
+                $required,
+                [StringComparison]::Ordinal
+            ) -lt 0
+        ) {
+            throw "macOS allocator policy is missing a required invariant: $required"
+        }
+    }
+}
 $releasePerformanceStart = $releaseSource.IndexOf(
     "  windows-release-gate:",
     [StringComparison]::Ordinal
