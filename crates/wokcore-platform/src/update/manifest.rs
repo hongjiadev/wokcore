@@ -10,12 +10,86 @@ pub const MAX_UPDATE_SIGNATURE_BYTES: usize = 16 * 1024;
 pub const MAX_UPDATE_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_PUBLIC_KEY_BYTES: usize = 4 * 1024;
 
-const TARGETS: [TargetContract; 5] = [
-    TargetContract::new("x86_64-pc-windows-msvc", "zip", "wokcore.exe"),
-    TargetContract::new("x86_64-apple-darwin", "tar.gz", "wokcore"),
-    TargetContract::new("aarch64-apple-darwin", "tar.gz", "wokcore"),
-    TargetContract::new("x86_64-unknown-linux-gnu", "tar.gz", "wokcore"),
-    TargetContract::new("aarch64-unknown-linux-gnu", "tar.gz", "wokcore"),
+const V1_TARGETS: [TargetContract; 5] = [
+    TargetContract::legacy(
+        "x86_64-pc-windows-msvc",
+        "Windows",
+        "x86_64",
+        "zip",
+        "wokcore.exe",
+    ),
+    TargetContract::legacy(
+        "x86_64-apple-darwin",
+        "macOS",
+        "x86_64",
+        "tar.gz",
+        "wokcore",
+    ),
+    TargetContract::legacy(
+        "aarch64-apple-darwin",
+        "macOS",
+        "arm64",
+        "tar.gz",
+        "wokcore",
+    ),
+    TargetContract::legacy(
+        "x86_64-unknown-linux-gnu",
+        "Linux",
+        "x86_64",
+        "tar.gz",
+        "wokcore",
+    ),
+    TargetContract::legacy(
+        "aarch64-unknown-linux-gnu",
+        "Linux",
+        "arm64",
+        "tar.gz",
+        "wokcore",
+    ),
+];
+const V2_TARGETS: [TargetContract; 6] = [
+    TargetContract::friendly(
+        "x86_64-pc-windows-msvc",
+        "Windows",
+        "x86_64",
+        "zip",
+        "wokcore.exe",
+    ),
+    TargetContract::friendly(
+        "aarch64-pc-windows-msvc",
+        "Windows",
+        "arm64",
+        "zip",
+        "wokcore.exe",
+    ),
+    TargetContract::friendly(
+        "x86_64-apple-darwin",
+        "macOS",
+        "x86_64",
+        "tar.gz",
+        "wokcore",
+    ),
+    TargetContract::friendly(
+        "aarch64-apple-darwin",
+        "macOS",
+        "arm64",
+        "tar.gz",
+        "wokcore",
+    ),
+    TargetContract::friendly(
+        "x86_64-unknown-linux-gnu",
+        "Linux",
+        "x86_64",
+        "tar.gz",
+        "wokcore",
+    ),
+    TargetContract::friendly(
+        "aarch64-unknown-linux-gnu",
+        "Linux",
+        "arm64",
+        "tar.gz",
+        "wokcore",
+    ),
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -152,7 +226,7 @@ pub fn verify_manifest(
         .get("api_major")
         .and_then(serde_json::Value::as_u64)
         .ok_or(UpdateError::InvalidManifest)?;
-    if schema_version != 1 || api_major != 1 {
+    if !matches!(schema_version, 1 | 2) || api_major != 1 {
         return Ok(UpdateDecision::IncompatibleManifest);
     }
     let document = parse_manifest_document(manifest_bytes)?;
@@ -215,11 +289,15 @@ fn validate_document(
     current_version: &Version,
     target: &str,
 ) -> Result<UpdateDecision, UpdateError> {
-    if document.schema_version != 1
-        || document.product != "wokcore"
+    let targets: &[TargetContract] = match document.schema_version {
+        1 => &V1_TARGETS,
+        2 => &V2_TARGETS,
+        _ => return Err(UpdateError::InvalidManifest),
+    };
+    if document.product != "wokcore"
         || document.api_major != 1
         || document.signing_key_id != key_id
-        || document.artifacts.len() != TARGETS.len()
+        || document.artifacts.len() != targets.len()
     {
         return Err(UpdateError::InvalidManifest);
     }
@@ -229,7 +307,7 @@ fn validate_document(
     }
 
     let mut selected = None;
-    for (artifact, contract) in document.artifacts.into_iter().zip(TARGETS) {
+    for (artifact, contract) in document.artifacts.into_iter().zip(targets.iter().copied()) {
         let validated = validate_artifact(artifact, contract, &document.version)?;
         if contract.target == target {
             selected = Some(validated);
@@ -251,10 +329,7 @@ fn validate_artifact(
     contract: TargetContract,
     version: &str,
 ) -> Result<UpdateArtifact, UpdateError> {
-    let expected_file = format!(
-        "wokcore-v{version}-{}.{}",
-        contract.target, contract.extension
-    );
+    let expected_file = contract.expected_file(version);
     let expected_url = format!(
         "https://github.com/hongjiadev/wokcore/releases/download/v{version}/{expected_file}"
     );
@@ -288,6 +363,8 @@ fn is_lower_hex_sha256(value: &str) -> bool {
 pub const fn current_target() -> &'static str {
     if cfg!(all(target_arch = "x86_64", target_os = "windows")) {
         "x86_64-pc-windows-msvc"
+    } else if cfg!(all(target_arch = "aarch64", target_os = "windows")) {
+        "aarch64-pc-windows-msvc"
     } else if cfg!(all(target_arch = "x86_64", target_os = "macos")) {
         "x86_64-apple-darwin"
     } else if cfg!(all(target_arch = "aarch64", target_os = "macos")) {
@@ -326,23 +403,213 @@ struct ArtifactDocument {
 #[derive(Clone, Copy)]
 struct TargetContract {
     target: &'static str,
+    system: &'static str,
+    architecture: &'static str,
     extension: &'static str,
     executable: &'static str,
+    friendly_name: bool,
 }
 
 impl TargetContract {
-    const fn new(target: &'static str, extension: &'static str, executable: &'static str) -> Self {
+    const fn legacy(
+        target: &'static str,
+        system: &'static str,
+        architecture: &'static str,
+        extension: &'static str,
+        executable: &'static str,
+    ) -> Self {
         Self {
             target,
+            system,
+            architecture,
             extension,
             executable,
+            friendly_name: false,
         }
+    }
+
+    const fn friendly(
+        target: &'static str,
+        system: &'static str,
+        architecture: &'static str,
+        extension: &'static str,
+        executable: &'static str,
+    ) -> Self {
+        Self {
+            target,
+            system,
+            architecture,
+            extension,
+            executable,
+            friendly_name: true,
+        }
+    }
+
+    fn expected_file(self, version: &str) -> String {
+        if !self.friendly_name {
+            return format!("wokcore-v{version}-{}.{}", self.target, self.extension);
+        }
+        let portable = if self.system == "Windows" {
+            "-Portable"
+        } else {
+            ""
+        };
+        format!(
+            "WokCore-v{version}-{}-{}{}.{extension}",
+            self.system,
+            self.architecture,
+            portable,
+            extension = self.extension,
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{UpdateError, parse_manifest_document, public_key_id};
+    use semver::Version;
+
+    use super::{
+        UpdateDecision, UpdateError, parse_manifest_document, public_key_id, validate_document,
+    };
+
+    #[test]
+    fn manifest_v2_selects_windows_arm64() {
+        let v2 = br#"{
+            "schema_version": 2,
+            "product": "wokcore",
+            "api_major": 1,
+            "version": "1.2.3",
+            "signing_key_id": "0000000000000000",
+            "artifacts": [
+                {
+                    "target": "x86_64-pc-windows-msvc",
+                    "file": "WokCore-v1.2.3-Windows-x86_64-Portable.zip",
+                    "executable": "wokcore.exe",
+                    "size": 1,
+                    "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "url": "https://github.com/hongjiadev/wokcore/releases/download/v1.2.3/WokCore-v1.2.3-Windows-x86_64-Portable.zip"
+                },
+                {
+                    "target": "aarch64-pc-windows-msvc",
+                    "file": "WokCore-v1.2.3-Windows-arm64-Portable.zip",
+                    "executable": "wokcore.exe",
+                    "size": 1,
+                    "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+                    "url": "https://github.com/hongjiadev/wokcore/releases/download/v1.2.3/WokCore-v1.2.3-Windows-arm64-Portable.zip"
+                },
+                {
+                    "target": "x86_64-apple-darwin",
+                    "file": "WokCore-v1.2.3-macOS-x86_64.tar.gz",
+                    "executable": "wokcore",
+                    "size": 1,
+                    "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+                    "url": "https://github.com/hongjiadev/wokcore/releases/download/v1.2.3/WokCore-v1.2.3-macOS-x86_64.tar.gz"
+                },
+                {
+                    "target": "aarch64-apple-darwin",
+                    "file": "WokCore-v1.2.3-macOS-arm64.tar.gz",
+                    "executable": "wokcore",
+                    "size": 1,
+                    "sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+                    "url": "https://github.com/hongjiadev/wokcore/releases/download/v1.2.3/WokCore-v1.2.3-macOS-arm64.tar.gz"
+                },
+                {
+                    "target": "x86_64-unknown-linux-gnu",
+                    "file": "WokCore-v1.2.3-Linux-x86_64.tar.gz",
+                    "executable": "wokcore",
+                    "size": 1,
+                    "sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+                    "url": "https://github.com/hongjiadev/wokcore/releases/download/v1.2.3/WokCore-v1.2.3-Linux-x86_64.tar.gz"
+                },
+                {
+                    "target": "aarch64-unknown-linux-gnu",
+                    "file": "WokCore-v1.2.3-Linux-arm64.tar.gz",
+                    "executable": "wokcore",
+                    "size": 1,
+                    "sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+                    "url": "https://github.com/hongjiadev/wokcore/releases/download/v1.2.3/WokCore-v1.2.3-Linux-arm64.tar.gz"
+                }
+            ]
+        }"#;
+        let decision = validate_document(
+            parse_manifest_document(v2).unwrap(),
+            "0000000000000000",
+            &Version::new(1, 0, 0),
+            "aarch64-pc-windows-msvc",
+        )
+        .unwrap();
+        let UpdateDecision::Available(candidate) = decision else {
+            panic!("v2 fixture must offer an upgrade");
+        };
+        assert_eq!(
+            candidate.artifact().file(),
+            "WokCore-v1.2.3-Windows-arm64-Portable.zip"
+        );
+
+        let v1 = br#"{
+            "schema_version": 1,
+            "product": "wokcore",
+            "api_major": 1,
+            "version": "1.2.3",
+            "signing_key_id": "0000000000000000",
+            "artifacts": [
+                {
+                    "target": "x86_64-pc-windows-msvc",
+                    "file": "wokcore-v1.2.3-x86_64-pc-windows-msvc.zip",
+                    "executable": "wokcore.exe",
+                    "size": 1,
+                    "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "url": "https://github.com/hongjiadev/wokcore/releases/download/v1.2.3/wokcore-v1.2.3-x86_64-pc-windows-msvc.zip"
+                },
+                {
+                    "target": "x86_64-apple-darwin",
+                    "file": "wokcore-v1.2.3-x86_64-apple-darwin.tar.gz",
+                    "executable": "wokcore",
+                    "size": 1,
+                    "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+                    "url": "https://github.com/hongjiadev/wokcore/releases/download/v1.2.3/wokcore-v1.2.3-x86_64-apple-darwin.tar.gz"
+                },
+                {
+                    "target": "aarch64-apple-darwin",
+                    "file": "wokcore-v1.2.3-aarch64-apple-darwin.tar.gz",
+                    "executable": "wokcore",
+                    "size": 1,
+                    "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+                    "url": "https://github.com/hongjiadev/wokcore/releases/download/v1.2.3/wokcore-v1.2.3-aarch64-apple-darwin.tar.gz"
+                },
+                {
+                    "target": "x86_64-unknown-linux-gnu",
+                    "file": "wokcore-v1.2.3-x86_64-unknown-linux-gnu.tar.gz",
+                    "executable": "wokcore",
+                    "size": 1,
+                    "sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+                    "url": "https://github.com/hongjiadev/wokcore/releases/download/v1.2.3/wokcore-v1.2.3-x86_64-unknown-linux-gnu.tar.gz"
+                },
+                {
+                    "target": "aarch64-unknown-linux-gnu",
+                    "file": "wokcore-v1.2.3-aarch64-unknown-linux-gnu.tar.gz",
+                    "executable": "wokcore",
+                    "size": 1,
+                    "sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+                    "url": "https://github.com/hongjiadev/wokcore/releases/download/v1.2.3/wokcore-v1.2.3-aarch64-unknown-linux-gnu.tar.gz"
+                }
+            ]
+        }"#;
+        let decision = validate_document(
+            parse_manifest_document(v1).unwrap(),
+            "0000000000000000",
+            &Version::new(1, 0, 0),
+            "x86_64-pc-windows-msvc",
+        )
+        .unwrap();
+        let UpdateDecision::Available(candidate) = decision else {
+            panic!("v1 fixture must offer an upgrade");
+        };
+        assert_eq!(
+            candidate.artifact().file(),
+            "wokcore-v1.2.3-x86_64-pc-windows-msvc.zip"
+        );
+    }
 
     #[test]
     fn public_key_comment_must_match_the_payload_key_id() {

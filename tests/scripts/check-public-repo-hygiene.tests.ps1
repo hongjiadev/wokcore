@@ -18,7 +18,12 @@ $clean = @(
     "100644 0000000000000000000000000000000000000000 0`tcrates/wokcore-platform/tests/fixtures/update/wokcore-update-v1.json.minisig",
     "100644 0000000000000000000000000000000000000000 0`tcrates/wokcore-platform/tests/fixtures/update/install-minisign.pub",
     "100644 0000000000000000000000000000000000000000 0`tcrates/wokcore-platform/tests/fixtures/update/install-wokcore-update-v1.json",
-    "100644 0000000000000000000000000000000000000000 0`tcrates/wokcore-platform/tests/fixtures/update/install-wokcore-update-v1.json.minisig"
+    "100644 0000000000000000000000000000000000000000 0`tcrates/wokcore-platform/tests/fixtures/update/install-wokcore-update-v1.json.minisig",
+    "100644 0000000000000000000000000000000000000000 0`tapps/wokcore/tests/fixtures/update/migration-minisign.pub",
+    "100644 0000000000000000000000000000000000000000 0`tapps/wokcore/tests/fixtures/update/migration-wokcore-update-v1.json",
+    "100644 0000000000000000000000000000000000000000 0`tapps/wokcore/tests/fixtures/update/migration-wokcore-update-v1.json.minisig",
+    "100644 0000000000000000000000000000000000000000 0`tapps/wokcore/tests/fixtures/update/migration-wokcore-update-v2.json",
+    "100644 0000000000000000000000000000000000000000 0`tapps/wokcore/tests/fixtures/update/migration-wokcore-update-v2.json.minisig"
 )
 & $checker -IndexLines $clean
 
@@ -46,6 +51,7 @@ foreach ($forbidden in @(
     "100644 0000000000000000000000000000000000000000 0`tdist/SHA256SUMS",
     "100644 0000000000000000000000000000000000000000 0`twokcore-v1.2.3-x86_64-pc-windows-msvc.zip",
     "100644 0000000000000000000000000000000000000000 0`tcrates/wokcore-platform/tests/fixtures/update/unapproved.minisig",
+    "100644 0000000000000000000000000000000000000000 0`tapps/wokcore/tests/fixtures/update/wokcore-update-v2.json",
     "120000 0000000000000000000000000000000000000000 0`tcrates/wokcore-platform/tests/fixtures/update/wokcore-update-v1.json",
     "100644 0000000000000000000000000000000000000000 0`tcrates/WokCore-platform/tests/fixtures/update/wokcore-update-v1.json"
 )) {

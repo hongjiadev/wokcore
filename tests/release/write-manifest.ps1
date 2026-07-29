@@ -7,9 +7,10 @@ param(
     [Parameter(Mandatory)]
     [string] $SigningKeyId,
     [Parameter(Mandatory)]
-    [string] $OutputPath,
+    [ValidateSet(1, 2)]
+    [int] $SchemaVersion,
     [Parameter(Mandatory)]
-    [string] $ChecksumsPath
+    [string] $OutputPath
 )
 
 $ErrorActionPreference = "Stop"
@@ -25,49 +26,30 @@ if ($SigningKeyId -cnotmatch "^[0-9A-F]{16}$") {
 
 $ArtifactDirectory = [IO.Path]::GetFullPath($ArtifactDirectory)
 $OutputPath = [IO.Path]::GetFullPath($OutputPath)
-$ChecksumsPath = [IO.Path]::GetFullPath($ChecksumsPath)
 if (-not [IO.Directory]::Exists($ArtifactDirectory)) {
     throw "Artifact directory does not exist."
 }
+$manifestName = "wokcore-update-v$SchemaVersion.json"
 if (
     [IO.Path]::GetDirectoryName($OutputPath) -cne $ArtifactDirectory -or
-    [IO.Path]::GetFileName($OutputPath) -cne "wokcore-update-v1.json" -or
-    [IO.Path]::GetDirectoryName($ChecksumsPath) -cne $ArtifactDirectory -or
-    [IO.Path]::GetFileName($ChecksumsPath) -cne "SHA256SUMS"
+    [IO.Path]::GetFileName($OutputPath) -cne $manifestName
 ) {
-    throw "Manifest and checksums must use their fixed names in the artifact directory."
+    throw "Manifest must use its fixed schema-versioned name in the artifact directory."
 }
 
-$specifications = @(
-    [pscustomobject]@{
-        Target = "x86_64-pc-windows-msvc"
-        Extension = "zip"
-        Executable = "wokcore.exe"
-    },
-    [pscustomobject]@{
-        Target = "x86_64-apple-darwin"
-        Extension = "tar.gz"
-        Executable = "wokcore"
-    },
-    [pscustomobject]@{
-        Target = "aarch64-apple-darwin"
-        Extension = "tar.gz"
-        Executable = "wokcore"
-    },
-    [pscustomobject]@{
-        Target = "x86_64-unknown-linux-gnu"
-        Extension = "tar.gz"
-        Executable = "wokcore"
-    },
-    [pscustomobject]@{
-        Target = "aarch64-unknown-linux-gnu"
-        Extension = "tar.gz"
-        Executable = "wokcore"
-    }
-)
+Import-Module (Join-Path $PSScriptRoot "WokCore.ReleaseContract.psm1") -Force
+$contracts = if ($SchemaVersion -eq 1) {
+    @(Get-WokCoreTargetContracts -Version $Version | Where-Object LegacyV1)
+} else {
+    @(Get-WokCoreTargetContracts -Version $Version)
+}
 
-$artifacts = foreach ($specification in $specifications) {
-    $fileName = "wokcore-v$Version-$($specification.Target).$($specification.Extension)"
+$artifacts = foreach ($contract in $contracts) {
+    $fileName = if ($SchemaVersion -eq 1) {
+        $contract.LegacyV1Name
+    } else {
+        $contract.FriendlyPortableName
+    }
     $path = Join-Path $ArtifactDirectory $fileName
     if (-not [IO.File]::Exists($path)) {
         throw "Release artifact is missing: $fileName"
@@ -82,9 +64,9 @@ $artifacts = foreach ($specification in $specifications) {
     }
     $sha256 = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
     [ordered]@{
-        target = $specification.Target
+        target = $contract.Target
         file = $fileName
-        executable = $specification.Executable
+        executable = $contract.Executable
         size = [long] $item.Length
         sha256 = $sha256
         url = "https://github.com/hongjiadev/wokcore/releases/download/v$Version/$fileName"
@@ -92,7 +74,7 @@ $artifacts = foreach ($specification in $specifications) {
 }
 
 $document = [ordered]@{
-    schema_version = 1
+    schema_version = $SchemaVersion
     product = "wokcore"
     api_major = 1
     version = $Version
@@ -100,42 +82,22 @@ $document = [ordered]@{
     artifacts = @($artifacts)
 }
 $json = ($document | ConvertTo-Json -Depth 6 -Compress) + "`n"
-$utf8 = [Text.UTF8Encoding]::new($false)
 $temporaryManifest = Join-Path $ArtifactDirectory (
-    ".wokcore-update-v1." + [Guid]::NewGuid().ToString("N") + ".tmp"
+    ".$manifestName." + [Guid]::NewGuid().ToString("N") + ".tmp"
 )
-$temporaryChecksums = Join-Path $ArtifactDirectory (
-    ".SHA256SUMS." + [Guid]::NewGuid().ToString("N") + ".tmp"
-)
-
 try {
-    [IO.File]::WriteAllText($temporaryManifest, $json, $utf8)
+    [IO.File]::WriteAllText(
+        $temporaryManifest,
+        $json,
+        [Text.UTF8Encoding]::new($false)
+    )
     if ([IO.File]::Exists($OutputPath)) {
         [IO.File]::Delete($OutputPath)
     }
     [IO.File]::Move($temporaryManifest, $OutputPath)
-
-    $checksumLines = foreach ($artifact in $artifacts) {
-        "$($artifact.sha256)  $($artifact.file)"
-    }
-    $manifestHash = (
-        Get-FileHash -LiteralPath $OutputPath -Algorithm SHA256
-    ).Hash.ToLowerInvariant()
-    $checksumLines += "$manifestHash  wokcore-update-v1.json"
-    [IO.File]::WriteAllText(
-        $temporaryChecksums,
-        ([string]::Join("`n", $checksumLines) + "`n"),
-        $utf8
-    )
-    if ([IO.File]::Exists($ChecksumsPath)) {
-        [IO.File]::Delete($ChecksumsPath)
-    }
-    [IO.File]::Move($temporaryChecksums, $ChecksumsPath)
 } finally {
-    foreach ($temporary in @($temporaryManifest, $temporaryChecksums)) {
-        if ([IO.File]::Exists($temporary)) {
-            [IO.File]::Delete($temporary)
-        }
+    if ([IO.File]::Exists($temporaryManifest)) {
+        [IO.File]::Delete($temporaryManifest)
     }
 }
 

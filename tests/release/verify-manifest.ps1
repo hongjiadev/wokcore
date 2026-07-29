@@ -184,11 +184,19 @@ if (
 ) {
     throw "Artifact directory or Minisign executable is missing."
 }
+$manifestName = [IO.Path]::GetFileName($ManifestPath)
+$fileSchemaVersion = if ($manifestName -ceq "wokcore-update-v1.json") {
+    1
+} elseif ($manifestName -ceq "wokcore-update-v2.json") {
+    2
+} else {
+    0
+}
 if (
     [IO.Path]::GetDirectoryName($ManifestPath) -cne $ArtifactDirectory -or
-    [IO.Path]::GetFileName($ManifestPath) -cne "wokcore-update-v1.json" -or
+    $fileSchemaVersion -eq 0 -or
     [IO.Path]::GetDirectoryName($SignaturePath) -cne $ArtifactDirectory -or
-    [IO.Path]::GetFileName($SignaturePath) -cne "wokcore-update-v1.json.minisig" -or
+    [IO.Path]::GetFileName($SignaturePath) -cne "$manifestName.minisig" -or
     [IO.Path]::GetDirectoryName($ChecksumsPath) -cne $ArtifactDirectory -or
     [IO.Path]::GetFileName($ChecksumsPath) -cne "SHA256SUMS"
 ) {
@@ -230,7 +238,7 @@ Assert-ExactProperties `
     -Context "Release manifest"
 if (
     -not (Test-JsonInteger -Value $document.schema_version) -or
-    [int64] $document.schema_version -ne 1 -or
+    [int64] $document.schema_version -ne $fileSchemaVersion -or
     $document.product -isnot [string] -or
     $document.product -cne "wokcore" -or
     -not (Test-JsonInteger -Value $document.api_major) -or
@@ -262,39 +270,20 @@ if ($LASTEXITCODE -ne 0) {
     throw "Release manifest Minisign verification failed."
 }
 
-$specifications = @(
-    [pscustomobject]@{
-        Target = "x86_64-pc-windows-msvc"
-        Extension = "zip"
-        Executable = "wokcore.exe"
-    },
-    [pscustomobject]@{
-        Target = "x86_64-apple-darwin"
-        Extension = "tar.gz"
-        Executable = "wokcore"
-    },
-    [pscustomobject]@{
-        Target = "aarch64-apple-darwin"
-        Extension = "tar.gz"
-        Executable = "wokcore"
-    },
-    [pscustomobject]@{
-        Target = "x86_64-unknown-linux-gnu"
-        Extension = "tar.gz"
-        Executable = "wokcore"
-    },
-    [pscustomobject]@{
-        Target = "aarch64-unknown-linux-gnu"
-        Extension = "tar.gz"
-        Executable = "wokcore"
-    }
-)
+Import-Module (Join-Path $PSScriptRoot "WokCore.ReleaseContract.psm1") -Force
+$specifications = if ($fileSchemaVersion -eq 1) {
+    @(
+        Get-WokCoreTargetContracts -Version $ExpectedVersion |
+            Where-Object LegacyV1
+    )
+} else {
+    @(Get-WokCoreTargetContracts -Version $ExpectedVersion)
+}
 $artifacts = @($document.artifacts)
 if ($artifacts.Count -ne $specifications.Count) {
-    throw "Release manifest must contain exactly five artifacts."
+    throw "Release manifest artifact count does not match its schema."
 }
 
-$checksumLines = [Collections.Generic.List[string]]::new()
 for ($index = 0; $index -lt $specifications.Count; $index++) {
     $specification = $specifications[$index]
     $artifact = $artifacts[$index]
@@ -303,7 +292,11 @@ for ($index = 0; $index -lt $specifications.Count; $index++) {
         -Expected @("target", "file", "executable", "size", "sha256", "url") `
         -Context "Release artifact"
 
-    $expectedFile = "wokcore-v$ExpectedVersion-$($specification.Target).$($specification.Extension)"
+    $expectedFile = if ($fileSchemaVersion -eq 1) {
+        $specification.LegacyV1Name
+    } else {
+        $specification.FriendlyPortableName
+    }
     $expectedUrl = "https://github.com/hongjiadev/wokcore/releases/download/v$ExpectedVersion/$expectedFile"
     if (
         $artifact.target -isnot [string] -or
@@ -371,13 +364,38 @@ for ($index = 0; $index -lt $specifications.Count; $index++) {
             throw "Release archive contains an unsafe or forbidden entry."
         }
     }
-    $checksumLines.Add("$actualHash  $expectedFile")
 }
 
-$manifestHash = (
-    Get-FileHash -LiteralPath $ManifestPath -Algorithm SHA256
-).Hash.ToLowerInvariant()
-$checksumLines.Add("$manifestHash  wokcore-update-v1.json")
+$checksumNames = [string[]] @(
+    @(
+        Get-WokCorePayloadNames `
+            -Version $ExpectedVersion `
+            -IncludeLegacyV1
+    ) + @(
+        "wokcore-update-v1.json",
+        "wokcore-update-v2.json"
+    )
+)
+[Array]::Sort($checksumNames, [StringComparer]::Ordinal)
+$checksumLines = [Collections.Generic.List[string]]::new()
+foreach ($name in $checksumNames) {
+    $path = Join-Path $ArtifactDirectory $name
+    if (-not [IO.File]::Exists($path)) {
+        throw "Release checksum input is missing: $name"
+    }
+    $item = Get-Item -LiteralPath $path
+    if (
+        ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+        $item.Length -le 0 -or
+        $item.Length -gt $maximumArtifactBytes
+    ) {
+        throw "Release checksum input is symbolic, empty, or oversized: $name"
+    }
+    $hash = (
+        Get-FileHash -LiteralPath $path -Algorithm SHA256
+    ).Hash.ToLowerInvariant()
+    $checksumLines.Add("$hash  $name")
+}
 $expectedChecksums = [string]::Join("`n", $checksumLines) + "`n"
 if ($checksumsText -cne $expectedChecksums) {
     throw "SHA256SUMS does not exactly match the release artifacts and manifest."

@@ -9,21 +9,28 @@ Set-StrictMode -Version Latest
 $repositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "../.."))
 $buildPackage = Join-Path $PSScriptRoot "build-package.ps1"
 $writeManifest = Join-Path $PSScriptRoot "write-manifest.ps1"
+$writeChecksums = Join-Path $PSScriptRoot "write-checksums.ps1"
 $verifyManifest = Join-Path $PSScriptRoot "verify-manifest.ps1"
 $normalizePublicKey = Join-Path $PSScriptRoot "normalize-minisign-public-key.ps1"
-$schema = Join-Path $repositoryRoot "release\manifest-v1.schema.json"
+$schemaV1 = Join-Path $repositoryRoot "release\manifest-v1.schema.json"
+$schemaV2 = Join-Path $repositoryRoot "release\manifest-v2.schema.json"
+$releaseContract = Join-Path $PSScriptRoot "WokCore.ReleaseContract.psm1"
 
 foreach ($path in @(
     $buildPackage,
     $writeManifest,
+    $writeChecksums,
     $verifyManifest,
     $normalizePublicKey,
-    $schema
+    $schemaV1,
+    $schemaV2,
+    $releaseContract
 )) {
     if (-not [IO.File]::Exists($path)) {
         throw "Missing release contract implementation: $path"
     }
 }
+Import-Module $releaseContract -Force
 if ([string]::IsNullOrWhiteSpace($MinisignPath)) {
     $command = Get-Command minisign -ErrorAction SilentlyContinue
     if ($null -eq $command) {
@@ -264,6 +271,33 @@ try {
             Join-Path $packages "wokcore-v1.2.3-$target.tar.gz"
         )
     }
+    foreach ($contract in Get-WokCoreTargetContracts -Version "1.2.3") {
+        $friendlyPath = Join-Path $packages $contract.FriendlyPortableName
+        $sourceName = if ($contract.LegacyV1) {
+            $contract.LegacyV1Name
+        } else {
+            "wokcore-v1.2.3-x86_64-pc-windows-msvc.zip"
+        }
+        [IO.File]::Copy(
+            (Join-Path $packages $sourceName),
+            $friendlyPath
+        )
+    }
+    $expectedPayloadNames = @(
+        Get-WokCorePayloadNames -Version "1.2.3" -IncludeLegacyV1
+    )
+    if ($expectedPayloadNames.Count -ne 19) {
+        throw "Dual-manifest fixture must contain 19 payloads."
+    }
+    foreach ($name in $expectedPayloadNames) {
+        $path = Join-Path $packages $name
+        if (-not [IO.File]::Exists($path)) {
+            [IO.File]::WriteAllBytes(
+                $path,
+                [Text.Encoding]::UTF8.GetBytes($name)
+            )
+        }
+    }
 
     $publicKey = Join-Path $testRoot "fixture.pub"
     $secretKey = Join-Path $testRoot "fixture.key"
@@ -283,15 +317,41 @@ try {
     }
 
     $manifest = Join-Path $packages "wokcore-update-v1.json"
+    $manifestV2 = Join-Path $packages "wokcore-update-v2.json"
     $checksums = Join-Path $packages "SHA256SUMS"
     & $writeManifest `
         -ArtifactDirectory $packages `
         -Version "1.2.3" `
         -SigningKeyId $keyId `
-        -OutputPath $manifest `
-        -ChecksumsPath $checksums
+        -SchemaVersion 1 `
+        -OutputPath $manifest
+    & $writeManifest `
+        -ArtifactDirectory $packages `
+        -Version "1.2.3" `
+        -SigningKeyId $keyId `
+        -SchemaVersion 2 `
+        -OutputPath $manifestV2
+
+    $v1 = Get-Content -Raw -LiteralPath $manifest | ConvertFrom-Json
+    $v2 = Get-Content -Raw -LiteralPath $manifestV2 | ConvertFrom-Json
+    if ($v1.artifacts.Count -ne 5) { throw "v1 must remain five-target." }
+    if ($v2.artifacts.Count -ne 6) { throw "v2 must be six-target." }
+    if ($v2.artifacts.file -match "unknown") {
+        throw "v2 files must be friendly."
+    }
+    if ($v2.artifacts.target -notcontains "aarch64-pc-windows-msvc") {
+        throw "v2 must contain Windows ARM64."
+    }
+    & $writeChecksums `
+        -ArtifactDirectory $packages `
+        -ExpectedNames @(
+            $expectedPayloadNames +
+            @("wokcore-update-v1.json", "wokcore-update-v2.json")
+        ) `
+        -OutputPath $checksums
 
     $signature = "$manifest.minisig"
+    $signatureV2 = "$manifestV2.minisig"
     Invoke-Minisign -Arguments @(
         "-S", "-W",
         "-s", $secretKey,
@@ -300,10 +360,27 @@ try {
         "-c", "WokCore release contract test",
         "-t", "wokcore test fixture"
     )
+    Invoke-Minisign -Arguments @(
+        "-S", "-W",
+        "-s", $secretKey,
+        "-m", $manifestV2,
+        "-x", $signatureV2,
+        "-c", "WokCore release contract test",
+        "-t", "wokcore v2 test fixture"
+    )
 
     & $verifyManifest `
         -ManifestPath $manifest `
         -SignaturePath $signature `
+        -PublicKeyPath $publicKey `
+        -ArtifactDirectory $packages `
+        -ChecksumsPath $checksums `
+        -ExpectedVersion "1.2.3" `
+        -ExpectedSigningKeyId $keyId `
+        -MinisignPath $MinisignPath
+    & $verifyManifest `
+        -ManifestPath $manifestV2 `
+        -SignaturePath $signatureV2 `
         -PublicKeyPath $publicKey `
         -ArtifactDirectory $packages `
         -ChecksumsPath $checksums `

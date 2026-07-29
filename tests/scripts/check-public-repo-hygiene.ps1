@@ -90,7 +90,12 @@ foreach ($path in @(
         "crates/wokcore-platform/tests/fixtures/update/wokcore-update-v1.json.minisig",
         "crates/wokcore-platform/tests/fixtures/update/install-minisign.pub",
         "crates/wokcore-platform/tests/fixtures/update/install-wokcore-update-v1.json",
-        "crates/wokcore-platform/tests/fixtures/update/install-wokcore-update-v1.json.minisig"
+        "crates/wokcore-platform/tests/fixtures/update/install-wokcore-update-v1.json.minisig",
+        "apps/wokcore/tests/fixtures/update/migration-minisign.pub",
+        "apps/wokcore/tests/fixtures/update/migration-wokcore-update-v1.json",
+        "apps/wokcore/tests/fixtures/update/migration-wokcore-update-v1.json.minisig",
+        "apps/wokcore/tests/fixtures/update/migration-wokcore-update-v2.json",
+        "apps/wokcore/tests/fixtures/update/migration-wokcore-update-v2.json.minisig"
     )) {
     $allowedUpdateFixturePaths.Add($path) | Out-Null
 }
@@ -122,7 +127,7 @@ $violations = foreach ($line in $IndexLines) {
         $lowerPath -match
             "\.(key|sec|secret|private|pem|p12|pfx|zip|tgz|tar\.gz|minisig|exe|dll|dylib|so)$" -or
         $lowerPath -match
-            "(^|/)(sha256sums|wokcore-update-v1\.json|wokcore-update-v1\.json\.minisig)$" -or
+            "(^|/)(sha256sums|wokcore-update-v[12]\.json|wokcore-update-v[12]\.json\.minisig)$" -or
         $lowerPath -match
             "(^|/)wokcore-v[0-9][0-9a-z.+-]*-(x86_64|aarch64)-[^/]+\.(zip|tar\.gz)$" -or
         $lowerPath -in @(

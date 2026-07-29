@@ -4,15 +4,17 @@ Set-StrictMode -Version Latest
 $repositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "../.."))
 $workflowPath = Join-Path $repositoryRoot ".github\workflows\release.yml"
 $ciPath = Join-Path $repositoryRoot ".github\workflows\ci.yml"
-$schemaPath = Join-Path $repositoryRoot "release\manifest-v1.schema.json"
-foreach ($path in @($workflowPath, $ciPath, $schemaPath)) {
+$schemaV1Path = Join-Path $repositoryRoot "release\manifest-v1.schema.json"
+$schemaV2Path = Join-Path $repositoryRoot "release\manifest-v2.schema.json"
+foreach ($path in @($workflowPath, $ciPath, $schemaV1Path, $schemaV2Path)) {
     if (-not [IO.File]::Exists($path)) {
         throw "Release workflow input is missing: $path"
     }
 }
 $source = [IO.File]::ReadAllText($workflowPath, [Text.Encoding]::UTF8)
 $ciSource = [IO.File]::ReadAllText($ciPath, [Text.Encoding]::UTF8)
-$schema = Get-Content -Raw -LiteralPath $schemaPath | ConvertFrom-Json
+$schemaV1 = Get-Content -Raw -LiteralPath $schemaV1Path | ConvertFrom-Json
+$schemaV2 = Get-Content -Raw -LiteralPath $schemaV2Path | ConvertFrom-Json
 
 # These checks catch a release contract that omits a supported target, misses a
 # public or legacy payload, or leaks a Rust vendor segment into a public name.
@@ -123,9 +125,9 @@ foreach ($workflowSource in @($source, $ciSource)) {
     }
 }
 
-$prefixItems = @($schema.properties.artifacts.prefixItems)
+$prefixItems = @($schemaV1.properties.artifacts.prefixItems)
 if (
-    $schema.properties.artifacts.items -ne $false -or
+    $schemaV1.properties.artifacts.items -ne $false -or
     $prefixItems.Count -ne $matrixContracts.Count
 ) {
     throw "Release schema must define exactly five ordered artifact contracts."
@@ -148,6 +150,67 @@ for ($index = 0; $index -lt $matrixContracts.Count; $index++) {
         ) -lt 0
     ) {
         throw "Release schema target mapping is not exact: $target"
+    }
+}
+
+$v2Contracts = @(
+    @(
+        "x86_64-pc-windows-msvc",
+        "wokcore.exe",
+        "^WokCore-v[0-9]+\.[0-9]+\.[0-9]+-Windows-x86_64-Portable\.zip$",
+        "^https://github\.com/hongjiadev/wokcore/releases/download/v[0-9]+\.[0-9]+\.[0-9]+/WokCore-v[0-9]+\.[0-9]+\.[0-9]+-Windows-x86_64-Portable\.zip$"
+    ),
+    @(
+        "aarch64-pc-windows-msvc",
+        "wokcore.exe",
+        "^WokCore-v[0-9]+\.[0-9]+\.[0-9]+-Windows-arm64-Portable\.zip$",
+        "^https://github\.com/hongjiadev/wokcore/releases/download/v[0-9]+\.[0-9]+\.[0-9]+/WokCore-v[0-9]+\.[0-9]+\.[0-9]+-Windows-arm64-Portable\.zip$"
+    ),
+    @(
+        "x86_64-apple-darwin",
+        "wokcore",
+        "^WokCore-v[0-9]+\.[0-9]+\.[0-9]+-macOS-x86_64\.tar\.gz$",
+        "^https://github\.com/hongjiadev/wokcore/releases/download/v[0-9]+\.[0-9]+\.[0-9]+/WokCore-v[0-9]+\.[0-9]+\.[0-9]+-macOS-x86_64\.tar\.gz$"
+    ),
+    @(
+        "aarch64-apple-darwin",
+        "wokcore",
+        "^WokCore-v[0-9]+\.[0-9]+\.[0-9]+-macOS-arm64\.tar\.gz$",
+        "^https://github\.com/hongjiadev/wokcore/releases/download/v[0-9]+\.[0-9]+\.[0-9]+/WokCore-v[0-9]+\.[0-9]+\.[0-9]+-macOS-arm64\.tar\.gz$"
+    ),
+    @(
+        "x86_64-unknown-linux-gnu",
+        "wokcore",
+        "^WokCore-v[0-9]+\.[0-9]+\.[0-9]+-Linux-x86_64\.tar\.gz$",
+        "^https://github\.com/hongjiadev/wokcore/releases/download/v[0-9]+\.[0-9]+\.[0-9]+/WokCore-v[0-9]+\.[0-9]+\.[0-9]+-Linux-x86_64\.tar\.gz$"
+    ),
+    @(
+        "aarch64-unknown-linux-gnu",
+        "wokcore",
+        "^WokCore-v[0-9]+\.[0-9]+\.[0-9]+-Linux-arm64\.tar\.gz$",
+        "^https://github\.com/hongjiadev/wokcore/releases/download/v[0-9]+\.[0-9]+\.[0-9]+/WokCore-v[0-9]+\.[0-9]+\.[0-9]+-Linux-arm64\.tar\.gz$"
+    )
+)
+$v2PrefixItems = @($schemaV2.properties.artifacts.prefixItems)
+if (
+    $schemaV2.properties.schema_version.const -ne 2 -or
+    $schemaV2.properties.artifacts.minItems -ne 6 -or
+    $schemaV2.properties.artifacts.maxItems -ne 6 -or
+    $schemaV2.properties.artifacts.items -ne $false -or
+    $v2PrefixItems.Count -ne 6
+) {
+    throw "Release schema v2 must define exactly six ordered artifact contracts."
+}
+for ($index = 0; $index -lt $v2Contracts.Count; $index++) {
+    $target, $executable, $filePattern, $urlPattern = $v2Contracts[$index]
+    $properties = $v2PrefixItems[$index].allOf[1].properties
+    if (
+        $properties.target.const -cne $target -or
+        $properties.executable.const -cne $executable -or
+        $properties.file.pattern -cne $filePattern -or
+        $properties.url.pattern -cne $urlPattern
+    ) {
+        throw "Release schema v2 target mapping is not exact: $target"
     }
 }
 

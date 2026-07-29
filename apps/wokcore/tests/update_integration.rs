@@ -1,4 +1,11 @@
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use axum::{Router, body::Body, response::Response, routing::get};
 use clap::Parser;
@@ -17,13 +24,13 @@ use wokcore_platform::AppPaths;
 use wokcore_server::auth::{EntropySource, TokenError};
 use wokcore_storage::MemorySecretStore;
 
-const FIXTURE_PUBLIC_KEY: &str =
-    include_str!("../../../crates/wokcore-platform/tests/fixtures/update/minisign.pub");
-const FIXTURE_MANIFEST: &[u8] =
-    include_bytes!("../../../crates/wokcore-platform/tests/fixtures/update/wokcore-update-v1.json");
-const FIXTURE_SIGNATURE: &[u8] = include_bytes!(
-    "../../../crates/wokcore-platform/tests/fixtures/update/wokcore-update-v1.json.minisig"
-);
+const MIGRATION_PUBLIC_KEY: &str = include_str!("fixtures/update/migration-minisign.pub");
+const MIGRATION_V1: &[u8] = include_bytes!("fixtures/update/migration-wokcore-update-v1.json");
+const MIGRATION_V1_SIGNATURE: &[u8] =
+    include_bytes!("fixtures/update/migration-wokcore-update-v1.json.minisig");
+const MIGRATION_V2: &[u8] = include_bytes!("fixtures/update/migration-wokcore-update-v2.json");
+const MIGRATION_V2_SIGNATURE: &[u8] =
+    include_bytes!("fixtures/update/migration-wokcore-update-v2.json.minisig");
 
 struct UnusedRuntime;
 
@@ -119,17 +126,21 @@ async fn update_check_without_a_verification_key_fails_closed_before_network_acc
 }
 
 #[tokio::test]
-async fn update_check_downloads_and_verifies_a_signed_manifest_from_loopback() {
+async fn update_check_falls_back_to_v1_only_when_v2_is_not_found() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let app = Router::new()
         .route(
+            "/wokcore-update-v2.json",
+            get(|| async { Response::builder().status(404).body(Body::empty()).unwrap() }),
+        )
+        .route(
             "/wokcore-update-v1.json",
-            get(|| async { Response::new(Body::from(FIXTURE_MANIFEST)) }),
+            get(|| async { Response::new(Body::from(MIGRATION_V1)) }),
         )
         .route(
             "/wokcore-update-v1.json.minisig",
-            get(|| async { Response::new(Body::from(FIXTURE_SIGNATURE)) }),
+            get(|| async { Response::new(Body::from(MIGRATION_V1_SIGNATURE)) }),
         );
     let server = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
@@ -137,7 +148,7 @@ async fn update_check_downloads_and_verifies_a_signed_manifest_from_loopback() {
     let origin = Url::parse(&format!("http://{address}/")).unwrap();
     let (_directory, dependencies) = dependencies();
     let dependencies = dependencies
-        .with_loopback_update_source(origin, FIXTURE_PUBLIC_KEY)
+        .with_loopback_update_source(origin, MIGRATION_PUBLIC_KEY)
         .unwrap();
     let mut output = BufferOutput::default();
 
@@ -160,4 +171,91 @@ async fn update_check_downloads_and_verifies_a_signed_manifest_from_loopback() {
         }),
     );
     assert_eq!(output.stderr(), "");
+}
+
+#[tokio::test]
+async fn update_check_does_not_fall_back_when_present_v2_has_an_invalid_signature() {
+    let mut corrupted_signature = MIGRATION_V2_SIGNATURE.to_vec();
+    let signature_payload = corrupted_signature
+        .split_mut(|byte| *byte == b'\n')
+        .nth(1)
+        .unwrap();
+    let index = signature_payload
+        .iter()
+        .skip(20)
+        .position(|byte| byte.is_ascii_alphanumeric())
+        .map(|index| index + 20)
+        .unwrap();
+    signature_payload[index] = if signature_payload[index] == b'A' {
+        b'B'
+    } else {
+        b'A'
+    };
+
+    let v1_manifest_requests = Arc::new(AtomicUsize::new(0));
+    let v1_signature_requests = Arc::new(AtomicUsize::new(0));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let app = Router::new()
+        .route(
+            "/wokcore-update-v2.json",
+            get(|| async { Response::new(Body::from(MIGRATION_V2)) }),
+        )
+        .route(
+            "/wokcore-update-v2.json.minisig",
+            get({
+                let corrupted_signature = corrupted_signature.clone();
+                move || {
+                    let signature = corrupted_signature.clone();
+                    async move { Response::new(Body::from(signature)) }
+                }
+            }),
+        )
+        .route(
+            "/wokcore-update-v1.json",
+            get({
+                let requests = v1_manifest_requests.clone();
+                move || {
+                    let requests = requests.clone();
+                    async move {
+                        requests.fetch_add(1, Ordering::AcqRel);
+                        Response::new(Body::from(MIGRATION_V1))
+                    }
+                }
+            }),
+        )
+        .route(
+            "/wokcore-update-v1.json.minisig",
+            get({
+                let requests = v1_signature_requests.clone();
+                move || {
+                    let requests = requests.clone();
+                    async move {
+                        requests.fetch_add(1, Ordering::AcqRel);
+                        Response::new(Body::from(MIGRATION_V1_SIGNATURE))
+                    }
+                }
+            }),
+        );
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let origin = Url::parse(&format!("http://{address}/")).unwrap();
+    let (_directory, dependencies) = dependencies();
+    let dependencies = dependencies
+        .with_loopback_update_source(origin, MIGRATION_PUBLIC_KEY)
+        .unwrap();
+    let mut output = BufferOutput::default();
+
+    let exit = run_with_dependencies(
+        Cli::try_parse_from(["wokcore", "update", "--check", "--json"]).unwrap(),
+        &dependencies,
+        &mut output,
+    )
+    .await;
+
+    server.abort();
+    assert_eq!(exit, ExitCode::InternalFailure);
+    assert_eq!(v1_manifest_requests.load(Ordering::Acquire), 0);
+    assert_eq!(v1_signature_requests.load(Ordering::Acquire), 0);
 }

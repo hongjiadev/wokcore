@@ -10,7 +10,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use reqwest::{Response, header::LOCATION};
+use reqwest::{Response, StatusCode, header::LOCATION};
 use semver::Version;
 use serde_json::{Value, json};
 use tempfile::{Builder, TempPath};
@@ -861,17 +861,40 @@ async fn install_candidate(
 async fn check(source: &UpdateSource) -> Result<UpdateDecision, ()> {
     validate_update_source(source)?;
     let client = update_client()?;
-    let manifest_url = source
+    let v2_url = source
         .origin
-        .join("wokcore-update-v1.json")
+        .join("wokcore-update-v2.json")
         .map_err(|_| ())?;
-    let signature_url = source
-        .origin
-        .join("wokcore-update-v1.json.minisig")
-        .map_err(|_| ())?;
-    let manifest = fetch_bounded(&client, source, manifest_url, MAX_UPDATE_MANIFEST_BYTES).await?;
-    let signature =
-        fetch_bounded(&client, source, signature_url, MAX_UPDATE_SIGNATURE_BYTES).await?;
+    let (manifest, signature) =
+        match fetch_document(&client, source, v2_url, MAX_UPDATE_MANIFEST_BYTES).await? {
+            FetchDocument::Found(manifest) => {
+                let signature = fetch_required_document(
+                    &client,
+                    source,
+                    "wokcore-update-v2.json.minisig",
+                    MAX_UPDATE_SIGNATURE_BYTES,
+                )
+                .await?;
+                (manifest, signature)
+            }
+            FetchDocument::NotFound => {
+                let manifest = fetch_required_document(
+                    &client,
+                    source,
+                    "wokcore-update-v1.json",
+                    MAX_UPDATE_MANIFEST_BYTES,
+                )
+                .await?;
+                let signature = fetch_required_document(
+                    &client,
+                    source,
+                    "wokcore-update-v1.json.minisig",
+                    MAX_UPDATE_SIGNATURE_BYTES,
+                )
+                .await?;
+                (manifest, signature)
+            }
+        };
     let current_version = Version::parse(env!("CARGO_PKG_VERSION")).map_err(|_| ())?;
     verify_manifest(
         &manifest,
@@ -894,13 +917,21 @@ fn update_client() -> Result<reqwest::Client, ()> {
         .map_err(|_| ())
 }
 
-async fn fetch_bounded(
+enum FetchDocument {
+    Found(Vec<u8>),
+    NotFound,
+}
+
+async fn fetch_document(
     client: &reqwest::Client,
     source: &UpdateSource,
     url: url::Url,
     maximum_bytes: usize,
-) -> Result<Vec<u8>, ()> {
+) -> Result<FetchDocument, ()> {
     let mut response = send_update_request(client, source, url).await?;
+    if response.status() == StatusCode::NOT_FOUND {
+        return Ok(FetchDocument::NotFound);
+    }
     if !response.status().is_success()
         || response
             .content_length()
@@ -921,7 +952,20 @@ async fn fetch_bounded(
         }
         body.extend_from_slice(&chunk);
     }
-    Ok(body)
+    Ok(FetchDocument::Found(body))
+}
+
+async fn fetch_required_document(
+    client: &reqwest::Client,
+    source: &UpdateSource,
+    file: &str,
+    maximum_bytes: usize,
+) -> Result<Vec<u8>, ()> {
+    let url = source.origin.join(file).map_err(|_| ())?;
+    match fetch_document(client, source, url, maximum_bytes).await? {
+        FetchDocument::Found(bytes) => Ok(bytes),
+        FetchDocument::NotFound => Err(()),
+    }
 }
 
 async fn download_artifact(
@@ -1052,12 +1096,15 @@ fn validate_initial_update_url(source: &UpdateSource, url: &url::Url) -> Result<
         && url.password().is_none()
         && url.query().is_none()
         && url.fragment().is_none()
-        && (url.path() == "/hongjiadev/wokcore/releases/latest/download/wokcore-update-v1.json"
-            || url.path()
-                == "/hongjiadev/wokcore/releases/latest/download/wokcore-update-v1.json.minisig"
-            || url
-                .path()
-                .starts_with("/hongjiadev/wokcore/releases/download/v")))
+        && (matches!(
+            url.path(),
+            "/hongjiadev/wokcore/releases/latest/download/wokcore-update-v1.json"
+                | "/hongjiadev/wokcore/releases/latest/download/wokcore-update-v1.json.minisig"
+                | "/hongjiadev/wokcore/releases/latest/download/wokcore-update-v2.json"
+                | "/hongjiadev/wokcore/releases/latest/download/wokcore-update-v2.json.minisig"
+        ) || url
+            .path()
+            .starts_with("/hongjiadev/wokcore/releases/download/v")))
     .then_some(())
     .ok_or(())
 }
@@ -1229,12 +1276,12 @@ mod tests {
 
     use super::{
         ChildCleanupCoordinator, InstallOutcome, LifecyclePreparation, ManagedUpdateChild,
-        OriginalServiceState, PreparedLifecycle, ServiceUpdateLifecycle, UpdateLifecycle,
-        VerificationFailure, classify_drain_response, download_artifact, install_verified,
-        matches_current_service, matches_expected_discovery, matches_expected_service,
-        read_startup_discovery, recovered_old_service_matches, render_install_result,
-        run as run_update, update_client, validated_latest_release_redirect,
-        validated_release_asset_redirect,
+        OriginalServiceState, PRODUCTION_UPDATE_ORIGIN, PreparedLifecycle, ServiceUpdateLifecycle,
+        UpdateLifecycle, VerificationFailure, classify_drain_response, download_artifact,
+        install_verified, matches_current_service, matches_expected_discovery,
+        matches_expected_service, read_startup_discovery, recovered_old_service_matches,
+        render_install_result, run as run_update, update_client, validate_initial_update_url,
+        validated_latest_release_redirect, validated_release_asset_redirect,
     };
     use crate::commands::stop::LifecycleResponse;
     use crate::{
@@ -1525,6 +1572,21 @@ mod tests {
 
     #[test]
     fn update_redirects_accept_only_the_fixed_github_release_asset_host() {
+        let source = UpdateSource {
+            origin: Url::parse(PRODUCTION_UPDATE_ORIGIN).unwrap(),
+            public_key: Arc::from("fixture"),
+        };
+        for file in [
+            "wokcore-update-v1.json",
+            "wokcore-update-v1.json.minisig",
+            "wokcore-update-v2.json",
+            "wokcore-update-v2.json.minisig",
+        ] {
+            assert!(
+                validate_initial_update_url(&source, &source.origin.join(file).unwrap()).is_ok(),
+                "{file}"
+            );
+        }
         let latest = Url::parse(
             "https://github.com/hongjiadev/wokcore/releases/latest/download/wokcore-update-v1.json",
         )
@@ -1539,6 +1601,17 @@ mod tests {
             )
             .is_ok()
         );
+        for file in ["wokcore-update-v2.json", "wokcore-update-v2.json.minisig"] {
+            let initial = source.origin.join(file).unwrap();
+            let redirect = Url::parse(&format!(
+                "https://github.com/hongjiadev/wokcore/releases/download/v1.2.3/{file}"
+            ))
+            .unwrap();
+            assert!(
+                validated_latest_release_redirect(&initial, &redirect).is_ok(),
+                "{file}"
+            );
+        }
         for rejected in [
             "https://github.com/hongjiadev/other/releases/download/v1.2.3/wokcore-update-v1.json",
             "https://github.com/hongjiadev/wokcore/releases/download/not-semver/wokcore-update-v1.json",

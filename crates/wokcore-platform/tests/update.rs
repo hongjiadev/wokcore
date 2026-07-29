@@ -22,6 +22,13 @@ const INSTALL_FIXTURE_MANIFEST: &[u8] =
     include_bytes!("fixtures/update/install-wokcore-update-v1.json");
 const INSTALL_FIXTURE_SIGNATURE: &[u8] =
     include_bytes!("fixtures/update/install-wokcore-update-v1.json.minisig");
+const MIGRATION_PUBLIC_KEY: &str =
+    include_str!("../../../apps/wokcore/tests/fixtures/update/migration-minisign.pub");
+const MIGRATION_V2: &[u8] =
+    include_bytes!("../../../apps/wokcore/tests/fixtures/update/migration-wokcore-update-v2.json");
+const MIGRATION_V2_SIGNATURE: &[u8] = include_bytes!(
+    "../../../apps/wokcore/tests/fixtures/update/migration-wokcore-update-v2.json.minisig"
+);
 
 #[test]
 fn signed_update_fixtures_remain_byte_exact() {
@@ -97,6 +104,25 @@ fn signed_manifest_selects_only_the_native_upgrade_and_rejects_downgrades() {
         )
         .unwrap_err(),
         UpdateError::DowngradeRejected,
+    );
+}
+
+#[test]
+fn signed_v2_manifest_selects_the_friendly_windows_arm64_artifact() {
+    let decision = verify_manifest(
+        MIGRATION_V2,
+        MIGRATION_V2_SIGNATURE,
+        MIGRATION_PUBLIC_KEY,
+        &Version::new(1, 0, 0),
+        "aarch64-pc-windows-msvc",
+    )
+    .unwrap();
+    let UpdateDecision::Available(candidate) = decision else {
+        panic!("v2 fixture must offer an upgrade");
+    };
+    assert_eq!(
+        candidate.artifact().file(),
+        "WokCore-v1.2.3-Windows-arm64-Portable.zip"
     );
 }
 
