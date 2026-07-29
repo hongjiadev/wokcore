@@ -31,7 +31,11 @@ jobs:
         run: bash tests/release/build-package.tests.sh
       - name: Test release manifest and Windows package contracts
         shell: pwsh
-        run: pwsh tests/release/verify-manifest.tests.ps1
+        run: |
+          pwsh tests/release/release-contract.tests.ps1
+          pwsh tests/release/verify-manifest.tests.ps1
+          pwsh tests/release/release-bundle.tests.ps1 `
+            -MinisignPath (Get-Command minisign).Source
       - name: Test release workflow contract
         shell: pwsh
         run: pwsh tests/release/release-workflow.tests.ps1
@@ -48,18 +52,29 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             extension: zip
+            public_arch: x86_64
+            run_binary: true
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            extension: zip
+            public_arch: arm64
+            run_binary: false
           - os: macos-15-intel
             target: x86_64-apple-darwin
             extension: tar.gz
-          - os: macos-15
+            public_arch: x86_64
+          - os: macos-14
             target: aarch64-apple-darwin
             extension: tar.gz
+            public_arch: arm64
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             extension: tar.gz
+            public_arch: x86_64
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             extension: tar.gz
+            public_arch: arm64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -69,6 +84,54 @@ jobs:
         with:
           toolchain: 1.97.1
           target: ${{ matrix.target }}
+      - name: Install Visual C++ ARM64 tools
+        if: runner.os == 'Windows' && !matrix.run_binary
+        shell: powershell
+        run: |
+          $installerRoot = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer"
+          $installationPath = & (Join-Path $installerRoot "vswhere.exe") `
+              -latest -products * -property installationPath
+          $arguments = @(
+              "modify",
+              "--installPath", "`"$installationPath`"",
+              "--add", "Microsoft.VisualStudio.Component.VC.Tools.ARM64",
+              "--quiet", "--norestart", "--nocache"
+          )
+          $process = Start-Process `
+              -FilePath (Join-Path $installerRoot "vs_installer.exe") `
+              -ArgumentList $arguments `
+              -Wait `
+              -PassThru
+          if ($process.ExitCode -ne 0) {
+              throw "Installing Visual C++ ARM64 tools failed."
+          }
+      - name: Install Linux package tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes cpio rpm
+      - name: Install pinned WiX 3.14.1 tools
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $archive = Join-Path "${{ runner.temp }}" "wix314-binaries.zip"
+          $directory = Join-Path "${{ runner.temp }}" "wix314-binaries"
+          Invoke-WebRequest `
+              -Uri "https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314-binaries.zip" `
+              -OutFile $archive
+          $actualHash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash
+          $expectedHash = "6AC824E1642D6F7277D0ED7EA09411A508F6116BA6FAE0AA5F2C7DAA2FF43D31"
+          if ($actualHash -cne $expectedHash) {
+              throw "WiX 3.14.1 archive hash mismatch."
+          }
+          Expand-Archive -LiteralPath $archive -DestinationPath $directory
+          $directory >> $env:GITHUB_PATH
+      - name: Assert WiX tools are available
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          Get-Command candle.exe -ErrorAction Stop | Out-Null
+          Get-Command light.exe -ErrorAction Stop | Out-Null
       - name: Resolve and validate release version
         id: version
         shell: pwsh
@@ -103,8 +166,8 @@ jobs:
           --release
           --locked
           --target ${{ matrix.target }}
-      - name: Verify and package Windows executable
-        if: runner.os == 'Windows'
+      - name: Verify native Windows executable
+        if: runner.os == 'Windows' && matrix.run_binary
         shell: powershell
         run: |
           $executable = Join-Path `
@@ -114,11 +177,46 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
               throw "The fixed WokCore release executable did not start."
           }
+      - name: Verify ARM64 Windows executable
+        if: runner.os == 'Windows' && !matrix.run_binary
+        shell: powershell
+        run: |
+          $path = Join-Path `
+              "${{ github.workspace }}\target\${{ matrix.target }}\release" `
+              "wokcore.exe"
+          $bytes = [IO.File]::ReadAllBytes($path)
+          if ($bytes.Length -lt 0x40) {
+              throw "The ARM64 executable is too short to contain a PE header."
+          }
+          $peOffset = [BitConverter]::ToInt32($bytes, 0x3c)
+          if ($peOffset -lt 0 -or $peOffset + 6 -gt $bytes.Length) {
+              throw "The ARM64 executable has an invalid PE header offset."
+          }
+          $machine = [BitConverter]::ToUInt16($bytes, $peOffset + 4)
+          if ($machine -ne 0xaa64) {
+              throw "Expected ARM64 PE machine 0xAA64."
+          }
+      - name: Package Windows executable and distribution assets
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $executable = Join-Path `
+              "${{ github.workspace }}\target\${{ matrix.target }}\release" `
+              "wokcore.exe"
+          $dist = "${{ runner.temp }}\wokcore-release"
           powershell.exe -NoProfile -ExecutionPolicy Bypass `
               -File tests/release/build-package.ps1 `
               -ExecutablePath $executable `
               -RepositoryRoot "${{ github.workspace }}" `
-              -OutputDirectory "${{ runner.temp }}\wokcore-release" `
+              -OutputDirectory $dist `
+              -Version "${{ steps.version.outputs.version }}" `
+              -Target "${{ matrix.target }}"
+          powershell.exe -NoProfile -ExecutionPolicy Bypass `
+              -File tests/release/build-windows-assets.ps1 `
+              -ExecutablePath $executable `
+              -PortableArchivePath (Join-Path $dist "wokcore-v${{ steps.version.outputs.version }}-${{ matrix.target }}.zip") `
+              -RepositoryRoot "${{ github.workspace }}" `
+              -OutputDirectory $dist `
               -Version "${{ steps.version.outputs.version }}" `
               -Target "${{ matrix.target }}"
       - name: Verify and package Unix executable
@@ -133,11 +231,70 @@ jobs:
             --output-directory "${{ runner.temp }}/wokcore-release" \
             --version "${{ steps.version.outputs.version }}" \
             --target "${{ matrix.target }}"
-      - name: Upload fixed release package
+      - name: Build friendly Linux distribution assets
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          bash tests/release/build-linux-assets.sh \
+            --technical-archive "${{ runner.temp }}/wokcore-release/wokcore-v${{ steps.version.outputs.version }}-${{ matrix.target }}.tar.gz" \
+            --executable "${{ github.workspace }}/target/${{ matrix.target }}/release/wokcore" \
+            --repository-root "${{ github.workspace }}" \
+            --output-directory "${{ runner.temp }}/wokcore-release" \
+            --version "${{ steps.version.outputs.version }}" \
+            --target "${{ matrix.target }}"
+      - name: Build friendly macOS distribution assets
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          bash tests/release/build-macos-assets.sh \
+            --technical-archive "${{ runner.temp }}/wokcore-release/wokcore-v${{ steps.version.outputs.version }}-${{ matrix.target }}.tar.gz" \
+            --executable "${{ github.workspace }}/target/${{ matrix.target }}/release/wokcore" \
+            --repository-root "${{ github.workspace }}" \
+            --output-directory "${{ runner.temp }}/wokcore-release" \
+            --version "${{ steps.version.outputs.version }}" \
+            --target "${{ matrix.target }}"
+      - name: Upload x64 Windows release intermediate
+        if: runner.os == 'Windows' && matrix.run_binary
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: wokcore-package-${{ matrix.target }}
-          path: ${{ runner.temp }}/wokcore-release/wokcore-v${{ steps.version.outputs.version }}-${{ matrix.target }}.${{ matrix.extension }}
+          path: |
+            ${{ runner.temp }}/wokcore-release/wokcore-v${{ steps.version.outputs.version }}-${{ matrix.target }}.zip
+            ${{ runner.temp }}/wokcore-release/WokCore-v${{ steps.version.outputs.version }}-Windows-${{ matrix.public_arch }}-Portable.zip
+            ${{ runner.temp }}/wokcore-release/WokCore-v${{ steps.version.outputs.version }}-Windows-${{ matrix.public_arch }}.msi
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload ARM64 Windows release intermediate
+        if: runner.os == 'Windows' && !matrix.run_binary
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: wokcore-package-${{ matrix.target }}
+          path: |
+            ${{ runner.temp }}/wokcore-release/WokCore-v${{ steps.version.outputs.version }}-Windows-${{ matrix.public_arch }}-Portable.zip
+            ${{ runner.temp }}/wokcore-release/WokCore-v${{ steps.version.outputs.version }}-Windows-${{ matrix.public_arch }}.msi
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload Linux release intermediate
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: wokcore-package-${{ matrix.target }}
+          path: |
+            ${{ runner.temp }}/wokcore-release/wokcore-v${{ steps.version.outputs.version }}-${{ matrix.target }}.tar.gz
+            ${{ runner.temp }}/wokcore-release/WokCore-v${{ steps.version.outputs.version }}-Linux-${{ matrix.public_arch }}.tar.gz
+            ${{ runner.temp }}/wokcore-release/WokCore-v${{ steps.version.outputs.version }}-Linux-${{ matrix.public_arch }}.deb
+            ${{ runner.temp }}/wokcore-release/WokCore-v${{ steps.version.outputs.version }}-Linux-${{ matrix.public_arch }}.rpm
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload macOS release intermediate
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: wokcore-package-${{ matrix.target }}
+          path: |
+            ${{ runner.temp }}/wokcore-release/wokcore-v${{ steps.version.outputs.version }}-${{ matrix.target }}.tar.gz
+            ${{ runner.temp }}/wokcore-release/WokCore-v${{ steps.version.outputs.version }}-macOS-${{ matrix.public_arch }}.tar.gz
+            ${{ runner.temp }}/wokcore-release/WokCore-v${{ steps.version.outputs.version }}-macOS-${{ matrix.public_arch }}.zip
           if-no-files-found: error
           retention-days: 14
 
@@ -159,7 +316,7 @@ jobs:
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
           pattern: wokcore-package-*
-          path: ${{ runner.temp }}/wokcore-release
+          path: ${{ runner.temp }}/wokcore-intermediate
           merge-multiple: true
       - name: Resolve release version
         id: version
@@ -169,53 +326,51 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           [[ "v$version" == "$GITHUB_REF_NAME" ]]
           printf 'version=%s\n' "$version" >>"$GITHUB_OUTPUT"
-      - name: Write, sign, and verify release manifest
-        shell: bash
+      - name: Assemble, sign, and verify exact release bundle
+        shell: pwsh
         env:
           WOKCORE_MINISIGN_SECRET_KEY: ${{ secrets.WOKCORE_MINISIGN_SECRET_KEY }}
         run: |
-          set -Eeuo pipefail
-          dist="${{ runner.temp }}/wokcore-release"
-          public_key="${{ github.workspace }}/release/minisign.pub"
-          secret_key="${{ runner.temp }}/wokcore-minisign.key"
-          trap 'rm -f -- "$secret_key"' EXIT
-          [[ -f "$public_key" ]]
-          [[ -n "$WOKCORE_MINISIGN_SECRET_KEY" ]]
-          key_id="$(
-            sed -nE 's/^untrusted comment: minisign public key ([0-9A-F]{16})$/\1/p' \
-              "$public_key"
-          )"
-          [[ "$key_id" =~ ^[0-9A-F]{16}$ ]]
-          umask 077
-          printf '%s' "$WOKCORE_MINISIGN_SECRET_KEY" >"$secret_key"
-          pwsh tests/release/write-manifest.ps1 \
-            -ArtifactDirectory "$dist" \
-            -Version "${{ steps.version.outputs.version }}" \
-            -SigningKeyId "$key_id" \
-            -OutputPath "$dist/wokcore-update-v1.json" \
-            -ChecksumsPath "$dist/SHA256SUMS"
-          minisign -S -W \
-            -s "$secret_key" \
-            -m "$dist/wokcore-update-v1.json" \
-            -x "$dist/wokcore-update-v1.json.minisig" \
-            -c "WokCore release manifest" \
-            -t "wokcore v${{ steps.version.outputs.version }}"
-          pwsh tests/release/verify-manifest.ps1 \
-            -ManifestPath "$dist/wokcore-update-v1.json" \
-            -SignaturePath "$dist/wokcore-update-v1.json.minisig" \
-            -PublicKeyPath "$public_key" \
-            -ArtifactDirectory "$dist" \
-            -ChecksumsPath "$dist/SHA256SUMS" \
-            -ExpectedVersion "${{ steps.version.outputs.version }}" \
-            -ExpectedSigningKeyId "$key_id" \
-            -MinisignPath "$(command -v minisign)"
-          rm -f -- "$secret_key"
-          trap - EXIT
+          $secretPath = Join-Path $env:RUNNER_TEMP "wokcore-minisign.key"
+          try {
+            [IO.File]::WriteAllText(
+              $secretPath,
+              $env:WOKCORE_MINISIGN_SECRET_KEY,
+              [Text.UTF8Encoding]::new($false)
+            )
+            # WokCore.ReleaseContract.psm1 defines the 19 payloads; assembly
+            # adds wokcore-update-v1.json and wokcore-update-v2.json.
+            pwsh tests/release/assemble-release-bundle.ps1 `
+              -IntermediateDirectory "${{ runner.temp }}/wokcore-intermediate" `
+              -ArtifactDirectory "${{ runner.temp }}/wokcore-release" `
+              -Version "${{ steps.version.outputs.version }}" `
+              -SigningKeyId "7EF262CD8E9FE136"
+            pwsh tests/release/sign-release-bundle.ps1 `
+              -ArtifactDirectory "${{ runner.temp }}/wokcore-release" `
+              -Version "${{ steps.version.outputs.version }}" `
+              -SecretKeyPath $secretPath `
+              -PublicKeyPath release/minisign.pub `
+              -MinisignPath (Get-Command minisign).Source
+            pwsh tests/release/verify-release-bundle.ps1 `
+              -ArtifactDirectory "${{ runner.temp }}/wokcore-release" `
+              -Version "${{ steps.version.outputs.version }}" `
+              -PublicKeyPath release/minisign.pub `
+              -MinisignPath (Get-Command minisign).Source
+          } finally {
+            if (Test-Path -LiteralPath $secretPath -PathType Leaf) {
+              $length = (Get-Item -LiteralPath $secretPath).Length
+              [IO.File]::WriteAllBytes(
+                $secretPath,
+                [byte[]]::new($length)
+              )
+              Remove-Item -LiteralPath $secretPath -Force
+            }
+          }
       - name: Upload verified release bundle
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: wokcore-release-${{ steps.version.outputs.version }}
-          path: ${{ runner.temp }}/wokcore-release/*
+          path: ${{ runner.temp }}/wokcore-release
           if-no-files-found: error
           retention-days: 14
 
@@ -331,6 +486,8 @@ jobs:
   publish-release:
     if: github.ref_type == 'tag'
     needs:
+      - release-contract
+      - build-release-package
       - assemble-release
       - windows-release-gate
       - portable-soak
@@ -351,7 +508,7 @@ jobs:
           pattern: wokcore-release-*
           path: ${{ runner.temp }}/wokcore-release
           merge-multiple: true
-      - name: Publish or replace release assets
+      - name: Publish matching draft after remote byte verification
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -361,40 +518,23 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           public_key="${{ github.workspace }}/release/minisign.pub"
           [[ "$GITHUB_REF_NAME" == "v$version" ]]
-          expected=(
-            "SHA256SUMS"
-            "wokcore-update-v1.json"
-            "wokcore-update-v1.json.minisig"
-            "wokcore-v$version-aarch64-apple-darwin.tar.gz"
-            "wokcore-v$version-aarch64-unknown-linux-gnu.tar.gz"
-            "wokcore-v$version-x86_64-apple-darwin.tar.gz"
-            "wokcore-v$version-x86_64-pc-windows-msvc.zip"
-            "wokcore-v$version-x86_64-unknown-linux-gnu.tar.gz"
-          )
-          mapfile -t actual < <(
+          pwsh tests/release/verify-release-bundle.ps1 \
+            -ArtifactDirectory "$dist" \
+            -Version "$version" \
+            -PublicKeyPath "$public_key" \
+            -MinisignPath "$(command -v minisign)"
+          mapfile -t expected < <(
             find "$dist" -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort
           )
-          [[ "${#actual[@]}" -eq 8 ]]
-          [[ "$(printf '%s\n' "${actual[@]}")" == "$(printf '%s\n' "${expected[@]}")" ]]
-          key_id="$(
-            sed -nE 's/^untrusted comment: minisign public key ([0-9A-F]{16})$/\1/p' \
-              "$public_key"
-          )"
-          [[ "$key_id" =~ ^[0-9A-F]{16}$ ]]
-          pwsh tests/release/verify-manifest.ps1 \
-            -ManifestPath "$dist/wokcore-update-v1.json" \
-            -SignaturePath "$dist/wokcore-update-v1.json.minisig" \
-            -PublicKeyPath "$public_key" \
-            -ArtifactDirectory "$dist" \
-            -ChecksumsPath "$dist/SHA256SUMS" \
-            -ExpectedVersion "$version" \
-            -ExpectedSigningKeyId "$key_id" \
-            -MinisignPath "$(command -v minisign)"
+          [[ "${#expected[@]}" -eq 45 ]]
 
-          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release edit "$GITHUB_REF_NAME" \
+          if existing="$(
+            gh release view "$GITHUB_REF_NAME" \
               --repo "$GITHUB_REPOSITORY" \
-              --draft
+              --json isDraft,tagName 2>/dev/null
+          )"; then
+            [[ "$(jq -r .isDraft <<<"$existing")" == "true" ]]
+            [[ "$(jq -r .tagName <<<"$existing")" == "$GITHUB_REF_NAME" ]]
             mapfile -t previous < <(
               gh release view "$GITHUB_REF_NAME" \
                 --repo "$GITHUB_REPOSITORY" \
@@ -417,17 +557,21 @@ jobs:
           for asset in "${expected[@]}"; do
             gh release upload "$GITHUB_REF_NAME" \
               --repo "$GITHUB_REPOSITORY" \
-              "$dist/$asset"
+              "$dist/$asset" \
+              --clobber
           done
-          mapfile -t published < <(
-            gh release view "$GITHUB_REF_NAME" \
-              --repo "$GITHUB_REPOSITORY" \
-              --json assets \
-              --jq '.assets[].name' |
-              LC_ALL=C sort
-          )
-          [[ "${#published[@]}" -eq 8 ]]
-          [[ "$(printf '%s\n' "${published[@]}")" == "$(printf '%s\n' "${expected[@]}")" ]]
+          remote="$(mktemp -d "$RUNNER_TEMP/wokcore-remote.XXXXXXXX")"
+          trap 'rm -rf -- "$remote"' EXIT
+          gh release download "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir "$remote"
+          pwsh tests/release/verify-release-bundle.ps1 \
+            -ArtifactDirectory "$remote" \
+            -Version "$version" \
+            -PublicKeyPath "$public_key" \
+            -MinisignPath "$(command -v minisign)"
           gh release edit "$GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" \
             --draft=false
+          rm -rf -- "$remote"
+          trap - EXIT

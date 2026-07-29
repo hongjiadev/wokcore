@@ -112,6 +112,12 @@ The output is one bounded, content-free JSON report. The script refuses to place
 
 Linux x64 and macOS arm64 CI also run the complete release data path through `tests/performance/run-provider-gates.sh`. The fixed 5-minute pull-request profile checks exact concurrency, cancellation, RSS recovery trend, file-descriptor/task growth, process survival, listener cleanup, and process-scoped loopback-only networking. Manual and release verification use a 30-minute soak. Linux uses a private temporary Secret Service session and macOS uses a temporary Keychain; both isolate application/Session roots and receive no real Provider credentials.
 
+## Release downloads
+
+See [`release/README.md`](release/README.md) for the six-target package
+matrix, Minisign verification, update-manifest lifecycle, and native-signing
+limitations.
+
 ## Development
 
 ```powershell

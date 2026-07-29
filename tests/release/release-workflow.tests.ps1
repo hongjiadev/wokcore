@@ -45,24 +45,140 @@ foreach ($required in @(
     "tests/release/build-package.sh",
     "tests/release/build-package.tests.sh",
     "tests/release/verify-manifest.tests.ps1",
-    "tests/release/write-manifest.ps1",
-    "tests/release/verify-manifest.ps1",
     "release/minisign.pub",
     "secrets.WOKCORE_MINISIGN_SECRET_KEY",
-    "wokcore-update-v1.json.minisig",
-    "SHA256SUMS",
     "actions/upload-artifact@",
     "actions/download-artifact@",
     "gh release",
     "gh release delete-asset",
     "--draft",
     "--draft=false",
-    "verify-manifest.ps1",
-    "wokcore-v`$version-aarch64-apple-darwin.tar.gz"
+    "aarch64-pc-windows-msvc",
+    "wokcore-update-v2.json",
+    "WokCore.ReleaseContract.psm1",
+    "sign-release-bundle.ps1",
+    "verify-release-bundle.ps1",
+    "gh release download"
 )) {
     if ($source.IndexOf($required, [StringComparison]::Ordinal) -lt 0) {
         throw "Release workflow is missing a required contract: $required"
     }
+}
+
+$secretReference = "secrets.WOKCORE_MINISIGN_SECRET_KEY"
+if (
+    [regex]::Matches(
+        $source,
+        [regex]::Escape($secretReference)
+    ).Count -ne 1
+) {
+    throw "Only the assemble/sign job may receive the Minisign secret."
+}
+$assembleStart = $source.IndexOf(
+    "  assemble-release:",
+    [StringComparison]::Ordinal
+)
+$assembleEnd = $source.IndexOf(
+    "  windows-release-gate:",
+    [StringComparison]::Ordinal
+)
+if (
+    $assembleStart -lt 0 -or
+    $assembleEnd -le $assembleStart -or
+    $source.Substring(
+        $assembleStart,
+        $assembleEnd - $assembleStart
+    ).IndexOf($secretReference, [StringComparison]::Ordinal) -lt 0
+) {
+    throw "The Minisign secret must be scoped to the assemble/sign job."
+}
+
+$publishStart = $source.IndexOf(
+    "  publish-release:",
+    [StringComparison]::Ordinal
+)
+if ($publishStart -lt 0) {
+    throw "The publish job is missing."
+}
+$publishSource = $source.Substring($publishStart)
+foreach ($requiredNeed in @(
+    "release-contract",
+    "build-release-package",
+    "assemble-release",
+    "windows-release-gate",
+    "portable-soak"
+)) {
+    if (
+        $publishSource.IndexOf(
+            "      - $requiredNeed",
+            [StringComparison]::Ordinal
+        ) -lt 0
+    ) {
+        throw "Publish must need every release build and gate: $requiredNeed"
+    }
+}
+foreach ($required in @(
+    "--json isDraft,tagName",
+    '[[ "$(jq -r .isDraft <<<"$existing")" == "true" ]]',
+    '[[ "$(jq -r .tagName <<<"$existing")" == "$GITHUB_REF_NAME" ]]',
+    '[[ "${#expected[@]}" -eq 45 ]]',
+    "mktemp -d"
+)) {
+    if ($publishSource.IndexOf($required, [StringComparison]::Ordinal) -lt 0) {
+        throw "Publish is missing an atomic draft contract: $required"
+    }
+}
+$remoteDownload = $publishSource.IndexOf(
+    "gh release download",
+    [StringComparison]::Ordinal
+)
+$remoteVerification = $publishSource.IndexOf(
+    "verify-release-bundle.ps1",
+    $remoteDownload + 1,
+    [StringComparison]::Ordinal
+)
+$makePublic = $publishSource.IndexOf(
+    "--draft=false",
+    [StringComparison]::Ordinal
+)
+if (
+    $remoteDownload -lt 0 -or
+    $remoteVerification -le $remoteDownload -or
+    $makePublic -le $remoteVerification
+) {
+    throw "Remote release bytes must verify before the draft becomes public."
+}
+if (
+    [regex]::IsMatch(
+        $publishSource,
+        "(?ms)gh release edit.*?--draft(?![=])"
+    )
+) {
+    throw "Publish must never convert an existing public release back to draft."
+}
+if (
+    $publishSource.IndexOf(
+        '"$dist"/*',
+        [StringComparison]::Ordinal
+    ) -ge 0
+) {
+    throw "Publish must upload the verified exact inventory without a glob."
+}
+$assembleSource = $source.Substring(
+    $assembleStart,
+    $assembleEnd - $assembleStart
+)
+if (
+    $assembleSource.IndexOf(
+        "Upload verified release bundle",
+        [StringComparison]::Ordinal
+    ) -lt 0 -or
+    $assembleSource.IndexOf(
+        "if: always()",
+        [StringComparison]::Ordinal
+    ) -ge 0
+) {
+    throw "A failed assemble/sign step must not upload partial output."
 }
 
 $matrixStart = $source.IndexOf(
@@ -77,18 +193,34 @@ if ($matrixStart -lt 0 -or $matrixEnd -le $matrixStart) {
     throw "Release package matrix boundaries are invalid."
 }
 $matrixSource = $source.Substring($matrixStart, $matrixEnd - $matrixStart)
-$matrixContracts = @(
-    @("windows-latest", "x86_64-pc-windows-msvc", "zip"),
-    @("macos-15-intel", "x86_64-apple-darwin", "tar.gz"),
-    @("macos-15", "aarch64-apple-darwin", "tar.gz"),
-    @("ubuntu-24.04", "x86_64-unknown-linux-gnu", "tar.gz"),
-    @("ubuntu-24.04-arm", "aarch64-unknown-linux-gnu", "tar.gz")
+$windowsReleaseContracts = @(
+    @("windows-latest", "x86_64-pc-windows-msvc", "zip", "x86_64", "true"),
+    @("windows-latest", "aarch64-pc-windows-msvc", "zip", "arm64", "false")
 )
-foreach ($contract in $matrixContracts) {
-    $runner, $target, $extension = $contract
+$unixReleaseContracts = @(
+    @("macos-15-intel", "x86_64-apple-darwin", "tar.gz", "x86_64"),
+    @("macos-14", "aarch64-apple-darwin", "tar.gz", "arm64"),
+    @("ubuntu-24.04", "x86_64-unknown-linux-gnu", "tar.gz", "x86_64"),
+    @("ubuntu-24.04-arm", "aarch64-unknown-linux-gnu", "tar.gz", "arm64")
+)
+$matrixContracts = @($windowsReleaseContracts + $unixReleaseContracts)
+foreach ($contract in $windowsReleaseContracts) {
+    $runner, $target, $extension, $publicArch, $runBinary = $contract
     $pattern = "(?ms)- os:\s+$([regex]::Escape($runner))\s+" +
         "target:\s+$([regex]::Escape($target))\s+" +
-        "extension:\s+$([regex]::Escape($extension))\s*"
+        "extension:\s+$([regex]::Escape($extension))\s+" +
+        "public_arch:\s+$([regex]::Escape($publicArch))\s+" +
+        "run_binary:\s+$([regex]::Escape($runBinary))\s*"
+    if ([regex]::Matches($matrixSource, $pattern).Count -ne 1) {
+        throw "Release package matrix has an invalid Windows target mapping: $target"
+    }
+}
+foreach ($contract in $unixReleaseContracts) {
+    $runner, $target, $extension, $publicArch = $contract
+    $pattern = "(?ms)- os:\s+$([regex]::Escape($runner))\s+" +
+        "target:\s+$([regex]::Escape($target))\s+" +
+        "extension:\s+$([regex]::Escape($extension))\s+" +
+        "public_arch:\s+$([regex]::Escape($publicArch))\s*"
     if ([regex]::Matches($matrixSource, $pattern).Count -ne 1) {
         throw "Release package matrix has an invalid native target mapping: $target"
     }
@@ -104,7 +236,7 @@ foreach ($required in @(
     "tests/release/build-package.sh",
     "tests/release/normalize-minisign-public-key.ps1",
     "tests/release/verify-manifest.tests.ps1",
-    "ci-wokcore-package-",
+    "ci-wokcore-",
     "actions/download-artifact@"
 )) {
     if ($ciSource.IndexOf($required, [StringComparison]::Ordinal) -lt 0) {
@@ -226,15 +358,19 @@ foreach ($workflowSource in @($source, $ciSource)) {
 }
 
 $prefixItems = @($schemaV1.properties.artifacts.prefixItems)
+$legacyV1Contracts = @(
+    $matrixContracts |
+        Where-Object { $_[1] -cne "aarch64-pc-windows-msvc" }
+)
 if (
     $schemaV1.properties.artifacts.items -ne $false -or
-    $prefixItems.Count -ne $matrixContracts.Count
+    $prefixItems.Count -ne $legacyV1Contracts.Count
 ) {
     throw "Release schema must define exactly five ordered artifact contracts."
 }
-for ($index = 0; $index -lt $matrixContracts.Count; $index++) {
-    $target = $matrixContracts[$index][1]
-    $extension = $matrixContracts[$index][2]
+for ($index = 0; $index -lt $legacyV1Contracts.Count; $index++) {
+    $target = $legacyV1Contracts[$index][1]
+    $extension = $legacyV1Contracts[$index][2]
     $item = $prefixItems[$index]
     $expectedExecutable = if ($extension -ceq "zip") {
         "wokcore.exe"

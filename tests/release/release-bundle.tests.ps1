@@ -9,6 +9,7 @@ Set-StrictMode -Version Latest
 
 $signer = Join-Path $PSScriptRoot "sign-release-bundle.ps1"
 $verifier = Join-Path $PSScriptRoot "verify-release-bundle.ps1"
+$assembler = Join-Path $PSScriptRoot "assemble-release-bundle.ps1"
 $writeManifest = Join-Path $PSScriptRoot "write-manifest.ps1"
 $normalizePublicKey = Join-Path $PSScriptRoot "normalize-minisign-public-key.ps1"
 $releaseContract = Join-Path $PSScriptRoot "WokCore.ReleaseContract.psm1"
@@ -186,9 +187,40 @@ function Assert-VerifierFails {
     }
 }
 
+function Assert-AssemblerFailsClean {
+    param(
+        [Parameter(Mandatory)][string] $IntermediateDirectory,
+        [Parameter(Mandatory)][string] $ArtifactDirectory,
+        [Parameter(Mandatory)][string] $SigningKeyId,
+        [Parameter(Mandatory)][string] $FailureMessage
+    )
+
+    $failed = $false
+    try {
+        & $assembler `
+            -IntermediateDirectory $IntermediateDirectory `
+            -ArtifactDirectory $ArtifactDirectory `
+            -Version "1.2.3" `
+            -SigningKeyId $SigningKeyId |
+            Out-Null
+    } catch {
+        $failed = $true
+    }
+    if (-not $failed) {
+        throw $FailureMessage
+    }
+    if (
+        [IO.Directory]::Exists($ArtifactDirectory) -and
+        @(Get-ChildItem -LiteralPath $ArtifactDirectory -Force).Count -ne 0
+    ) {
+        throw "A failed assembly left files in its upload directory."
+    }
+}
+
 $testRoot = Join-Path ([IO.Path]::GetTempPath()) (
     "wokcore release bundle " + [Guid]::NewGuid().ToString("N")
 )
+$intermediate = Join-Path $testRoot "intermediate with spaces"
 $bundle = Join-Path $testRoot "bundle with spaces"
 $keys = Join-Path $testRoot "ephemeral keys"
 $public = Join-Path $keys "fixture.pub"
@@ -196,10 +228,11 @@ $secret = Join-Path $keys "fixture.key"
 $secondPublic = Join-Path $keys "second.pub"
 $secondSecret = Join-Path $keys "second.key"
 $junction = Join-Path $testRoot "bundle junction"
+$intermediateJunction = Join-Path $testRoot "intermediate junction"
 $maximumVersionBundle = Join-Path ([IO.Path]::GetTempPath()) (
     "wb-" + [Guid]::NewGuid().ToString("N")
 )
-[IO.Directory]::CreateDirectory($bundle) | Out-Null
+[IO.Directory]::CreateDirectory($intermediate) | Out-Null
 [IO.Directory]::CreateDirectory($keys) | Out-Null
 
 try {
@@ -210,7 +243,7 @@ try {
         throw "Expected exactly 19 WokCore payload fixtures."
     }
     foreach ($name in $payloads) {
-        $path = Join-Path $bundle $name
+        $path = Join-Path $intermediate $name
         if (
             $name.EndsWith(".zip", [StringComparison]::Ordinal) -and
             (
@@ -236,20 +269,112 @@ try {
         throw "Minisign fixture-key generation failed."
     }
     $keyId = (& $normalizePublicKey -Path $public).Trim()
-    & $writeManifest `
+    & $assembler `
+        -IntermediateDirectory $intermediate `
         -ArtifactDirectory $bundle `
         -Version "1.2.3" `
-        -SigningKeyId $keyId `
-        -SchemaVersion 1 `
-        -OutputPath (Join-Path $bundle "wokcore-update-v1.json") |
+        -SigningKeyId $keyId |
         Out-Null
-    & $writeManifest `
-        -ArtifactDirectory $bundle `
-        -Version "1.2.3" `
+    $assembledNames = [string[]] @(
+        Get-ChildItem -LiteralPath $bundle -Force |
+            ForEach-Object Name
+    )
+    [Array]::Sort($assembledNames, [StringComparer]::Ordinal)
+    $expectedUnsignedNames = [string[]] @(
+        $payloads +
+        @("wokcore-update-v1.json", "wokcore-update-v2.json")
+    )
+    [Array]::Sort($expectedUnsignedNames, [StringComparer]::Ordinal)
+    if (
+        $assembledNames.Count -ne 21 -or
+        [string]::Join("`n", $assembledNames) -cne
+        [string]::Join("`n", $expectedUnsignedNames)
+    ) {
+        throw "Assembly did not produce the exact unsigned 21-file contract."
+    }
+
+    $missingIntermediate = Join-Path $testRoot "missing intermediate"
+    $missingArtifact = Join-Path $testRoot "missing artifact"
+    Copy-TestBundle `
+        -Source $intermediate `
+        -Destination $missingIntermediate
+    [IO.File]::Delete(
+        (Join-Path $missingIntermediate $payloads[$payloads.Count - 1])
+    )
+    Assert-AssemblerFailsClean `
+        -IntermediateDirectory $missingIntermediate `
+        -ArtifactDirectory $missingArtifact `
         -SigningKeyId $keyId `
-        -SchemaVersion 2 `
-        -OutputPath (Join-Path $bundle "wokcore-update-v2.json") |
+        -FailureMessage "The assembler accepted a missing payload."
+
+    Assert-AssemblerFailsClean `
+        -IntermediateDirectory $intermediate `
+        -ArtifactDirectory (Join-Path $testRoot "manifest failure artifact") `
+        -SigningKeyId "INVALID" `
+        -FailureMessage "The assembler accepted an invalid signing key id."
+
+    $duplicateIntermediate = Join-Path $testRoot "duplicate intermediate"
+    $duplicateArtifact = Join-Path $testRoot "duplicate artifact"
+    Copy-TestBundle `
+        -Source $intermediate `
+        -Destination $duplicateIntermediate
+    $duplicateDirectory = Join-Path $duplicateIntermediate "duplicate"
+    [IO.Directory]::CreateDirectory($duplicateDirectory) | Out-Null
+    [IO.File]::Copy(
+        (Join-Path $duplicateIntermediate $payloads[0]),
+        (Join-Path $duplicateDirectory $payloads[0])
+    )
+    Assert-AssemblerFailsClean `
+        -IntermediateDirectory $duplicateIntermediate `
+        -ArtifactDirectory $duplicateArtifact `
+        -SigningKeyId $keyId `
+        -FailureMessage "The assembler accepted a duplicate payload."
+
+    $caseIntermediate = Join-Path $testRoot "case intermediate"
+    $caseArtifact = Join-Path $testRoot "case artifact"
+    Copy-TestBundle `
+        -Source $intermediate `
+        -Destination $caseIntermediate
+    $caseDirectory = Join-Path $caseIntermediate "case ambiguity"
+    [IO.Directory]::CreateDirectory($caseDirectory) | Out-Null
+    $caseVariant = $payloads[0].Substring(0, 1).ToUpperInvariant() +
+        $payloads[0].Substring(1)
+    [IO.File]::Copy(
+        (Join-Path $caseIntermediate $payloads[0]),
+        (Join-Path $caseDirectory $caseVariant)
+    )
+    Assert-AssemblerFailsClean `
+        -IntermediateDirectory $caseIntermediate `
+        -ArtifactDirectory $caseArtifact `
+        -SigningKeyId $keyId `
+        -FailureMessage "The assembler accepted a case-ambiguous payload."
+
+    $extraIntermediate = Join-Path $testRoot "extra intermediate"
+    $extraArtifact = Join-Path $testRoot "extra artifact"
+    Copy-TestBundle `
+        -Source $intermediate `
+        -Destination $extraIntermediate
+    [IO.File]::WriteAllBytes(
+        (Join-Path $extraIntermediate "unexpected.bin"),
+        [byte[]] @(1)
+    )
+    Assert-AssemblerFailsClean `
+        -IntermediateDirectory $extraIntermediate `
+        -ArtifactDirectory $extraArtifact `
+        -SigningKeyId $keyId `
+        -FailureMessage "The assembler accepted an extra intermediate file."
+
+    New-Item `
+        -ItemType Junction `
+        -Path $intermediateJunction `
+        -Target $intermediate |
         Out-Null
+    Assert-AssemblerFailsClean `
+        -IntermediateDirectory $intermediateJunction `
+        -ArtifactDirectory (Join-Path $testRoot "reparse artifact") `
+        -SigningKeyId $keyId `
+        -FailureMessage "The assembler accepted a reparse-point input path."
+    [IO.Directory]::Delete($intermediateJunction)
 
     New-Item -ItemType Junction -Path $junction -Target $bundle |
         Out-Null
@@ -549,6 +674,9 @@ try {
         -FailureMessage "The verifier accepted a reparse-point bundle ancestor."
     [IO.Directory]::Delete($junction)
 } finally {
+    if ([IO.Directory]::Exists($intermediateJunction)) {
+        [IO.Directory]::Delete($intermediateJunction)
+    }
     if ([IO.Directory]::Exists($junction)) {
         [IO.Directory]::Delete($junction)
     }

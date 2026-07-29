@@ -156,6 +156,27 @@ jobs:
         with:
           toolchain: 1.97.1
           target: ${{ matrix.target }}
+      - name: Install Visual C++ ARM64 tools
+        if: runner.os == 'Windows' && !matrix.run_binary
+        shell: powershell
+        run: |
+          $installerRoot = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer"
+          $installationPath = & (Join-Path $installerRoot "vswhere.exe") `
+              -latest -products * -property installationPath
+          $arguments = @(
+              "modify",
+              "--installPath", "`"$installationPath`"",
+              "--add", "Microsoft.VisualStudio.Component.VC.Tools.ARM64",
+              "--quiet", "--norestart", "--nocache"
+          )
+          $process = Start-Process `
+              -FilePath (Join-Path $installerRoot "vs_installer.exe") `
+              -ArgumentList $arguments `
+              -Wait `
+              -PassThru
+          if ($process.ExitCode -ne 0) {
+              throw "Installing Visual C++ ARM64 tools failed."
+          }
       - name: Install Linux package tools
         if: runner.os == 'Linux'
         run: |
@@ -177,6 +198,12 @@ jobs:
           }
           Expand-Archive -LiteralPath $archive -DestinationPath $directory
           $directory >> $env:GITHUB_PATH
+      - name: Assert WiX tools are available
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          Get-Command candle.exe -ErrorAction Stop | Out-Null
+          Get-Command light.exe -ErrorAction Stop | Out-Null
       - name: Test Windows distribution assets
         if: runner.os == 'Windows' && matrix.run_binary
         shell: powershell
@@ -304,40 +331,46 @@ jobs:
             --output-directory "${{ runner.temp }}/wokcore-release" \
             --version "${{ steps.version.outputs.version }}" \
             --target "${{ matrix.target }}"
-      - name: Upload deterministic CI package
+      - name: Upload x64 Windows CI release intermediate
+        if: runner.os == 'Windows' && matrix.run_binary
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: ci-wokcore-package-${{ matrix.target }}
-          path: ${{ runner.temp }}/wokcore-release/wokcore-v${{ steps.version.outputs.version }}-${{ matrix.target }}.${{ matrix.extension }}
+          name: ci-wokcore-${{ matrix.target }}
+          path: |
+            ${{ runner.temp }}/wokcore-release/wokcore-v${{ steps.version.outputs.version }}-${{ matrix.target }}.zip
+            ${{ runner.temp }}/wokcore-release/WokCore-v${{ steps.version.outputs.version }}-Windows-${{ matrix.public_arch }}-Portable.zip
+            ${{ runner.temp }}/wokcore-release/WokCore-v${{ steps.version.outputs.version }}-Windows-${{ matrix.public_arch }}.msi
           if-no-files-found: error
           retention-days: 7
-      - name: Upload friendly Windows distribution assets
-        if: runner.os == 'Windows'
+      - name: Upload ARM64 Windows CI release intermediate
+        if: runner.os == 'Windows' && !matrix.run_binary
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: wokcore-${{ matrix.target }}
+          name: ci-wokcore-${{ matrix.target }}
           path: |
             ${{ runner.temp }}/wokcore-release/WokCore-v${{ steps.version.outputs.version }}-Windows-${{ matrix.public_arch }}-Portable.zip
             ${{ runner.temp }}/wokcore-release/WokCore-v${{ steps.version.outputs.version }}-Windows-${{ matrix.public_arch }}.msi
           if-no-files-found: error
           retention-days: 7
-      - name: Upload friendly Linux distribution assets
+      - name: Upload Linux CI release intermediate
         if: runner.os == 'Linux'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: wokcore-${{ matrix.target }}
+          name: ci-wokcore-${{ matrix.target }}
           path: |
+            ${{ runner.temp }}/wokcore-release/wokcore-v${{ steps.version.outputs.version }}-${{ matrix.target }}.tar.gz
             ${{ runner.temp }}/wokcore-release/WokCore-v${{ steps.version.outputs.version }}-Linux-${{ matrix.public_arch }}.tar.gz
             ${{ runner.temp }}/wokcore-release/WokCore-v${{ steps.version.outputs.version }}-Linux-${{ matrix.public_arch }}.deb
             ${{ runner.temp }}/wokcore-release/WokCore-v${{ steps.version.outputs.version }}-Linux-${{ matrix.public_arch }}.rpm
           if-no-files-found: error
           retention-days: 7
-      - name: Upload friendly macOS distribution assets
+      - name: Upload macOS CI release intermediate
         if: runner.os == 'macOS'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: wokcore-${{ matrix.target }}
+          name: ci-wokcore-${{ matrix.target }}
           path: |
+            ${{ runner.temp }}/wokcore-release/wokcore-v${{ steps.version.outputs.version }}-${{ matrix.target }}.tar.gz
             ${{ runner.temp }}/wokcore-release/WokCore-v${{ steps.version.outputs.version }}-macOS-${{ matrix.public_arch }}.tar.gz
             ${{ runner.temp }}/wokcore-release/WokCore-v${{ steps.version.outputs.version }}-macOS-${{ matrix.public_arch }}.zip
           if-no-files-found: error
@@ -368,29 +401,31 @@ jobs:
             aarch64-apple-darwin arm64
       - name: Test release manifest and Windows package contracts
         shell: pwsh
-        run: pwsh tests/release/verify-manifest.tests.ps1
+        run: |
+          pwsh tests/release/release-contract.tests.ps1
+          pwsh tests/release/verify-manifest.tests.ps1
+          pwsh tests/release/release-bundle.tests.ps1 `
+            -MinisignPath (Get-Command minisign).Source
       - name: Test workflow and public repository contracts
         shell: pwsh
         run: |
           pwsh tests/release/release-workflow.tests.ps1
           pwsh tests/scripts/check-public-repo-hygiene.tests.ps1
           pwsh tests/scripts/check-public-repo-hygiene.ps1
-      - name: Download all six native CI packages
+      - name: Download all six target-scoped CI intermediates
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
-          pattern: ci-wokcore-package-*
-          path: ${{ runner.temp }}/wokcore-release
+          pattern: ci-wokcore-*
+          path: ${{ runner.temp }}/wokcore-intermediate
           merge-multiple: true
-      - name: Verify a signed legacy five-target manifest
+      - name: Assemble, sign, and verify an ephemeral exact release bundle
         shell: bash
         run: |
           set -Eeuo pipefail
+          intermediate="${{ runner.temp }}/wokcore-intermediate"
           dist="${{ runner.temp }}/wokcore-release"
           secret_key="${{ runner.temp }}/ci-wokcore-minisign.key"
           public_key="${{ runner.temp }}/ci-wokcore-minisign.pub"
-          manifest="$dist/wokcore-update-v1.json"
-          signature="$manifest.minisig"
-          checksums="$dist/SHA256SUMS"
           trap 'rm -f -- "$secret_key" "$public_key"' EXIT
           version="$(
             sed -nE \
@@ -405,26 +440,21 @@ jobs:
               -Path "$public_key"
           )"
           [[ "$key_id" =~ ^[0-9A-F]{16}$ ]]
-          pwsh tests/release/write-manifest.ps1 \
+          pwsh tests/release/assemble-release-bundle.ps1 \
+            -IntermediateDirectory "$intermediate" \
             -ArtifactDirectory "$dist" \
             -Version "$version" \
-            -SigningKeyId "$key_id" \
-            -OutputPath "$manifest" \
-            -ChecksumsPath "$checksums"
-          minisign -S -W \
-            -s "$secret_key" \
-            -m "$manifest" \
-            -x "$signature" \
-            -c "WokCore CI release manifest" \
-            -t "ephemeral CI signature"
-          pwsh tests/release/verify-manifest.ps1 \
-            -ManifestPath "$manifest" \
-            -SignaturePath "$signature" \
-            -PublicKeyPath "$public_key" \
+            -SigningKeyId "$key_id"
+          pwsh tests/release/sign-release-bundle.ps1 \
             -ArtifactDirectory "$dist" \
-            -ChecksumsPath "$checksums" \
-            -ExpectedVersion "$version" \
-            -ExpectedSigningKeyId "$key_id" \
+            -Version "$version" \
+            -SecretKeyPath "$secret_key" \
+            -PublicKeyPath "$public_key" \
+            -MinisignPath "$(command -v minisign)"
+          pwsh tests/release/verify-release-bundle.ps1 \
+            -ArtifactDirectory "$dist" \
+            -Version "$version" \
+            -PublicKeyPath "$public_key" \
             -MinisignPath "$(command -v minisign)"
           rm -f -- "$secret_key" "$public_key"
           trap - EXIT
