@@ -14,6 +14,16 @@ $source = [IO.File]::ReadAllText($workflowPath, [Text.Encoding]::UTF8)
 $ciSource = [IO.File]::ReadAllText($ciPath, [Text.Encoding]::UTF8)
 $schema = Get-Content -Raw -LiteralPath $schemaPath | ConvertFrom-Json
 
+# These checks catch a release contract that omits a supported target, misses a
+# public or legacy payload, or leaks a Rust vendor segment into a public name.
+Import-Module (Join-Path $PSScriptRoot "WokCore.ReleaseContract.psm1") -Force
+$contracts = @(Get-WokCoreTargetContracts -Version "0.1.1")
+if ($contracts.Count -ne 6) { throw "Expected six WokCore targets." }
+$payloads = @(Get-WokCorePayloadNames -Version "0.1.1" -IncludeLegacyV1)
+if ($payloads.Count -ne 19) { throw "Expected 19 WokCore payloads." }
+$publicNames = $payloads | Where-Object { $_ -clike "WokCore-*" }
+if ($publicNames -match "unknown") { throw "Public names expose a Rust vendor segment." }
+
 foreach ($required in @(
     "build-release-package:",
     "release-contract:",
@@ -141,4 +151,4 @@ for ($index = 0; $index -lt $matrixContracts.Count; $index++) {
     }
 }
 
-Write-Output "release workflow contract tests passed"
+Write-Output "release workflow contract tests passed: six targets and 19 payloads"
