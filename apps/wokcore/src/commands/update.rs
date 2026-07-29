@@ -865,7 +865,7 @@ async fn check(source: &UpdateSource) -> Result<UpdateDecision, ()> {
         .origin
         .join("wokcore-update-v2.json")
         .map_err(|_| ())?;
-    let (manifest, signature) =
+    let (manifest, signature, expected_schema) =
         match fetch_document(&client, source, v2_url, MAX_UPDATE_MANIFEST_BYTES).await? {
             FetchDocument::Found(manifest) => {
                 let signature = fetch_required_document(
@@ -875,7 +875,7 @@ async fn check(source: &UpdateSource) -> Result<UpdateDecision, ()> {
                     MAX_UPDATE_SIGNATURE_BYTES,
                 )
                 .await?;
-                (manifest, signature)
+                (manifest, signature, 2)
             }
             FetchDocument::NotFound => {
                 let manifest = fetch_required_document(
@@ -892,18 +892,25 @@ async fn check(source: &UpdateSource) -> Result<UpdateDecision, ()> {
                     MAX_UPDATE_SIGNATURE_BYTES,
                 )
                 .await?;
-                (manifest, signature)
+                (manifest, signature, 1)
             }
         };
     let current_version = Version::parse(env!("CARGO_PKG_VERSION")).map_err(|_| ())?;
-    verify_manifest(
+    let decision = verify_manifest(
         &manifest,
         &signature,
         &source.public_key,
         &current_version,
         current_target(),
     )
-    .map_err(|_| ())
+    .map_err(|_| ())?;
+    let schema_version = serde_json::from_slice::<Value>(&manifest)
+        .map_err(|_| ())?
+        .get("schema_version")
+        .and_then(Value::as_u64);
+    (schema_version == Some(expected_schema))
+        .then_some(decision)
+        .ok_or(())
 }
 
 fn update_client() -> Result<reqwest::Client, ()> {

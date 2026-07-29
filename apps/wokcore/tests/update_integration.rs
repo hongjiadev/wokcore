@@ -174,6 +174,108 @@ async fn update_check_falls_back_to_v1_only_when_v2_is_not_found() {
 }
 
 #[tokio::test]
+async fn update_check_rejects_v1_manifest_from_v2_url_without_falling_back() {
+    let v1_manifest_requests = Arc::new(AtomicUsize::new(0));
+    let v1_signature_requests = Arc::new(AtomicUsize::new(0));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let app = Router::new()
+        .route(
+            "/wokcore-update-v2.json",
+            get(|| async { Response::new(Body::from(MIGRATION_V1)) }),
+        )
+        .route(
+            "/wokcore-update-v2.json.minisig",
+            get(|| async { Response::new(Body::from(MIGRATION_V1_SIGNATURE)) }),
+        )
+        .route(
+            "/wokcore-update-v1.json",
+            get({
+                let requests = v1_manifest_requests.clone();
+                move || {
+                    let requests = requests.clone();
+                    async move {
+                        requests.fetch_add(1, Ordering::AcqRel);
+                        Response::new(Body::from(MIGRATION_V1))
+                    }
+                }
+            }),
+        )
+        .route(
+            "/wokcore-update-v1.json.minisig",
+            get({
+                let requests = v1_signature_requests.clone();
+                move || {
+                    let requests = requests.clone();
+                    async move {
+                        requests.fetch_add(1, Ordering::AcqRel);
+                        Response::new(Body::from(MIGRATION_V1_SIGNATURE))
+                    }
+                }
+            }),
+        );
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let origin = Url::parse(&format!("http://{address}/")).unwrap();
+    let (_directory, dependencies) = dependencies();
+    let dependencies = dependencies
+        .with_loopback_update_source(origin, MIGRATION_PUBLIC_KEY)
+        .unwrap();
+    let mut output = BufferOutput::default();
+
+    let exit = run_with_dependencies(
+        Cli::try_parse_from(["wokcore", "update", "--check", "--json"]).unwrap(),
+        &dependencies,
+        &mut output,
+    )
+    .await;
+
+    server.abort();
+    assert_eq!(exit, ExitCode::InternalFailure);
+    assert_eq!(v1_manifest_requests.load(Ordering::Acquire), 0);
+    assert_eq!(v1_signature_requests.load(Ordering::Acquire), 0);
+}
+
+#[tokio::test]
+async fn update_check_rejects_v2_manifest_from_v1_url() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let app = Router::new()
+        .route(
+            "/wokcore-update-v2.json",
+            get(|| async { Response::builder().status(404).body(Body::empty()).unwrap() }),
+        )
+        .route(
+            "/wokcore-update-v1.json",
+            get(|| async { Response::new(Body::from(MIGRATION_V2)) }),
+        )
+        .route(
+            "/wokcore-update-v1.json.minisig",
+            get(|| async { Response::new(Body::from(MIGRATION_V2_SIGNATURE)) }),
+        );
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let origin = Url::parse(&format!("http://{address}/")).unwrap();
+    let (_directory, dependencies) = dependencies();
+    let dependencies = dependencies
+        .with_loopback_update_source(origin, MIGRATION_PUBLIC_KEY)
+        .unwrap();
+    let mut output = BufferOutput::default();
+
+    let exit = run_with_dependencies(
+        Cli::try_parse_from(["wokcore", "update", "--check", "--json"]).unwrap(),
+        &dependencies,
+        &mut output,
+    )
+    .await;
+
+    server.abort();
+    assert_eq!(exit, ExitCode::InternalFailure);
+}
+
+#[tokio::test]
 async fn update_check_does_not_fall_back_when_present_v2_has_an_invalid_signature() {
     let mut corrupted_signature = MIGRATION_V2_SIGNATURE.to_vec();
     let signature_payload = corrupted_signature
