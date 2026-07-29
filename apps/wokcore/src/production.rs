@@ -10,6 +10,7 @@ use std::{
 
 use async_trait::async_trait;
 use secrecy::{SecretString, zeroize::Zeroizing};
+use url::Url;
 use uuid::Uuid;
 use wokcore_platform::{AppPaths, is_process_running, process_matches_executable};
 use wokcore_server::{
@@ -20,8 +21,9 @@ use wokcore_server::{
 use wokcore_storage::NativeSecretStore;
 
 use crate::{
-    Clock, CommandOutput, ExitCode, IdSource, ProcessIdentity, RunDependencies, RuntimeValueError,
-    SecretInput, ShutdownSignal, UpdateChild, UpdateProcess,
+    Clock, CommandOutput, ExitCode, IdSource, PRODUCTION_UPDATE_ORIGIN, ProcessIdentity,
+    RunDependencies, RuntimeValueError, SecretInput, ShutdownSignal, UpdateChild, UpdateProcess,
+    UpdateSource,
     cli::{Cli, Command},
     run_with_dependencies,
     runtime::production_upstream_executor,
@@ -42,6 +44,17 @@ pub async fn run_production(cli: Cli) -> ExitCode {
     };
     let entropy: Arc<dyn EntropySource> = Arc::new(OsEntropy);
     let secrets = Arc::new(NativeSecretStore::new());
+    let update_source = match production_update_source() {
+        Ok(source) => source,
+        Err(_) => {
+            if requests_json(&cli) {
+                let _ = output.write_stdout("{\"code\":\"internal_error\"}\n");
+            } else {
+                let _ = output.write_stderr("WokCore update runtime is unavailable.\n");
+            }
+            return ExitCode::InternalFailure;
+        }
+    };
     let upstream_executor = if matches!(&cli.command, Command::Serve(_)) {
         match production_upstream_executor(secrets.clone()) {
             Ok(executor) => Some(executor),
@@ -68,6 +81,7 @@ pub async fn run_production(cli: Cli) -> ExitCode {
     )
     .with_secret_input(Arc::new(StandardSecretInput))
     .with_update_process(Arc::new(SystemUpdateProcess));
+    dependencies.update_source = Some(update_source);
     if let Some(upstream_executor) = upstream_executor {
         dependencies = dependencies.with_upstream_executor(upstream_executor);
     }
@@ -75,6 +89,14 @@ pub async fn run_production(cli: Cli) -> ExitCode {
         dependencies = dependencies.with_session_roots(session_roots);
     }
     run_with_dependencies(cli, &dependencies, &mut output).await
+}
+
+fn production_update_source() -> Result<UpdateSource, RuntimeValueError> {
+    let origin = Url::parse(PRODUCTION_UPDATE_ORIGIN).map_err(|_| RuntimeValueError)?;
+    Ok(UpdateSource {
+        origin,
+        public_key: Arc::from(include_str!("../../../release/minisign.pub")),
+    })
 }
 
 fn requests_json(cli: &Cli) -> bool {
@@ -255,7 +277,7 @@ mod tests {
     use secrecy::ExposeSecret;
     use wokcore_server::auth::{EntropySource, TokenError};
 
-    use super::{IdSource, SystemIds, read_bounded_secret};
+    use super::{IdSource, SystemIds, production_update_source, read_bounded_secret};
 
     struct FailingEntropy;
 
@@ -263,6 +285,21 @@ mod tests {
         fn fill(&self, _output: &mut [u8; 32]) -> Result<(), TokenError> {
             Err(TokenError::EntropyUnavailable)
         }
+    }
+
+    #[test]
+    fn production_update_source_uses_the_exact_trusted_release_origin_and_key() {
+        const EXPECTED_ORIGIN: &str =
+            "https://github.com/hongjiadev/wokcore/releases/latest/download/";
+        const EXPECTED_PUBLIC_KEY: &str = "untrusted comment: minisign public key 7EF262CD8E9FE136\nRWQ24Z+OzWLyfjz0X7JFepiizNYEsUBt/cJisQWQ9o9EAK8TURVs9hts\n";
+        let source = production_update_source().unwrap();
+
+        assert_eq!(source.origin.as_str(), EXPECTED_ORIGIN);
+        assert_eq!(source.public_key.as_ref(), EXPECTED_PUBLIC_KEY);
+        assert_eq!(
+            source.public_key.lines().next(),
+            Some("untrusted comment: minisign public key 7EF262CD8E9FE136")
+        );
     }
 
     #[test]

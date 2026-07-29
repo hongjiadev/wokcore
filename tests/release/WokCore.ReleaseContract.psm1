@@ -51,7 +51,9 @@ function Get-WokCorePayloadNames {
             $names.Add($contract.LegacyV1Name)
         }
     }
-    return @($names | Sort-Object -CaseSensitive)
+    [string[]] $orderedNames = $names.ToArray()
+    [Array]::Sort($orderedNames, [StringComparer]::Ordinal)
+    return $orderedNames
 }
 
 Export-ModuleMember -Function Get-WokCoreTargetContracts, Get-WokCorePayloadNames

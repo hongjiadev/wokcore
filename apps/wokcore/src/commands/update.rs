@@ -25,7 +25,10 @@ use wokcore_platform::{
     },
 };
 
-use crate::{CommandOutput, ExitCode, RunDependencies, UpdateChild, UpdateSource, cli::Update};
+use crate::{
+    CommandOutput, ExitCode, PRODUCTION_UPDATE_ORIGIN, RunDependencies, UpdateChild, UpdateSource,
+    cli::Update,
+};
 
 use super::{
     client::{ControlClient, ControlClientError},
@@ -40,9 +43,6 @@ const UPDATE_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const UPDATE_PROCESS_TIMEOUT: Duration = Duration::from_secs(10);
 const UPDATE_STOP_SETTLE_TIMEOUT: Duration = Duration::from_secs(50);
 const UPDATE_PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(25);
-const PRODUCTION_UPDATE_ORIGIN: &str =
-    "https://github.com/hongjiadev/wokcore/releases/latest/download/";
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OriginalServiceState {
     Running,

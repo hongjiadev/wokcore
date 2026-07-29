@@ -27,6 +27,9 @@ pub mod runtime;
 
 pub use production::run_production;
 
+pub(crate) const PRODUCTION_UPDATE_ORIGIN: &str =
+    "https://github.com/hongjiadev/wokcore/releases/latest/download/";
+
 /// Stable process exit codes for local service commands.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
