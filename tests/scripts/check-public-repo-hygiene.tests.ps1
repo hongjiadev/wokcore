@@ -44,6 +44,11 @@ foreach ($forbidden in @(
     "100644 0000000000000000000000000000000000000000 0`trelease/wokcore-update-v1.json.minisig",
     "100644 0000000000000000000000000000000000000000 0`trelease/wokcore-update-v1.json",
     "100644 0000000000000000000000000000000000000000 0`trelease/SHA256SUMS",
+    "100644 0000000000000000000000000000000000000000 0`trelease/WokCore-v1.2.3-Windows-x86_64.msi",
+    "100644 0000000000000000000000000000000000000000 0`trelease/WokCore-v1.2.3-Linux-x86_64.deb",
+    "100644 0000000000000000000000000000000000000000 0`trelease/WokCore-v1.2.3-Linux-x86_64.rpm",
+    "100644 0000000000000000000000000000000000000000 0`trelease/WokCore-v1.2.3-Linux-x86_64.AppImage",
+    "100644 0000000000000000000000000000000000000000 0`trelease/WokCore-v1.2.3-macOS-x86_64.dmg",
     "100644 0000000000000000000000000000000000000000 0`trelease/wokcore-v1.2.3-x86_64-pc-windows-msvc.zip",
     "100644 0000000000000000000000000000000000000000 0`trelease/wokcore-v1.2.3-aarch64-apple-darwin.tar.gz",
     "100644 0000000000000000000000000000000000000000 0`tkeys/minisign.key",
@@ -128,6 +133,12 @@ function Assert-StagedContentRejected {
     }
 }
 
+Assert-StagedContentRejected `
+    -RelativePath "keys/minisign.txt" `
+    -Content (
+        "untrusted comment: minisign encrypted " +
+        "secret key`n"
+    )
 Assert-StagedContentRejected `
     -RelativePath "keys/hidden.txt" `
     -Content (

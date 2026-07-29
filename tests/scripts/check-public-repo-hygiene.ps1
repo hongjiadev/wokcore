@@ -125,7 +125,7 @@ $violations = foreach ($line in $IndexLines) {
     }
     $isSignedReleasePayload =
         $lowerPath -match
-            "\.(key|sec|secret|private|pem|p12|pfx|zip|tgz|tar\.gz|minisig|exe|dll|dylib|so)$" -or
+            "\.(key|sec|secret|private|pem|p12|pfx|zip|tgz|tar\.gz|minisig|msi|deb|rpm|appimage|dmg|exe|dll|dylib|so)$" -or
         $lowerPath -match
             "(^|/)(sha256sums|wokcore-update-v[12]\.json|wokcore-update-v[12]\.json\.minisig)$" -or
         $lowerPath -match
