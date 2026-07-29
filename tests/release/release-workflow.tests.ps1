@@ -99,6 +99,8 @@ foreach ($required in @(
     "macos-15-intel",
     "ubuntu-24.04-arm",
     "tests/release/build-package.ps1",
+    "tests/release/build-windows-assets.ps1",
+    "tests/release/build-windows-assets.tests.ps1",
     "tests/release/build-package.sh",
     "tests/release/normalize-minisign-public-key.ps1",
     "tests/release/verify-manifest.tests.ps1",
@@ -131,6 +133,33 @@ $unixCiContracts = @(
     @("ubuntu-24.04", "x86_64-unknown-linux-gnu", "tar.gz", "x86_64"),
     @("ubuntu-24.04-arm", "aarch64-unknown-linux-gnu", "tar.gz", "arm64")
 )
+$windowsCiContracts = @(
+    @(
+        "windows-latest",
+        "x86_64-pc-windows-msvc",
+        "zip",
+        "x86_64",
+        "true"
+    ),
+    @(
+        "windows-latest",
+        "aarch64-pc-windows-msvc",
+        "zip",
+        "arm64",
+        "false"
+    )
+)
+foreach ($contract in $windowsCiContracts) {
+    $runner, $target, $extension, $publicArch, $runBinary = $contract
+    $pattern = "(?ms)- os:\s+$([regex]::Escape($runner))\s+" +
+        "target:\s+$([regex]::Escape($target))\s+" +
+        "extension:\s+$([regex]::Escape($extension))\s+" +
+        "public_arch:\s+$([regex]::Escape($publicArch))\s+" +
+        "run_binary:\s+$([regex]::Escape($runBinary))\s*"
+    if ([regex]::Matches($targetCheckSource, $pattern).Count -ne 1) {
+        throw "CI has an invalid Windows target/runtime mapping: $target"
+    }
+}
 foreach ($contract in $unixCiContracts) {
     $runner, $target, $extension, $publicArch = $contract
     $pattern = "(?ms)- os:\s+$([regex]::Escape($runner))\s+" +
@@ -153,6 +182,13 @@ foreach ($testScript in @(
     }
 }
 foreach ($required in @(
+    "powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/release/build-windows-assets.tests.ps1",
+    "tests/release/build-windows-assets.ps1",
+    "0xaa64",
+    'if: runner.os == ''Windows'' && matrix.run_binary',
+    'if: runner.os == ''Windows'' && !matrix.run_binary',
+    '${{ runner.temp }}/wokcore-release/WokCore-v${{ steps.version.outputs.version }}-Windows-${{ matrix.public_arch }}-Portable.zip',
+    '${{ runner.temp }}/wokcore-release/WokCore-v${{ steps.version.outputs.version }}-Windows-${{ matrix.public_arch }}.msi',
     "bash tests/release/build-linux-assets.sh",
     "bash tests/release/build-macos-assets.sh",
     '${{ runner.temp }}/wokcore-release/WokCore-v${{ steps.version.outputs.version }}-Linux-${{ matrix.public_arch }}.tar.gz',
@@ -162,7 +198,7 @@ foreach ($required in @(
     '${{ runner.temp }}/wokcore-release/WokCore-v${{ steps.version.outputs.version }}-macOS-${{ matrix.public_arch }}.zip'
 )) {
     if ($targetCheckSource.IndexOf($required, [StringComparison]::Ordinal) -lt 0) {
-        throw "CI target-check is missing an exact Unix asset contract: $required"
+        throw "CI target-check is missing an exact asset contract: $required"
     }
 }
 if (
@@ -171,7 +207,7 @@ if (
         [StringComparison]::Ordinal
     ) -ge 0
 ) {
-    throw "CI target-check uses a wildcard for friendly Unix asset upload."
+    throw "CI target-check uses a wildcard for friendly asset upload."
 }
 
 foreach ($workflowSource in @($source, $ciSource)) {

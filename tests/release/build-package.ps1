@@ -9,7 +9,10 @@ param(
     [Parameter(Mandatory)]
     [string] $Version,
     [Parameter(Mandatory)]
-    [ValidateSet("x86_64-pc-windows-msvc")]
+    [ValidateSet(
+        "x86_64-pc-windows-msvc",
+        "aarch64-pc-windows-msvc"
+    )]
     [string] $Target
 )
 

@@ -124,6 +124,13 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             extension: zip
+            public_arch: x86_64
+            run_binary: true
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            extension: zip
+            public_arch: arm64
+            run_binary: false
           - os: macos-15-intel
             target: x86_64-apple-darwin
             extension: tar.gz
@@ -154,6 +161,26 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes cpio rpm
+      - name: Install pinned WiX 3.14.1 tools
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $archive = Join-Path "${{ runner.temp }}" "wix314-binaries.zip"
+          $directory = Join-Path "${{ runner.temp }}" "wix314-binaries"
+          Invoke-WebRequest `
+              -Uri "https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314-binaries.zip" `
+              -OutFile $archive
+          $actualHash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash
+          $expectedHash = "6AC824E1642D6F7277D0ED7EA09411A508F6116BA6FAE0AA5F2C7DAA2FF43D31"
+          if ($actualHash -cne $expectedHash) {
+              throw "WiX 3.14.1 archive hash mismatch."
+          }
+          Expand-Archive -LiteralPath $archive -DestinationPath $directory
+          $directory >> $env:GITHUB_PATH
+      - name: Test Windows distribution assets
+        if: runner.os == 'Windows' && matrix.run_binary
+        shell: powershell
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/release/build-windows-assets.tests.ps1
       - name: Test Linux distribution assets
         if: runner.os == 'Linux'
         run: >-
@@ -190,8 +217,8 @@ jobs:
           --release
           --locked
           --target ${{ matrix.target }}
-      - name: Verify and package Windows executable
-        if: runner.os == 'Windows'
+      - name: Verify native Windows executable
+        if: runner.os == 'Windows' && matrix.run_binary
         shell: powershell
         run: |
           $executable = Join-Path `
@@ -201,11 +228,46 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
               throw "The fixed WokCore release executable did not start."
           }
+      - name: Verify ARM64 Windows executable
+        if: runner.os == 'Windows' && !matrix.run_binary
+        shell: powershell
+        run: |
+          $path = Join-Path `
+              "${{ github.workspace }}\target\${{ matrix.target }}\release" `
+              "wokcore.exe"
+          $bytes = [IO.File]::ReadAllBytes($path)
+          if ($bytes.Length -lt 0x40) {
+              throw "The ARM64 executable is too short to contain a PE header."
+          }
+          $peOffset = [BitConverter]::ToInt32($bytes, 0x3c)
+          if ($peOffset -lt 0 -or $peOffset + 6 -gt $bytes.Length) {
+              throw "The ARM64 executable has an invalid PE header offset."
+          }
+          $machine = [BitConverter]::ToUInt16($bytes, $peOffset + 4)
+          if ($machine -ne 0xaa64) {
+              throw "Expected ARM64 PE machine 0xAA64."
+          }
+      - name: Package Windows executable and distribution assets
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $executable = Join-Path `
+              "${{ github.workspace }}\target\${{ matrix.target }}\release" `
+              "wokcore.exe"
+          $dist = "${{ runner.temp }}\wokcore-release"
           powershell.exe -NoProfile -ExecutionPolicy Bypass `
               -File tests/release/build-package.ps1 `
               -ExecutablePath $executable `
               -RepositoryRoot "${{ github.workspace }}" `
-              -OutputDirectory "${{ runner.temp }}\wokcore-release" `
+              -OutputDirectory $dist `
+              -Version "${{ steps.version.outputs.version }}" `
+              -Target "${{ matrix.target }}"
+          powershell.exe -NoProfile -ExecutionPolicy Bypass `
+              -File tests/release/build-windows-assets.ps1 `
+              -ExecutablePath $executable `
+              -PortableArchivePath (Join-Path $dist "wokcore-v${{ steps.version.outputs.version }}-${{ matrix.target }}.zip") `
+              -RepositoryRoot "${{ github.workspace }}" `
+              -OutputDirectory $dist `
               -Version "${{ steps.version.outputs.version }}" `
               -Target "${{ matrix.target }}"
       - name: Verify and package Unix executable
@@ -247,6 +309,16 @@ jobs:
         with:
           name: ci-wokcore-package-${{ matrix.target }}
           path: ${{ runner.temp }}/wokcore-release/wokcore-v${{ steps.version.outputs.version }}-${{ matrix.target }}.${{ matrix.extension }}
+          if-no-files-found: error
+          retention-days: 7
+      - name: Upload friendly Windows distribution assets
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: wokcore-${{ matrix.target }}
+          path: |
+            ${{ runner.temp }}/wokcore-release/WokCore-v${{ steps.version.outputs.version }}-Windows-${{ matrix.public_arch }}-Portable.zip
+            ${{ runner.temp }}/wokcore-release/WokCore-v${{ steps.version.outputs.version }}-Windows-${{ matrix.public_arch }}.msi
           if-no-files-found: error
           retention-days: 7
       - name: Upload friendly Linux distribution assets
@@ -303,13 +375,13 @@ jobs:
           pwsh tests/release/release-workflow.tests.ps1
           pwsh tests/scripts/check-public-repo-hygiene.tests.ps1
           pwsh tests/scripts/check-public-repo-hygiene.ps1
-      - name: Download all five native CI packages
+      - name: Download all six native CI packages
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
           pattern: ci-wokcore-package-*
           path: ${{ runner.temp }}/wokcore-release
           merge-multiple: true
-      - name: Verify a signed five-target manifest
+      - name: Verify a signed legacy five-target manifest
         shell: bash
         run: |
           set -Eeuo pipefail

@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*"
+           UpgradeCode="{B8B1D69E-A5B4-4C1B-B3FE-D43A3E52F4AF}"
+           Name="WokCore"
+           Manufacturer="Hong Jia"
+           Language="1033"
+           Version="$(var.WokCoreVersion)">
+    <Package InstallerVersion="500"
+             Compressed="yes"
+             InstallScope="perMachine"
+             Platform="$(var.WokCorePlatform)" />
+    <MajorUpgrade DowngradeErrorMessage="A newer WokCore version is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+    <Feature Id="ProductFeature" Title="WokCore" Level="1">
+      <ComponentGroupRef Id="WokCoreFiles" />
+    </Feature>
+  </Product>
+  <Fragment>
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="INSTALLFOLDER" Name="WokCore" />
+      </Directory>
+    </Directory>
+  </Fragment>
+  <Fragment>
+    <DirectoryRef Id="INSTALLFOLDER">
+      <Component Id="ExecutableComponent" Guid="*" Win64="yes">
+        <File Id="WokCoreExe" Source="$(var.WokCoreExe)" KeyPath="yes" />
+        <Environment Id="PathEntry"
+                     Name="PATH"
+                     Value="[INSTALLFOLDER]"
+                     Action="set"
+                     Part="last"
+                     System="yes" />
+      </Component>
+      <Component Id="ApacheLicenseComponent" Guid="*" Win64="yes">
+        <File Id="ApacheLicense" Source="$(var.ApacheLicense)" KeyPath="yes" />
+      </Component>
+      <Component Id="MitLicenseComponent" Guid="*" Win64="yes">
+        <File Id="MitLicense" Source="$(var.MitLicense)" KeyPath="yes" />
+      </Component>
+      <Component Id="NoticeComponent" Guid="*" Win64="yes">
+        <File Id="Notice" Source="$(var.Notice)" KeyPath="yes" />
+      </Component>
+      <Component Id="ReadmeComponent" Guid="*" Win64="yes">
+        <File Id="Readme" Source="$(var.Readme)" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+    <ComponentGroup Id="WokCoreFiles">
+      <ComponentRef Id="ExecutableComponent" />
+      <ComponentRef Id="ApacheLicenseComponent" />
+      <ComponentRef Id="MitLicenseComponent" />
+      <ComponentRef Id="NoticeComponent" />
+      <ComponentRef Id="ReadmeComponent" />
+    </ComponentGroup>
+  </Fragment>
+</Wix>

@@ -200,31 +200,44 @@ try {
         [DateTime]::new(2020, 1, 2, 3, 4, 5, [DateTimeKind]::Utc)
     )
 
-    & $buildPackage `
-        -ExecutablePath $executable `
-        -RepositoryRoot $repositoryRoot `
-        -OutputDirectory $packages `
-        -Version "1.2.3" `
-        -Target "x86_64-pc-windows-msvc"
-    [IO.File]::SetLastWriteTimeUtc(
-        $executable,
-        [DateTime]::new(2030, 1, 2, 3, 4, 5, [DateTimeKind]::Utc)
-    )
-    & $buildPackage `
-        -ExecutablePath $executable `
-        -RepositoryRoot $repositoryRoot `
-        -OutputDirectory $secondPackages `
-        -Version "1.2.3" `
-        -Target "x86_64-pc-windows-msvc"
+    foreach ($windowsTarget in @(
+        "x86_64-pc-windows-msvc",
+        "aarch64-pc-windows-msvc"
+    )) {
+        & $buildPackage `
+            -ExecutablePath $executable `
+            -RepositoryRoot $repositoryRoot `
+            -OutputDirectory $packages `
+            -Version "1.2.3" `
+            -Target $windowsTarget
+        [IO.File]::SetLastWriteTimeUtc(
+            $executable,
+            [DateTime]::new(2030, 1, 2, 3, 4, 5, [DateTimeKind]::Utc)
+        )
+        & $buildPackage `
+            -ExecutablePath $executable `
+            -RepositoryRoot $repositoryRoot `
+            -OutputDirectory $secondPackages `
+            -Version "1.2.3" `
+            -Target $windowsTarget
+        $windowsName = "wokcore-v1.2.3-$windowsTarget.zip"
+        $firstHash = (
+            Get-FileHash `
+                -LiteralPath (Join-Path $packages $windowsName) `
+                -Algorithm SHA256
+        ).Hash
+        $secondHash = (
+            Get-FileHash `
+                -LiteralPath (Join-Path $secondPackages $windowsName) `
+                -Algorithm SHA256
+        ).Hash
+        if ($firstHash -cne $secondHash) {
+            throw "Windows release package is not deterministic: $windowsTarget"
+        }
+    }
 
     $windowsName = "wokcore-v1.2.3-x86_64-pc-windows-msvc.zip"
     $firstWindows = Join-Path $packages $windowsName
-    $secondWindows = Join-Path $secondPackages $windowsName
-    $firstHash = (Get-FileHash -LiteralPath $firstWindows -Algorithm SHA256).Hash
-    $secondHash = (Get-FileHash -LiteralPath $secondWindows -Algorithm SHA256).Hash
-    if ($firstHash -cne $secondHash) {
-        throw "Windows release package is not deterministic."
-    }
 
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $zip = [IO.Compression.ZipFile]::OpenRead($firstWindows)
@@ -276,7 +289,7 @@ try {
         $sourceName = if ($contract.LegacyV1) {
             $contract.LegacyV1Name
         } else {
-            "wokcore-v1.2.3-x86_64-pc-windows-msvc.zip"
+            "wokcore-v1.2.3-aarch64-pc-windows-msvc.zip"
         }
         [IO.File]::Copy(
             (Join-Path $packages $sourceName),
