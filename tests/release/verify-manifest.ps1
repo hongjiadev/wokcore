@@ -24,7 +24,7 @@ Set-StrictMode -Version Latest
 $maximumManifestBytes = 131072
 $maximumSignatureBytes = 4096
 $maximumPublicKeyBytes = 1024
-$maximumChecksumsBytes = 4096
+$maximumChecksumsBytes = 8192
 $maximumArtifactBytes = 536870912
 $semverPattern = "^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
 

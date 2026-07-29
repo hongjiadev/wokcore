@@ -99,6 +99,15 @@ foreach ($path in @(
     )) {
     $allowedUpdateFixturePaths.Add($path) | Out-Null
 }
+$allowedPublicKeyPaths = [Collections.Generic.HashSet[string]]::new(
+    [StringComparer]::Ordinal
+)
+$allowedPublicKeyPaths.Add("release/minisign.pub") | Out-Null
+foreach ($path in $allowedUpdateFixturePaths) {
+    if ($path.EndsWith(".pub", [StringComparison]::Ordinal)) {
+        $allowedPublicKeyPaths.Add($path) | Out-Null
+    }
+}
 
 $violations = foreach ($line in $IndexLines) {
     if ($line -notmatch "^(?<mode>\d{6}) [0-9a-f]{40} \d+\t(?<path>.+)$") {
@@ -109,6 +118,9 @@ $violations = foreach ($line in $IndexLines) {
     $path = $Matches.path.Replace("\", "/")
     $lowerPath = $path.ToLowerInvariant()
     $isAllowedUpdateFixture = $allowedUpdateFixturePaths.Contains($path)
+    $isUnapprovedPublicKey =
+        $path.EndsWith(".pub", [StringComparison]::OrdinalIgnoreCase) -and
+        -not $allowedPublicKeyPaths.Contains($path)
     $hasPrivateWorkflowName = $false
     foreach ($segment in $path.Split("/")) {
         $tokens = @(($segment.ToLowerInvariant() -split "[-_.]+") | Where-Object { $_ })
@@ -142,6 +154,7 @@ $violations = foreach ($line in $IndexLines) {
         $path -match "(^|/)\.subpowers(/|$)" -or
         $path -match "(^|/)\.wokdocs(/|$)" -or
         $lowerPath -match "(^|/)(target|dist|artifacts?)(/|$)" -or
+        $isUnapprovedPublicKey -or
         ($isSignedReleasePayload -and -not $isAllowedUpdateFixture) -or
         $hasPrivateWorkflowName
     ) {

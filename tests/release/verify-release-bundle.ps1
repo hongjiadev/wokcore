@@ -17,7 +17,7 @@ $maximumArtifactBytes = 536870912
 $maximumManifestBytes = 131072
 $maximumSignatureBytes = 4096
 $maximumPublicKeyBytes = 1024
-$maximumChecksumsBytes = 4096
+$maximumChecksumsBytes = 8192
 $semverPattern = "^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
 
 function Assert-NoReparsePath {
@@ -59,6 +59,21 @@ function Assert-BoundedFile {
         $item.Length -gt $MaximumBytes
     ) {
         throw "$Description is symbolic, empty, or oversized."
+    }
+}
+
+function Assert-OutsideArtifactDirectory {
+    param(
+        [Parameter(Mandatory)][string] $Path,
+        [Parameter(Mandatory)][string] $Description
+    )
+
+    $prefix = $ArtifactDirectory.TrimEnd(
+        [IO.Path]::DirectorySeparatorChar,
+        [IO.Path]::AltDirectorySeparatorChar
+    ) + [IO.Path]::DirectorySeparatorChar
+    if ($Path.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "$Description must remain outside the release bundle."
     }
 }
 
@@ -174,6 +189,9 @@ Assert-BoundedFile `
     -Path $PublicKeyPath `
     -MaximumBytes $maximumPublicKeyBytes `
     -Description "Minisign public key"
+Assert-OutsideArtifactDirectory `
+    -Path $PublicKeyPath `
+    -Description "Trusted Minisign public key"
 if (-not [IO.File]::Exists($MinisignPath)) {
     throw "Minisign executable is missing."
 }

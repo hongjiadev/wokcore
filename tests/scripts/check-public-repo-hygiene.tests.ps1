@@ -41,6 +41,8 @@ foreach ($forbidden in @(
     "100644 0000000000000000000000000000000000000000 0`tnotes/review-generated-by-codex.md",
     "100644 0000000000000000000000000000000000000000 0`tnotes/CLAUDE_internal_PROGRESS.txt",
     "100644 0000000000000000000000000000000000000000 0`trelease/minisign.key",
+    "100644 0000000000000000000000000000000000000000 0`tkeys/rogue.pub",
+    "100644 0000000000000000000000000000000000000000 0`tkeys/ROGUE.PUB",
     "100644 0000000000000000000000000000000000000000 0`trelease/wokcore-update-v1.json.minisig",
     "100644 0000000000000000000000000000000000000000 0`trelease/wokcore-update-v1.json",
     "100644 0000000000000000000000000000000000000000 0`trelease/SHA256SUMS",
@@ -133,6 +135,9 @@ function Assert-StagedContentRejected {
     }
 }
 
+Assert-StagedContentRejected `
+    -RelativePath "keys/rogue.pub" `
+    -Content "untrusted comment: minisign public key 0000000000000000`n"
 Assert-StagedContentRejected `
     -RelativePath "keys/minisign.txt" `
     -Content (

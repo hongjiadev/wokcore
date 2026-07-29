@@ -196,6 +196,9 @@ $secret = Join-Path $keys "fixture.key"
 $secondPublic = Join-Path $keys "second.pub"
 $secondSecret = Join-Path $keys "second.key"
 $junction = Join-Path $testRoot "bundle junction"
+$maximumVersionBundle = Join-Path ([IO.Path]::GetTempPath()) (
+    "wb-" + [Guid]::NewGuid().ToString("N")
+)
 [IO.Directory]::CreateDirectory($bundle) | Out-Null
 [IO.Directory]::CreateDirectory($keys) | Out-Null
 
@@ -361,6 +364,15 @@ try {
         -PublicKeyPath $public `
         -MinisignPath $MinisignPath
 
+    Assert-VerifierFails `
+        -ArtifactDirectory $bundle `
+        -VerificationPublicKey (
+            Join-Path $bundle "WokCore-Minisign.pub"
+        ) `
+        -FailureMessage (
+            "The verifier trusted the public key supplied by its own bundle."
+        )
+
     $tampered = Join-Path $testRoot "tampered payload"
     Copy-TestBundle -Source $bundle -Destination $tampered
     [IO.File]::AppendAllText((Join-Path $tampered $payloads[0]), "tampered")
@@ -458,6 +470,78 @@ try {
         -VerificationPublicKey $secondPublic `
         -FailureMessage "A mismatched release public key was accepted."
 
+    $maximumVersion = "1.0.0+" + ("a" * 122)
+    if ($maximumVersion.Length -ne 128) {
+        throw "Maximum-version fixture must be exactly 128 characters."
+    }
+    [IO.Directory]::CreateDirectory($maximumVersionBundle) | Out-Null
+    $maximumVersionPayloads = @(
+        Get-WokCorePayloadNames `
+            -Version $maximumVersion `
+            -IncludeLegacyV1
+    )
+    foreach ($name in $maximumVersionPayloads) {
+        $path = Join-Path $maximumVersionBundle $name
+        if (
+            $name.EndsWith(".zip", [StringComparison]::Ordinal) -and
+            (
+                $name.Contains("-Portable.") -or
+                $name.StartsWith("wokcore-", [StringComparison]::Ordinal)
+            )
+        ) {
+            New-TestZipPackage -Path $path -Executable "wokcore.exe"
+        } elseif (
+            $name.EndsWith(".tar.gz", [StringComparison]::Ordinal)
+        ) {
+            New-TestTarPackage -Path $path -Executable "wokcore"
+        } else {
+            [IO.File]::WriteAllBytes(
+                $path,
+                [Text.Encoding]::UTF8.GetBytes("bounded fixture: $name")
+            )
+        }
+    }
+    & $writeManifest `
+        -ArtifactDirectory $maximumVersionBundle `
+        -Version $maximumVersion `
+        -SigningKeyId $keyId `
+        -SchemaVersion 1 `
+        -OutputPath (
+            Join-Path $maximumVersionBundle "wokcore-update-v1.json"
+        ) |
+        Out-Null
+    & $writeManifest `
+        -ArtifactDirectory $maximumVersionBundle `
+        -Version $maximumVersion `
+        -SigningKeyId $keyId `
+        -SchemaVersion 2 `
+        -OutputPath (
+            Join-Path $maximumVersionBundle "wokcore-update-v2.json"
+        ) |
+        Out-Null
+    & $signer `
+        -ArtifactDirectory $maximumVersionBundle `
+        -Version $maximumVersion `
+        -SecretKeyPath $secret `
+        -PublicKeyPath $public `
+        -MinisignPath $MinisignPath
+    $maximumChecksumsLength = (
+        Get-Item -LiteralPath (
+            Join-Path $maximumVersionBundle "SHA256SUMS"
+        )
+    ).Length
+    if (
+        $maximumChecksumsLength -le 4096 -or
+        $maximumChecksumsLength -gt 8192
+    ) {
+        throw "Maximum-version SHA256SUMS did not exercise the size boundary."
+    }
+    & $verifier `
+        -ArtifactDirectory $maximumVersionBundle `
+        -Version $maximumVersion `
+        -PublicKeyPath $public `
+        -MinisignPath $MinisignPath
+
     New-Item -ItemType Junction -Path $junction -Target $bundle |
         Out-Null
     Assert-VerifierFails `
@@ -470,6 +554,9 @@ try {
     }
     Clear-TestSecretKey -Path $secret
     Clear-TestSecretKey -Path $secondSecret
+    if ([IO.Directory]::Exists($maximumVersionBundle)) {
+        [IO.Directory]::Delete($maximumVersionBundle, $true)
+    }
     if ([IO.Directory]::Exists($testRoot)) {
         [IO.Directory]::Delete($testRoot, $true)
     }
