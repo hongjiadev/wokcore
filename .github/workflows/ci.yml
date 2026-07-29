@@ -127,15 +127,19 @@ jobs:
           - os: macos-15-intel
             target: x86_64-apple-darwin
             extension: tar.gz
+            public_arch: x86_64
           - os: macos-15
             target: aarch64-apple-darwin
             extension: tar.gz
+            public_arch: arm64
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             extension: tar.gz
+            public_arch: x86_64
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             extension: tar.gz
+            public_arch: arm64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -149,13 +153,17 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install --yes rpm
+          sudo apt-get install --yes cpio rpm
       - name: Test Linux distribution assets
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: bash tests/release/build-linux-assets.tests.sh
+        if: runner.os == 'Linux'
+        run: >-
+          bash tests/release/build-linux-assets.tests.sh
+          "${{ matrix.target }}" "${{ matrix.public_arch }}"
       - name: Test macOS distribution assets
         if: runner.os == 'macOS'
-        run: bash tests/release/build-macos-assets.tests.sh
+        run: >-
+          bash tests/release/build-macos-assets.tests.sh
+          "${{ matrix.target }}" "${{ matrix.public_arch }}"
       - name: Check target
         run: cargo check --workspace --all-features --locked --target ${{ matrix.target }}
       - name: Resolve package version
@@ -241,12 +249,25 @@ jobs:
           path: ${{ runner.temp }}/wokcore-release/wokcore-v${{ steps.version.outputs.version }}-${{ matrix.target }}.${{ matrix.extension }}
           if-no-files-found: error
           retention-days: 7
-      - name: Upload friendly Unix distribution assets
-        if: runner.os != 'Windows'
+      - name: Upload friendly Linux distribution assets
+        if: runner.os == 'Linux'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: wokcore-${{ matrix.target }}
-          path: ${{ runner.temp }}/wokcore-release/WokCore-v*
+          path: |
+            ${{ runner.temp }}/wokcore-release/WokCore-v${{ steps.version.outputs.version }}-Linux-${{ matrix.public_arch }}.tar.gz
+            ${{ runner.temp }}/wokcore-release/WokCore-v${{ steps.version.outputs.version }}-Linux-${{ matrix.public_arch }}.deb
+            ${{ runner.temp }}/wokcore-release/WokCore-v${{ steps.version.outputs.version }}-Linux-${{ matrix.public_arch }}.rpm
+          if-no-files-found: error
+          retention-days: 7
+      - name: Upload friendly macOS distribution assets
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: wokcore-${{ matrix.target }}
+          path: |
+            ${{ runner.temp }}/wokcore-release/WokCore-v${{ steps.version.outputs.version }}-macOS-${{ matrix.public_arch }}.tar.gz
+            ${{ runner.temp }}/wokcore-release/WokCore-v${{ steps.version.outputs.version }}-macOS-${{ matrix.public_arch }}.zip
           if-no-files-found: error
           retention-days: 7
 
@@ -260,13 +281,19 @@ jobs:
       - name: Install release contract tools
         run: |
           sudo apt-get update
-          sudo apt-get install --yes minisign rpm zip unzip
+          sudo apt-get install --yes cpio minisign rpm zip unzip
       - name: Test deterministic release packages
         run: bash tests/release/build-package.tests.sh
       - name: Test Linux distribution assets
-        run: bash tests/release/build-linux-assets.tests.sh
+        run: >-
+          bash tests/release/build-linux-assets.tests.sh
+          x86_64-unknown-linux-gnu x86_64
       - name: Test macOS distribution assets
-        run: bash tests/release/build-macos-assets.tests.sh
+        run: |
+          bash tests/release/build-macos-assets.tests.sh \
+            x86_64-apple-darwin x86_64
+          bash tests/release/build-macos-assets.tests.sh \
+            aarch64-apple-darwin arm64
       - name: Test release manifest and Windows package contracts
         shell: pwsh
         run: pwsh tests/release/verify-manifest.tests.ps1

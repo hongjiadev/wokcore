@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+: "${WOKCORE_REAL_DPKG_DEB:?}"
+"$WOKCORE_REAL_DPKG_DEB" "$@"
+if [[ "${1:-}" == "--build" ]]; then
+    printf 'corrupt Debian package fixture\n' >"${!#}"
+fi

@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+: "${WOKCORE_REAL_RPMBUILD:?}"
+"$WOKCORE_REAL_RPMBUILD" "$@"
+
+top_directory=""
+while [[ "$#" -gt 0 ]]; do
+    if [[ "$1" == "--define" && "$#" -ge 2 && "$2" == "_topdir "* ]]; then
+        top_directory="${2#_topdir }"
+        shift 2
+    else
+        shift
+    fi
+done
+[[ -n "$top_directory" ]]
+built_rpm="$(find "$top_directory/RPMS" -type f -name '*.rpm' -print -quit)"
+[[ -n "$built_rpm" ]]
+printf 'corrupt RPM package fixture\n' >"$built_rpm"

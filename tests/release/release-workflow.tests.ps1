@@ -110,6 +110,70 @@ foreach ($required in @(
     }
 }
 
+$targetCheckStart = $ciSource.IndexOf(
+    "  target-check:",
+    [StringComparison]::Ordinal
+)
+$targetCheckEnd = $ciSource.IndexOf(
+    "  release-contract:",
+    [StringComparison]::Ordinal
+)
+if ($targetCheckStart -lt 0 -or $targetCheckEnd -le $targetCheckStart) {
+    throw "CI target-check boundaries are invalid."
+}
+$targetCheckSource = $ciSource.Substring(
+    $targetCheckStart,
+    $targetCheckEnd - $targetCheckStart
+)
+$unixCiContracts = @(
+    @("macos-15-intel", "x86_64-apple-darwin", "tar.gz", "x86_64"),
+    @("macos-15", "aarch64-apple-darwin", "tar.gz", "arm64"),
+    @("ubuntu-24.04", "x86_64-unknown-linux-gnu", "tar.gz", "x86_64"),
+    @("ubuntu-24.04-arm", "aarch64-unknown-linux-gnu", "tar.gz", "arm64")
+)
+foreach ($contract in $unixCiContracts) {
+    $runner, $target, $extension, $publicArch = $contract
+    $pattern = "(?ms)- os:\s+$([regex]::Escape($runner))\s+" +
+        "target:\s+$([regex]::Escape($target))\s+" +
+        "extension:\s+$([regex]::Escape($extension))\s+" +
+        "public_arch:\s+$([regex]::Escape($publicArch))\s*"
+    if ([regex]::Matches($targetCheckSource, $pattern).Count -ne 1) {
+        throw "CI has an invalid Unix target/public-architecture mapping: $target"
+    }
+}
+foreach ($testScript in @(
+    "build-linux-assets.tests.sh",
+    "build-macos-assets.tests.sh"
+)) {
+    $pattern = 'bash\s+tests/release/' +
+        [regex]::Escape($testScript) +
+        '\s+"\$\{\{ matrix\.target \}\}"\s+"\$\{\{ matrix\.public_arch \}\}"'
+    if ([regex]::Matches($targetCheckSource, $pattern).Count -ne 1) {
+        throw "CI target-check does not run $testScript for its exact target."
+    }
+}
+foreach ($required in @(
+    "bash tests/release/build-linux-assets.sh",
+    "bash tests/release/build-macos-assets.sh",
+    '${{ runner.temp }}/wokcore-release/WokCore-v${{ steps.version.outputs.version }}-Linux-${{ matrix.public_arch }}.tar.gz',
+    '${{ runner.temp }}/wokcore-release/WokCore-v${{ steps.version.outputs.version }}-Linux-${{ matrix.public_arch }}.deb',
+    '${{ runner.temp }}/wokcore-release/WokCore-v${{ steps.version.outputs.version }}-Linux-${{ matrix.public_arch }}.rpm',
+    '${{ runner.temp }}/wokcore-release/WokCore-v${{ steps.version.outputs.version }}-macOS-${{ matrix.public_arch }}.tar.gz',
+    '${{ runner.temp }}/wokcore-release/WokCore-v${{ steps.version.outputs.version }}-macOS-${{ matrix.public_arch }}.zip'
+)) {
+    if ($targetCheckSource.IndexOf($required, [StringComparison]::Ordinal) -lt 0) {
+        throw "CI target-check is missing an exact Unix asset contract: $required"
+    }
+}
+if (
+    $targetCheckSource.IndexOf(
+        '${{ runner.temp }}/wokcore-release/WokCore-v*',
+        [StringComparison]::Ordinal
+    ) -ge 0
+) {
+    throw "CI target-check uses a wildcard for friendly Unix asset upload."
+}
+
 foreach ($workflowSource in @($source, $ciSource)) {
     foreach ($match in [regex]::Matches(
         $workflowSource,
