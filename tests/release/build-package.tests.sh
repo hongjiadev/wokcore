@@ -126,4 +126,52 @@ if "$BUILD_PACKAGE" \
     exit 1
 fi
 
+if "$BUILD_PACKAGE" \
+    --executable "$TEST_ROOT/wokcore" \
+    --repository-root "$REPOSITORY_ROOT" \
+    --output-directory "$FIRST_OUTPUT" \
+    --version 1.2.3 \
+    --target x86_64-unknown-linux-musl; then
+    printf 'unsupported release target was accepted\n' >&2
+    exit 1
+fi
+
+cp "$TEST_ROOT/wokcore" "$TEST_ROOT/not-wokcore"
+if "$BUILD_PACKAGE" \
+    --executable "$TEST_ROOT/not-wokcore" \
+    --repository-root "$REPOSITORY_ROOT" \
+    --output-directory "$FIRST_OUTPUT" \
+    --version 1.2.3 \
+    --target x86_64-unknown-linux-gnu; then
+    printf 'incorrect Unix executable name was accepted\n' >&2
+    exit 1
+fi
+
+ln -s "$TEST_ROOT/wokcore" "$TEST_ROOT/wokcore-link"
+if [[ -L "$TEST_ROOT/wokcore-link" ]]; then
+    if "$BUILD_PACKAGE" \
+        --executable "$TEST_ROOT/wokcore-link" \
+        --repository-root "$REPOSITORY_ROOT" \
+        --output-directory "$FIRST_OUTPUT" \
+        --version 1.2.3 \
+        --target x86_64-unknown-linux-gnu; then
+        printf 'symbolic release executable was accepted\n' >&2
+        exit 1
+    fi
+fi
+
+mv "$REPOSITORY_ROOT/NOTICE.md" "$TEST_ROOT/NOTICE.md.real"
+ln -s "$TEST_ROOT/NOTICE.md.real" "$REPOSITORY_ROOT/NOTICE.md"
+if [[ -L "$REPOSITORY_ROOT/NOTICE.md" ]]; then
+    if "$BUILD_PACKAGE" \
+        --executable "$TEST_ROOT/wokcore" \
+        --repository-root "$REPOSITORY_ROOT" \
+        --output-directory "$FIRST_OUTPUT" \
+        --version 1.2.3 \
+        --target x86_64-unknown-linux-gnu; then
+        printf 'symbolic release document was accepted\n' >&2
+        exit 1
+    fi
+fi
+
 printf 'release package shell tests passed\n'

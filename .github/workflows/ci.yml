@@ -145,6 +145,17 @@ jobs:
         with:
           toolchain: 1.97.1
           target: ${{ matrix.target }}
+      - name: Install Linux package tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes rpm
+      - name: Test Linux distribution assets
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: bash tests/release/build-linux-assets.tests.sh
+      - name: Test macOS distribution assets
+        if: runner.os == 'macOS'
+        run: bash tests/release/build-macos-assets.tests.sh
       - name: Check target
         run: cargo check --workspace --all-features --locked --target ${{ matrix.target }}
       - name: Resolve package version
@@ -201,11 +212,41 @@ jobs:
             --output-directory "${{ runner.temp }}/wokcore-release" \
             --version "${{ steps.version.outputs.version }}" \
             --target "${{ matrix.target }}"
+      - name: Build friendly Linux distribution assets
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          bash tests/release/build-linux-assets.sh \
+            --technical-archive "${{ runner.temp }}/wokcore-release/wokcore-v${{ steps.version.outputs.version }}-${{ matrix.target }}.tar.gz" \
+            --executable "${{ github.workspace }}/target/${{ matrix.target }}/release/wokcore" \
+            --repository-root "${{ github.workspace }}" \
+            --output-directory "${{ runner.temp }}/wokcore-release" \
+            --version "${{ steps.version.outputs.version }}" \
+            --target "${{ matrix.target }}"
+      - name: Build friendly macOS distribution assets
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          bash tests/release/build-macos-assets.sh \
+            --technical-archive "${{ runner.temp }}/wokcore-release/wokcore-v${{ steps.version.outputs.version }}-${{ matrix.target }}.tar.gz" \
+            --executable "${{ github.workspace }}/target/${{ matrix.target }}/release/wokcore" \
+            --repository-root "${{ github.workspace }}" \
+            --output-directory "${{ runner.temp }}/wokcore-release" \
+            --version "${{ steps.version.outputs.version }}" \
+            --target "${{ matrix.target }}"
       - name: Upload deterministic CI package
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ci-wokcore-package-${{ matrix.target }}
           path: ${{ runner.temp }}/wokcore-release/wokcore-v${{ steps.version.outputs.version }}-${{ matrix.target }}.${{ matrix.extension }}
+          if-no-files-found: error
+          retention-days: 7
+      - name: Upload friendly Unix distribution assets
+        if: runner.os != 'Windows'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: wokcore-${{ matrix.target }}
+          path: ${{ runner.temp }}/wokcore-release/WokCore-v*
           if-no-files-found: error
           retention-days: 7
 
@@ -216,12 +257,16 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
-      - name: Install Minisign
+      - name: Install release contract tools
         run: |
           sudo apt-get update
-          sudo apt-get install --yes minisign
+          sudo apt-get install --yes minisign rpm zip unzip
       - name: Test deterministic release packages
         run: bash tests/release/build-package.tests.sh
+      - name: Test Linux distribution assets
+        run: bash tests/release/build-linux-assets.tests.sh
+      - name: Test macOS distribution assets
+        run: bash tests/release/build-macos-assets.tests.sh
       - name: Test release manifest and Windows package contracts
         shell: pwsh
         run: pwsh tests/release/verify-manifest.tests.ps1
