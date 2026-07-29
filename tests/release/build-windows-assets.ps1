@@ -185,6 +185,56 @@ function Get-MsiInstallDirectory {
     }
 }
 
+function Get-MsiFileRows {
+    param(
+        [Parameter(Mandatory)]
+        [string] $Path
+    )
+
+    $installer = $null
+    $database = $null
+    $view = $null
+    $record = $null
+    try {
+        $installer = New-Object -ComObject WindowsInstaller.Installer
+        $database = $installer.OpenDatabase($Path, 0)
+        $view = $database.OpenView(
+            "SELECT ``File``.``File``, ``File``.``FileName``, " +
+            "``Component``.``Directory_`` " +
+            "FROM ``File``, ``Component`` " +
+            "WHERE ``File``.``Component_`` = ``Component``.``Component``"
+        )
+        [void] $view.Execute()
+        while ($null -ne ($record = $view.Fetch())) {
+            $encodedName = [string] $record.StringData(2)
+            $separator = $encodedName.IndexOf(
+                "|",
+                [StringComparison]::Ordinal
+            )
+            $targetName = if ($separator -ge 0) {
+                $encodedName.Substring($separator + 1)
+            } else {
+                $encodedName
+            }
+            [pscustomobject]@{
+                Id = [string] $record.StringData(1)
+                TargetName = $targetName
+                Directory = [string] $record.StringData(3)
+            }
+            [void] [Runtime.InteropServices.Marshal]::FinalReleaseComObject(
+                $record
+            )
+            $record = $null
+        }
+    } finally {
+        foreach ($item in @($record, $view, $database, $installer)) {
+            if ($null -ne $item -and [Runtime.InteropServices.Marshal]::IsComObject($item)) {
+                [void] [Runtime.InteropServices.Marshal]::FinalReleaseComObject($item)
+            }
+        }
+    }
+}
+
 if ($Version -cnotmatch "^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$") {
     throw "Windows MSI version must be canonical x.y.z."
 }
@@ -336,6 +386,30 @@ try {
     ) {
         throw "MSI does not target ProgramFiles64Folder\WokCore."
     }
+    $fileRows = @(Get-MsiFileRows -Path $temporaryMsi)
+    $actualFileContracts = @(
+        $fileRows |
+            ForEach-Object {
+                "$($_.Id)|$($_.TargetName)|$($_.Directory)"
+            } |
+            Sort-Object -CaseSensitive
+    )
+    $expectedFileContracts = @(
+        "ApacheLicense|LICENSE-APACHE|INSTALLFOLDER",
+        "MitLicense|LICENSE-MIT|INSTALLFOLDER",
+        "Notice|NOTICE.md|INSTALLFOLDER",
+        "Readme|README.md|INSTALLFOLDER",
+        "WokCoreExe|wokcore.exe|INSTALLFOLDER"
+    ) | Sort-Object -CaseSensitive
+    if (
+        $actualFileContracts.Count -ne $expectedFileContracts.Count -or
+        (Compare-Object `
+            $expectedFileContracts `
+            $actualFileContracts `
+            -CaseSensitive)
+    ) {
+        throw "MSI File table must contain exactly the five WokCore files in INSTALLFOLDER."
+    }
 
     [IO.Directory]::CreateDirectory($extractRoot) | Out-Null
     $process = Start-Process msiexec.exe `
@@ -382,6 +456,31 @@ try {
         (Compare-Object $expectedNames $actualNames -CaseSensitive)
     ) {
         throw "MSI payload must contain exactly wokcore.exe and four documents."
+    }
+    $expectedPayloads = @(
+        [pscustomobject]@{
+            Name = "wokcore.exe"
+            Source = $ExecutablePath
+        }
+    ) + @(
+        $documents | ForEach-Object {
+            [pscustomobject]@{
+                Name = $_.Name
+                Source = $_.Path
+            }
+        }
+    )
+    foreach ($payload in $expectedPayloads) {
+        $sourceBytes = [IO.File]::ReadAllBytes($payload.Source)
+        $installedBytes = [IO.File]::ReadAllBytes(
+            (Join-Path $installDirectory.FullName $payload.Name)
+        )
+        if (-not [Linq.Enumerable]::SequenceEqual(
+            $sourceBytes,
+            $installedBytes
+        )) {
+            throw "MSI payload bytes differ for $($payload.Name)."
+        }
     }
 
     foreach ($destination in @($friendlyArchive, $msiPath)) {

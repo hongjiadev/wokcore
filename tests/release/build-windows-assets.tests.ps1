@@ -86,6 +86,50 @@ function Get-MsiInstallDirectory {
     }
 }
 
+function Get-MsiFileContracts {
+    param(
+        [Parameter(Mandatory)]
+        [string] $Path
+    )
+
+    $installer = $null
+    $database = $null
+    $view = $null
+    $record = $null
+    try {
+        $installer = New-Object -ComObject WindowsInstaller.Installer
+        $database = $installer.OpenDatabase($Path, 0)
+        $view = $database.OpenView(
+            "SELECT ``File``.``File``, ``File``.``FileName``, " +
+            "``Component``.``Directory_`` " +
+            "FROM ``File``, ``Component`` " +
+            "WHERE ``File``.``Component_`` = ``Component``.``Component``"
+        )
+        [void] $view.Execute()
+        while ($null -ne ($record = $view.Fetch())) {
+            $fileName = [string] $record.StringData(2)
+            if ($fileName.Contains("|")) {
+                $fileName = $fileName.Substring($fileName.IndexOf("|") + 1)
+            }
+            [pscustomobject]@{
+                Id = [string] $record.StringData(1)
+                Name = $fileName
+                Directory = [string] $record.StringData(3)
+            }
+            [void] [Runtime.InteropServices.Marshal]::FinalReleaseComObject(
+                $record
+            )
+            $record = $null
+        }
+    } finally {
+        foreach ($item in @($record, $view, $database, $installer)) {
+            if ($null -ne $item -and [Runtime.InteropServices.Marshal]::IsComObject($item)) {
+                [void] [Runtime.InteropServices.Marshal]::FinalReleaseComObject($item)
+            }
+        }
+    }
+}
+
 function Expand-Msi {
     param(
         [Parameter(Mandatory)]
@@ -225,6 +269,29 @@ try {
         ) {
             throw "MSI does not target ProgramFiles64Folder\WokCore."
         }
+        $actualFileContracts = @(
+            Get-MsiFileContracts -Path $msi |
+                ForEach-Object {
+                    "$($_.Id)|$($_.Name)|$($_.Directory)"
+                } |
+                Sort-Object -CaseSensitive
+        )
+        $expectedFileContracts = @(
+            "ApacheLicense|LICENSE-APACHE|INSTALLFOLDER",
+            "MitLicense|LICENSE-MIT|INSTALLFOLDER",
+            "Notice|NOTICE.md|INSTALLFOLDER",
+            "Readme|README.md|INSTALLFOLDER",
+            "WokCoreExe|wokcore.exe|INSTALLFOLDER"
+        ) | Sort-Object -CaseSensitive
+        if (
+            $actualFileContracts.Count -ne $expectedFileContracts.Count -or
+            (Compare-Object `
+                $expectedFileContracts `
+                $actualFileContracts `
+                -CaseSensitive)
+        ) {
+            throw "MSI database file inventory is not exact."
+        }
 
         $extract = Join-Path $testRoot (
             "test-extract-" + $contract.PublicArchitecture
@@ -265,6 +332,27 @@ try {
         ) {
             throw "MSI payload is not exactly wokcore.exe and four documents."
         }
+        $expectedPayloadSources = @{
+            "wokcore.exe" = $fixtureExecutable
+            "LICENSE-APACHE" = Join-Path $fixtureRepository "LICENSE-APACHE"
+            "LICENSE-MIT" = Join-Path $fixtureRepository "LICENSE-MIT"
+            "NOTICE.md" = Join-Path $fixtureRepository "NOTICE.md"
+            "README.md" = Join-Path $fixtureRepository "README.md"
+        }
+        foreach ($name in $expectedPayloadSources.Keys) {
+            $expectedBytes = [IO.File]::ReadAllBytes(
+                $expectedPayloadSources[$name]
+            )
+            $actualBytes = [IO.File]::ReadAllBytes(
+                (Join-Path $installDirectory.FullName $name)
+            )
+            if (-not [Linq.Enumerable]::SequenceEqual(
+                $expectedBytes,
+                $actualBytes
+            )) {
+                throw "MSI payload bytes differ for $name."
+            }
+        }
     }
 
     $armDist = Join-Path $testRoot "arm64"
@@ -279,6 +367,92 @@ try {
         Version = "1.2.3"
         Target = "aarch64-pc-windows-msvc"
     }
+
+    $extraRepository = Join-Path $testRoot "repository-with-extra-msi-file"
+    Copy-Item `
+        -LiteralPath $fixtureRepository `
+        -Destination $extraRepository `
+        -Recurse
+    $extraWixSource = Join-Path $extraRepository "release\windows\WokCore.wxs"
+    $extraWix = [IO.File]::ReadAllText(
+        $extraWixSource,
+        [Text.Encoding]::UTF8
+    )
+    $extraWix = $extraWix.Replace(
+        '<Directory Id="INSTALLFOLDER" Name="WokCore" />',
+        @'
+<Directory Id="INSTALLFOLDER" Name="WokCore" />
+        <Directory Id="EXTRAFOLDER" Name="WokCoreExtra" />
+'@.Trim()
+    )
+    $extraWix = $extraWix.Replace(
+        '    <ComponentGroup Id="WokCoreFiles">',
+        @'
+    <DirectoryRef Id="EXTRAFOLDER">
+      <Component Id="ExtraComponent" Guid="*" Win64="yes">
+        <File Id="ExtraFile" Source="$(var.Readme)" Name="extra.txt" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+    <ComponentGroup Id="WokCoreFiles">
+'@.TrimEnd()
+    )
+    $extraWix = $extraWix.Replace(
+        '      <ComponentRef Id="ReadmeComponent" />',
+        @'
+      <ComponentRef Id="ReadmeComponent" />
+      <ComponentRef Id="ExtraComponent" />
+'@.TrimEnd()
+    )
+    [IO.File]::WriteAllText(
+        $extraWixSource,
+        $extraWix,
+        [Text.UTF8Encoding]::new($false)
+    )
+    $extraArguments = $common.Clone()
+    $extraArguments.RepositoryRoot = $extraRepository
+    $extraArguments.OutputDirectory = Join-Path $testRoot "rejected-extra-msi-file"
+    Assert-Fails `
+        -Message "Windows builder accepted an MSI file outside INSTALLFOLDER." `
+        -Operation {
+            & $buildWindowsAssets @extraArguments
+        }
+    if (
+        [IO.Directory]::Exists($extraArguments.OutputDirectory) -and
+        @(Get-ChildItem -LiteralPath $extraArguments.OutputDirectory -File).Count -ne 0
+    ) {
+        throw "Rejected MSI produced final Windows assets."
+    }
+
+    $wrongBytesRepository = Join-Path $testRoot "repository-with-wrong-msi-bytes"
+    Copy-Item `
+        -LiteralPath $fixtureRepository `
+        -Destination $wrongBytesRepository `
+        -Recurse
+    $wrongBytesWixSource = Join-Path (
+        $wrongBytesRepository
+    ) "release\windows\WokCore.wxs"
+    $wrongBytesWix = [IO.File]::ReadAllText(
+        $wrongBytesWixSource,
+        [Text.Encoding]::UTF8
+    ).Replace(
+        '<File Id="Readme" Source="$(var.Readme)" KeyPath="yes" />',
+        '<File Id="Readme" Source="$(var.Notice)" Name="README.md" KeyPath="yes" />'
+    )
+    [IO.File]::WriteAllText(
+        $wrongBytesWixSource,
+        $wrongBytesWix,
+        [Text.UTF8Encoding]::new($false)
+    )
+    $wrongBytesArguments = $common.Clone()
+    $wrongBytesArguments.RepositoryRoot = $wrongBytesRepository
+    $wrongBytesArguments.OutputDirectory = Join-Path (
+        $testRoot
+    ) "rejected-wrong-msi-bytes"
+    Assert-Fails `
+        -Message "Windows builder accepted an MSI with incorrect file bytes." `
+        -Operation {
+            & $buildWindowsAssets @wrongBytesArguments
+        }
 
     Assert-Fails `
         -Message "Windows builder accepted a non-canonical version." `
