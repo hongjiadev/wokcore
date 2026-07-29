@@ -6,6 +6,15 @@ Set-StrictMode -Version Latest
 # incorrectly ordered public or legacy payloads.
 Import-Module (Join-Path $PSScriptRoot "WokCore.ReleaseContract.psm1") -Force
 
+$repositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "../.."))
+$attributes = [IO.File]::ReadAllLines(
+    (Join-Path $repositoryRoot ".gitattributes"),
+    [Text.Encoding]::UTF8
+)
+if ($attributes -cnotcontains "/release/minisign.pub text eol=lf") {
+    throw "The production Minisign public key must retain LF line endings."
+}
+
 $contracts = @(Get-WokCoreTargetContracts -Version "0.1.1")
 $expectedContracts = @(
     [pscustomobject]@{
