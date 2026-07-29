@@ -46,6 +46,17 @@ EXPECTED_PACKAGE_FILES="/usr/bin/wokcore
 /usr/share/doc/wokcore/LICENSE-MIT
 /usr/share/doc/wokcore/NOTICE.md
 /usr/share/doc/wokcore/README.md"
+EXPECTED_DEB_NODE_INVENTORY="- ./usr/bin/wokcore
+- ./usr/share/doc/wokcore/LICENSE-APACHE
+- ./usr/share/doc/wokcore/LICENSE-MIT
+- ./usr/share/doc/wokcore/NOTICE.md
+- ./usr/share/doc/wokcore/README.md
+d ./
+d ./usr/
+d ./usr/bin/
+d ./usr/share/
+d ./usr/share/doc/
+d ./usr/share/doc/wokcore/"
 
 verify_package_tree() {
     local root="$1"
@@ -187,7 +198,7 @@ fi
 if path_has_symlink "$OUTPUT_DIRECTORY"; then
     fail "the output directory is missing or symbolic"
 fi
-for command in cmp cpio cp dpkg-deb find install rpm rpm2cpio rpmbuild sort stat; do
+for command in awk cmp cpio cp dpkg-deb find install rpm rpm2cpio rpmbuild sort stat tar; do
     command -v "$command" >/dev/null 2>&1 ||
         fail "$command is required"
 done
@@ -254,6 +265,16 @@ DEB_BUILT_ARCH="$(dpkg-deb --field "$DEB_PACKAGE" Architecture 2>/dev/null)" ||
     "$DEB_VERSION" == "$VERSION" &&
     "$DEB_BUILT_ARCH" == "$DEB_ARCH" ]] ||
     fail "built Debian package metadata is invalid"
+DEB_DATA_ARCHIVE="$WORK_ROOT/deb-data.tar"
+dpkg-deb --fsys-tarfile "$DEB_PACKAGE" >"$DEB_DATA_ARCHIVE" 2>/dev/null ||
+    fail "built Debian package payload is invalid"
+DEB_NODE_INVENTORY="$(
+    LC_ALL=C tar -tvf "$DEB_DATA_ARCHIVE" |
+        awk '{ print substr($1, 1, 1) " " $6 }' |
+        LC_ALL=C sort
+)" || fail "built Debian package node inventory is invalid"
+[[ "$DEB_NODE_INVENTORY" == "$EXPECTED_DEB_NODE_INVENTORY" ]] ||
+    fail "built Debian package node inventory is invalid"
 dpkg-deb --extract "$DEB_PACKAGE" "$DEB_VERIFY" 2>/dev/null ||
     fail "built Debian package payload is invalid"
 verify_package_tree "$DEB_VERIFY" Debian

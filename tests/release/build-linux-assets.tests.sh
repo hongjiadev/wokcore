@@ -92,11 +92,24 @@ expected_package_files="/usr/bin/wokcore
 /usr/share/doc/wokcore/LICENSE-MIT
 /usr/share/doc/wokcore/NOTICE.md
 /usr/share/doc/wokcore/README.md"
+expected_deb_archive_files="- /usr/bin/wokcore
+- /usr/share/doc/wokcore/LICENSE-APACHE
+- /usr/share/doc/wokcore/LICENSE-MIT
+- /usr/share/doc/wokcore/NOTICE.md
+- /usr/share/doc/wokcore/README.md"
+test "$(
+    dpkg-deb --contents "$DEB_PACKAGE" |
+        awk '$1 !~ /^d/ { print substr($1, 1, 1) " /" substr($6, 3) }' |
+        LC_ALL=C sort
+)" = "$expected_deb_archive_files"
 verify_package_tree() {
     local root="$1"
     test "$(
-        find "$root" -type f -printf '/%P\n' | LC_ALL=C sort
-    )" = "$expected_package_files"
+        find "$root" -mindepth 1 ! -type d -printf '%y /%P\n' |
+            LC_ALL=C sort
+    )" = "$(
+        printf '%s\n' "$expected_package_files" | sed 's|^|f |'
+    )"
     cmp "$TEST_ROOT/wokcore" "$root/usr/bin/wokcore"
     for name in LICENSE-APACHE LICENSE-MIT NOTICE.md README.md; do
         cmp "$FIXTURE_REPOSITORY/$name" \
@@ -284,6 +297,30 @@ if ! grep -Fqx \
     "$CORRUPT_DEB_ERROR"; then
     printf 'Linux asset builder returned the wrong corrupted Debian error\n' >&2
     cat "$CORRUPT_DEB_ERROR" >&2
+    exit 1
+fi
+
+EXTRA_DEB_NODE_ERROR="$TEST_ROOT/extra-deb-node-error"
+if env \
+    PATH="$CORRUPT_DPKG_DEB_DIRECTORY:$PATH" \
+    WOKCORE_REAL_DPKG_DEB="$REAL_DPKG_DEB" \
+    WOKCORE_DPKG_DEB_EXTRA_NODE=symlink \
+    "$BUILD_LINUX_ASSETS" \
+    --technical-archive "$TECHNICAL_ARCHIVE" \
+    --executable "$TEST_ROOT/wokcore" \
+    --repository-root "$FIXTURE_REPOSITORY" \
+    --output-directory "$TEST_ROOT/extra-deb-node-output" \
+    --version 1.2.3 \
+    --target "$TARGET" \
+    >/dev/null 2>"$EXTRA_DEB_NODE_ERROR"; then
+    printf 'Linux asset builder accepted an extra Debian symlink node\n' >&2
+    exit 1
+fi
+if ! grep -Fqx \
+    "wokcore Linux assets: built Debian package node inventory is invalid" \
+    "$EXTRA_DEB_NODE_ERROR"; then
+    printf 'Linux asset builder returned the wrong extra Debian node error\n' >&2
+    cat "$EXTRA_DEB_NODE_ERROR" >&2
     exit 1
 fi
 

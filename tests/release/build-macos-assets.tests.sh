@@ -36,6 +36,26 @@ done
 
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
+if [[ -n "${WOKCORE_EXPECT_DARWIN_SYSTEM_PREFIX:-}" ]]; then
+    SYSTEM_PREFIX="$WOKCORE_EXPECT_DARWIN_SYSTEM_PREFIX"
+    EXPECTED_PHYSICAL_PREFIX="/private${SYSTEM_PREFIX}"
+    [[ "$SYSTEM_PREFIX" == /var || "$SYSTEM_PREFIX" == /tmp ]] || {
+        printf 'Darwin system-prefix fixture received an invalid prefix\n' >&2
+        exit 1
+    }
+    [[ -L "$SYSTEM_PREFIX" ]] || {
+        printf 'Darwin system-prefix fixture requires a symbolic prefix\n' >&2
+        exit 1
+    }
+    [[ "$(cd "$SYSTEM_PREFIX" && pwd -P)" == "$EXPECTED_PHYSICAL_PREFIX" ]] || {
+        printf 'Darwin system-prefix fixture has the wrong physical prefix\n' >&2
+        exit 1
+    }
+    [[ "$TEST_ROOT" == "$SYSTEM_PREFIX"/* ]] || {
+        printf 'Darwin system-prefix fixture allocated under the wrong prefix\n' >&2
+        exit 1
+    }
+fi
 FIXTURE_REPOSITORY="$TEST_ROOT/repository"
 TECHNICAL_DIST="$TEST_ROOT/technical"
 DIST="$TEST_ROOT/dist"

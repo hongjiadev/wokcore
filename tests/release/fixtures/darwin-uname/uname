@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+if [[ "${1:-}" == "-s" ]]; then
+    printf 'Darwin\n'
+else
+    printf 'Darwin\n'
+fi

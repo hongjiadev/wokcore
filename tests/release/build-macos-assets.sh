@@ -13,10 +13,40 @@ VERSION=""
 VERSION_SET=false
 TARGET=""
 TARGET_SET=false
+DARWIN_VAR_SYMLINK_ALLOWED=false
+DARWIN_TMP_SYMLINK_ALLOWED=false
 
 fail() {
     printf 'wokcore macOS assets: %s\n' "$1" >&2
     exit 1
+}
+
+initialize_darwin_system_symlinks() {
+    local logical_path
+    local physical_path
+    local expected_path
+    [[ "$(uname -s)" == Darwin ]] || return 0
+    for logical_path in /var /tmp; do
+        [[ -L "$logical_path" ]] || continue
+        expected_path="/private$logical_path"
+        physical_path="$(
+            cd "$logical_path" 2>/dev/null &&
+                pwd -P
+        )" || continue
+        [[ "$physical_path" == "$expected_path" ]] || continue
+        case "$logical_path" in
+            /var) DARWIN_VAR_SYMLINK_ALLOWED=true ;;
+            /tmp) DARWIN_TMP_SYMLINK_ALLOWED=true ;;
+        esac
+    done
+}
+
+is_allowed_darwin_system_symlink() {
+    case "$1" in
+        /var) [[ "$DARWIN_VAR_SYMLINK_ALLOWED" == true ]] ;;
+        /tmp) [[ "$DARWIN_TMP_SYMLINK_ALLOWED" == true ]] ;;
+        *) return 1 ;;
+    esac
 }
 
 path_has_symlink() {
@@ -30,7 +60,10 @@ path_has_symlink() {
         candidate="${candidate%/}"
     done
     while true; do
-        [[ ! -L "$candidate" ]] || return 0
+        if [[ -L "$candidate" ]] &&
+            ! is_allowed_darwin_system_symlink "$candidate"; then
+            return 0
+        fi
         [[ "$candidate" != "/" ]] || return 1
         parent="${candidate%/*}"
         [[ -n "$parent" ]] || parent="/"
@@ -106,6 +139,7 @@ case "$TARGET" in
         ;;
 esac
 
+initialize_darwin_system_symlinks
 if path_has_symlink "$TECHNICAL_ARCHIVE"; then
     fail "the technical archive is missing or symbolic"
 fi
