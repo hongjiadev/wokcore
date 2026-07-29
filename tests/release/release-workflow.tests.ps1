@@ -2,19 +2,61 @@ $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
 $repositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "../.."))
+$cargoPath = Join-Path $repositoryRoot "Cargo.toml"
 $workflowPath = Join-Path $repositoryRoot ".github\workflows\release.yml"
 $ciPath = Join-Path $repositoryRoot ".github\workflows\ci.yml"
+$assembleBundlePath = Join-Path `
+    $repositoryRoot `
+    "tests\release\assemble-release-bundle.ps1"
 $schemaV1Path = Join-Path $repositoryRoot "release\manifest-v1.schema.json"
 $schemaV2Path = Join-Path $repositoryRoot "release\manifest-v2.schema.json"
-foreach ($path in @($workflowPath, $ciPath, $schemaV1Path, $schemaV2Path)) {
+foreach ($path in @(
+    $cargoPath,
+    $workflowPath,
+    $ciPath,
+    $assembleBundlePath,
+    $schemaV1Path,
+    $schemaV2Path
+)) {
     if (-not [IO.File]::Exists($path)) {
         throw "Release workflow input is missing: $path"
     }
 }
+$cargo = [IO.File]::ReadAllText($cargoPath, [Text.Encoding]::UTF8)
 $source = [IO.File]::ReadAllText($workflowPath, [Text.Encoding]::UTF8)
 $ciSource = [IO.File]::ReadAllText($ciPath, [Text.Encoding]::UTF8)
+$assembleBundleSource = [IO.File]::ReadAllText(
+    $assembleBundlePath,
+    [Text.Encoding]::UTF8
+)
 $schemaV1 = Get-Content -Raw -LiteralPath $schemaV1Path | ConvertFrom-Json
 $schemaV2 = Get-Content -Raw -LiteralPath $schemaV2Path | ConvertFrom-Json
+
+if ($cargo -notmatch '(?ms)\[workspace\.package\].*?version\s*=\s*"0\.1\.1"') {
+    throw "Workspace package version must be 0.1.1."
+}
+if (
+    $source -notmatch
+        '(?ms)\$tagVersion\s*=\s*\$env:GITHUB_REF_NAME\.Substring\(1\).*?' +
+        '\$tagVersion\s+-cne\s+\$version'
+) {
+    throw "Release tags must match the resolved workspace version."
+}
+if (
+    $source -notmatch
+        '(?ms)assemble-release-bundle\.ps1.*?' +
+        '-Version\s+"\$\{\{\s*steps\.version\.outputs\.version\s*\}\}"'
+) {
+    throw "Release assembly must receive the resolved workspace version."
+}
+if (
+    $assembleBundleSource -notmatch
+        '(?ms)foreach\s*\(\$schemaVersion\s+in\s+@\(1,\s*2\)\).*?' +
+        '&\s+\$writeManifest.*?-Version\s+\$Version.*?' +
+        '-SchemaVersion\s+\$schemaVersion'
+) {
+    throw "Manifest schemas 1 and 2 must receive the resolved version."
+}
 
 # These checks catch a release contract that omits a supported target, misses a
 # public or legacy payload, or leaks a Rust vendor segment into a public name.
