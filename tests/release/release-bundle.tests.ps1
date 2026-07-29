@@ -49,6 +49,23 @@ function Clear-TestSecretKey {
     [IO.File]::Delete($Path)
 }
 
+function New-TestDirectoryLink {
+    param(
+        [Parameter(Mandatory)][string] $Path,
+        [Parameter(Mandatory)][string] $Target
+    )
+
+    $itemType = if (
+        [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
+    ) {
+        "Junction"
+    } else {
+        "SymbolicLink"
+    }
+    New-Item -ItemType $itemType -Path $Path -Target $Target |
+        Out-Null
+}
+
 function New-TestZipPackage {
     param(
         [Parameter(Mandatory)][string] $Path,
@@ -364,11 +381,9 @@ try {
         -SigningKeyId $keyId `
         -FailureMessage "The assembler accepted an extra intermediate file."
 
-    New-Item `
-        -ItemType Junction `
+    New-TestDirectoryLink `
         -Path $intermediateJunction `
-        -Target $intermediate |
-        Out-Null
+        -Target $intermediate
     Assert-AssemblerFailsClean `
         -IntermediateDirectory $intermediateJunction `
         -ArtifactDirectory (Join-Path $testRoot "reparse artifact") `
@@ -376,8 +391,7 @@ try {
         -FailureMessage "The assembler accepted a reparse-point input path."
     [IO.Directory]::Delete($intermediateJunction)
 
-    New-Item -ItemType Junction -Path $junction -Target $bundle |
-        Out-Null
+    New-TestDirectoryLink -Path $junction -Target $bundle
     $signerRejectedJunction = $false
     try {
         & $signer `
@@ -667,8 +681,7 @@ try {
         -PublicKeyPath $public `
         -MinisignPath $MinisignPath
 
-    New-Item -ItemType Junction -Path $junction -Target $bundle |
-        Out-Null
+    New-TestDirectoryLink -Path $junction -Target $bundle
     Assert-VerifierFails `
         -ArtifactDirectory $junction `
         -FailureMessage "The verifier accepted a reparse-point bundle ancestor."

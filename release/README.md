@@ -16,8 +16,9 @@ Replace `<VERSION>` with the release version without the leading `v`.
 ## Minisign verification
 
 Every release payload, update manifest, and `SHA256SUMS` is signed with
-Minisign. Download the asset, its adjacent `.minisig` file, and
-`WokCore-Minisign.pub`, then verify the signature:
+Minisign. To verify one asset, download only that asset, its adjacent
+`.minisig` file, and `WokCore-Minisign.pub`, then verify its Minisign
+signature:
 
 ```bash
 minisign -Vm <ASSET> \
@@ -25,14 +26,24 @@ minisign -Vm <ASSET> \
   -p WokCore-Minisign.pub
 ```
 
-After verifying `SHA256SUMS` itself, verify the downloaded payload hashes:
+To verify the complete release, download all 45 assets into one directory
+before running `sha256sum -c`. For example:
 
 ```bash
+gh release download <TAG> \
+  --repo <OWNER>/wokcore \
+  --dir wokcore-release
+cd wokcore-release
 minisign -Vm SHA256SUMS \
   -x SHA256SUMS.minisig \
   -p WokCore-Minisign.pub
 sha256sum -c SHA256SUMS
 ```
+
+`SHA256SUMS` names the exact 21 content files: 19 payloads and two update
+manifests. If you do not use `gh release download` to fetch all 45 assets,
+all 21 of those content files must still be present together for
+`sha256sum -c SHA256SUMS` to succeed.
 
 Treat the public key distributed with the bundle as a convenience copy.
 Pin the trusted key from this repository or another authenticated channel
