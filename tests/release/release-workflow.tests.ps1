@@ -32,8 +32,8 @@ $assembleBundleSource = [IO.File]::ReadAllText(
 $schemaV1 = Get-Content -Raw -LiteralPath $schemaV1Path | ConvertFrom-Json
 $schemaV2 = Get-Content -Raw -LiteralPath $schemaV2Path | ConvertFrom-Json
 
-if ($cargo -notmatch '(?ms)\[workspace\.package\].*?version\s*=\s*"0\.1\.3"') {
-    throw "Workspace package version must be 0.1.3."
+if ($cargo -notmatch '(?ms)\[workspace\.package\].*?version\s*=\s*"0\.1\.4"') {
+    throw "Workspace package version must be 0.1.4."
 }
 if (
     $source -notmatch
@@ -61,9 +61,9 @@ if (
 # These checks catch a release contract that omits a supported target, misses a
 # public or legacy payload, or leaks a Rust vendor segment into a public name.
 Import-Module (Join-Path $PSScriptRoot "WokCore.ReleaseContract.psm1") -Force
-$contracts = @(Get-WokCoreTargetContracts -Version "0.1.3")
+$contracts = @(Get-WokCoreTargetContracts -Version "0.1.4")
 if ($contracts.Count -ne 6) { throw "Expected six WokCore targets." }
-$payloads = @(Get-WokCorePayloadNames -Version "0.1.3" -IncludeLegacyV1)
+$payloads = @(Get-WokCorePayloadNames -Version "0.1.4" -IncludeLegacyV1)
 if ($payloads.Count -ne 19) { throw "Expected 19 WokCore payloads." }
 $publicNames = $payloads | Where-Object { $_ -clike "WokCore-*" }
 if ($publicNames -match "unknown") { throw "Public names expose a Rust vendor segment." }
