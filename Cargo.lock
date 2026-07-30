@@ -2986,7 +2986,7 @@ dependencies = [
 
 [[package]]
 name = "wokcore"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "axum",
@@ -3020,7 +3020,7 @@ dependencies = [
 
 [[package]]
 name = "wokcore-core"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "serde",
  "sha2",
@@ -3031,7 +3031,7 @@ dependencies = [
 
 [[package]]
 name = "wokcore-diagnostics"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "serde",
  "serde_json",
@@ -3045,7 +3045,7 @@ dependencies = [
 
 [[package]]
 name = "wokcore-engine"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3067,7 +3067,7 @@ dependencies = [
 
 [[package]]
 name = "wokcore-loadgen"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "clap",
  "serde_json",
@@ -3077,7 +3077,7 @@ dependencies = [
 
 [[package]]
 name = "wokcore-platform"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "base64",
  "flate2",
@@ -3098,7 +3098,7 @@ dependencies = [
 
 [[package]]
 name = "wokcore-protocols"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "base64",
  "bytes",
@@ -3112,7 +3112,7 @@ dependencies = [
 
 [[package]]
 name = "wokcore-provider-sim"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "clap",
  "serde_json",
@@ -3122,7 +3122,7 @@ dependencies = [
 
 [[package]]
 name = "wokcore-provider-sim-core"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "axum",
  "bytes",
@@ -3138,7 +3138,7 @@ dependencies = [
 
 [[package]]
 name = "wokcore-server"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3175,7 +3175,7 @@ dependencies = [
 
 [[package]]
 name = "wokcore-sessions"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "rusqlite",
  "serde",
@@ -3190,7 +3190,7 @@ dependencies = [
 
 [[package]]
 name = "wokcore-storage"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "fs4",
