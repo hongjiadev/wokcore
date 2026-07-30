@@ -314,7 +314,7 @@ RPM_BUILT_ARCH="$(rpm -qp --queryformat '%{ARCH}' "$RPM_PACKAGE" 2>/dev/null)" |
     "$RPM_VERSION" == "$VERSION" &&
     "$RPM_BUILT_ARCH" == "$RPM_ARCH" ]] ||
     fail "built RPM package metadata is invalid"
-RPM_FILES="$(rpm -qpl "$RPM_PACKAGE" 2>/dev/null)" ||
+RPM_FILES="$(rpm -qpl "$RPM_PACKAGE" 2>/dev/null | LC_ALL=C sort)" ||
     fail "built RPM package file list is invalid"
 [[ "$RPM_FILES" == "$EXPECTED_PACKAGE_FILES" ]] ||
     fail "built RPM package file list is invalid"

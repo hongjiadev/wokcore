@@ -74,7 +74,8 @@ function Get-WixTool {
         [string] $Name
     )
 
-    $command = Get-Command $Name -CommandType Application -ErrorAction SilentlyContinue
+    $command = @(Get-Command $Name -CommandType Application -ErrorAction SilentlyContinue) |
+        Select-Object -First 1
     if ($null -eq $command) {
         throw "WiX 3.14.1 $Name is required."
     }

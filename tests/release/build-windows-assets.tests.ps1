@@ -159,6 +159,10 @@ foreach ($path in @($buildPackage, $buildWindowsAssets, $wixSource)) {
         throw "Missing Windows asset implementation: $path"
     }
 }
+$builderSource = [IO.File]::ReadAllText($buildWindowsAssets)
+if ($builderSource -notmatch '(?ms)\$command\s*=\s*@\(Get-Command\s+\$Name.*?\)\s*\|\s*Select-Object\s+-First\s+1') {
+    throw "Windows WiX lookup must select the PATH-preferred command before reading Source."
+}
 foreach ($commandName in @("candle.exe", "light.exe", "msiexec.exe")) {
     if ($null -eq (Get-Command $commandName -ErrorAction SilentlyContinue)) {
         throw "Windows asset tests require $commandName."

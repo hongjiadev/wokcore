@@ -10,6 +10,11 @@ CORRUPT_RPMBUILD_DIRECTORY="$SCRIPT_DIRECTORY/fixtures/corrupt-rpmbuild"
     printf 'missing Linux asset builder: %s\n' "$BUILD_LINUX_ASSETS" >&2
     exit 1
 }
+if ! grep -Fq 'rpm -qpl "$RPM_PACKAGE" 2>/dev/null | LC_ALL=C sort' \
+    "$BUILD_LINUX_ASSETS"; then
+    printf 'RPM file-list validation must normalize rpm query order\n' >&2
+    exit 1
+fi
 if [[ "$#" -ne 2 ]]; then
     printf 'usage: %s TARGET PUBLIC_ARCH\n' "$0" >&2
     exit 2
@@ -126,7 +131,7 @@ mkdir "$DEB_EXTRACT"
 dpkg-deb --extract "$DEB_PACKAGE" "$DEB_EXTRACT"
 verify_package_tree "$DEB_EXTRACT"
 
-test "$(rpm -qpl "$RPM_PACKAGE")" = "$expected_package_files"
+test "$(rpm -qpl "$RPM_PACKAGE" | LC_ALL=C sort)" = "$expected_package_files"
 RPM_EXTRACT="$TEST_ROOT/rpm-extract"
 mkdir "$RPM_EXTRACT"
 rpm2cpio "$RPM_PACKAGE" | (cd "$RPM_EXTRACT" && cpio -idmu --quiet)
