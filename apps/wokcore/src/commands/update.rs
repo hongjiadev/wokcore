@@ -2838,7 +2838,11 @@ mod tests {
         );
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(output.stdout()).unwrap(),
-            json!({"code": "installed", "from": "0.1.1", "to": "1.2.3"})
+            json!({
+                "code": "installed",
+                "from": env!("CARGO_PKG_VERSION"),
+                "to": "1.2.3"
+            })
         );
         assert_eq!(output.stderr(), "");
         assert_eq!(fs::read(&target).unwrap(), b"new executable");
