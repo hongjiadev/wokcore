@@ -104,7 +104,6 @@ enum VerificationFailure {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum InstallFailure {
     Failed,
-    #[allow(dead_code)]
     RecoveryRequired,
     OperationInProgress,
 }
@@ -115,20 +114,40 @@ impl From<()> for InstallFailure {
     }
 }
 
+fn rollback_install_failure(error: &UpdateError) -> InstallFailure {
+    match error {
+        UpdateError::RollbackDurabilityFailed | UpdateError::RecoveryRequired => {
+            InstallFailure::RecoveryRequired
+        }
+        _ => InstallFailure::Failed,
+    }
+}
+
 #[async_trait]
 trait UpdateLifecycle: Send + Sync {
-    async fn prepare(&self) -> Result<PreparedLifecycle, ()>;
+    async fn prepare(
+        &self,
+        reporter: &mut ProgressReporter,
+        output: &mut dyn CommandOutput,
+        versions: &ProgressDetails,
+    ) -> Result<PreparedLifecycle, ()>;
 
     async fn verify_installed(
         &self,
         version: &Version,
         original: OriginalServiceState,
+        reporter: &mut ProgressReporter,
+        output: &mut dyn CommandOutput,
+        versions: &ProgressDetails,
     ) -> Result<(), VerificationFailure>;
 
     async fn restore_previous(
         &self,
         version: &Version,
         original: OriginalServiceState,
+        reporter: &mut ProgressReporter,
+        output: &mut dyn CommandOutput,
+        versions: &ProgressDetails,
     ) -> Result<(), ()>;
 }
 
@@ -472,7 +491,15 @@ impl<'a> ServiceUpdateLifecycle<'a> {
         &self,
         version: &Version,
         original: OriginalServiceState,
+        mut progress: Option<(
+            &mut ProgressReporter,
+            &mut dyn CommandOutput,
+            &ProgressDetails,
+        )>,
     ) -> Result<(), VerificationFailure> {
+        if let Some((reporter, output, versions)) = progress.as_mut() {
+            reporter.running(*output, ProgressEvent::Starting((*versions).clone()));
+        }
         let child = self
             .dependencies
             .update_process
@@ -491,6 +518,12 @@ impl<'a> ServiceUpdateLifecycle<'a> {
                 });
             }
         };
+        if let Some((reporter, output, versions)) = progress.as_mut() {
+            reporter.running(
+                *output,
+                ProgressEvent::VerifyingRuntime((*versions).clone()),
+            );
+        }
         let record = match self.wait_for_ready(pid, version).await {
             Ok(record) => record,
             Err(()) => {
@@ -532,7 +565,13 @@ impl<'a> ServiceUpdateLifecycle<'a> {
 
 #[async_trait]
 impl UpdateLifecycle for ServiceUpdateLifecycle<'_> {
-    async fn prepare(&self) -> Result<PreparedLifecycle, ()> {
+    async fn prepare(
+        &self,
+        reporter: &mut ProgressReporter,
+        output: &mut dyn CommandOutput,
+        versions: &ProgressDetails,
+    ) -> Result<PreparedLifecycle, ()> {
+        reporter.running(output, ProgressEvent::PreparingService(versions.clone()));
         let client = match ControlClient::connect(self.dependencies).await {
             Ok(client) => client,
             Err(ControlClientError::NotRunning) => {
@@ -564,6 +603,7 @@ impl UpdateLifecycle for ServiceUpdateLifecycle<'_> {
             original.clone(),
             self.child_cleanup.clone(),
         );
+        reporter.running(output, ProgressEvent::Draining(versions.clone()));
         let drained = match request_drain(&client, &management).await {
             Ok(drained) => drained,
             Err(_) => {
@@ -571,6 +611,13 @@ impl UpdateLifecycle for ServiceUpdateLifecycle<'_> {
                 return Err(());
             }
         };
+        reporter.running(
+            output,
+            ProgressEvent::Draining(ProgressDetails {
+                active_requests: Some(drained.active_requests),
+                ..versions.clone()
+            }),
+        );
         match classify_drain_response(&drained) {
             Ok(LifecyclePreparation::ActiveRequestsRemain { count }) => {
                 recovery.recover().await?;
@@ -585,6 +632,7 @@ impl UpdateLifecycle for ServiceUpdateLifecycle<'_> {
             }
         }
         recovery.mark_stop_requested();
+        reporter.running(output, ProgressEvent::Stopping(versions.clone()));
         let stopped = match request_stop(&client, &management).await {
             Ok(stopped) => stopped,
             Err(_) => {
@@ -592,6 +640,13 @@ impl UpdateLifecycle for ServiceUpdateLifecycle<'_> {
                 return Err(());
             }
         };
+        reporter.running(
+            output,
+            ProgressEvent::Draining(ProgressDetails {
+                active_requests: Some(stopped.active_requests),
+                ..versions.clone()
+            }),
+        );
         if stopped.phase != "stopping" || stopped.active_requests != 0 {
             recovery.recover().await?;
             return Err(());
@@ -610,21 +665,32 @@ impl UpdateLifecycle for ServiceUpdateLifecycle<'_> {
         &self,
         version: &Version,
         original: OriginalServiceState,
+        reporter: &mut ProgressReporter,
+        output: &mut dyn CommandOutput,
+        versions: &ProgressDetails,
     ) -> Result<(), VerificationFailure> {
-        self.spawn_and_verify(version, original).await
+        self.spawn_and_verify(version, original, Some((reporter, output, versions)))
+            .await
     }
 
     async fn restore_previous(
         &self,
         version: &Version,
         original: OriginalServiceState,
+        reporter: &mut ProgressReporter,
+        output: &mut dyn CommandOutput,
+        versions: &ProgressDetails,
     ) -> Result<(), ()> {
         if original == OriginalServiceState::Stopped {
             return Ok(());
         }
-        self.spawn_and_verify(version, OriginalServiceState::Running)
-            .await
-            .map_err(|_| ())
+        self.spawn_and_verify(
+            version,
+            OriginalServiceState::Running,
+            Some((reporter, output, versions)),
+        )
+        .await
+        .map_err(|_| ())
     }
 }
 
@@ -657,6 +723,7 @@ async fn recover_interrupted_stop(
                     .spawn_and_verify(
                         &Version::parse(env!("CARGO_PKG_VERSION")).map_err(|_| ())?,
                         OriginalServiceState::Running,
+                        None,
                     )
                     .await
                     .map_err(|_| ());
@@ -676,6 +743,7 @@ async fn recover_interrupted_stop(
         .spawn_and_verify(
             &Version::parse(env!("CARGO_PKG_VERSION")).map_err(|_| ())?,
             OriginalServiceState::Running,
+            None,
         )
         .await
         .map_err(|_| ())
@@ -986,7 +1054,6 @@ async fn install_candidate(
         &versions,
     )
     .await
-    .map_err(InstallFailure::from)
 }
 
 async fn check(source: &UpdateSource) -> Result<UpdateDecision, ()> {
@@ -1319,15 +1386,19 @@ async fn install_verified(
     reporter: &mut ProgressReporter,
     output: &mut dyn CommandOutput,
     versions: &ProgressDetails,
-) -> Result<InstallOutcome, ()> {
+) -> Result<InstallOutcome, InstallFailure> {
     reporter.running(output, ProgressEvent::Verifying(versions.clone()));
-    verify_artifact_file(archive, artifact).map_err(|_| ())?;
-    let prepared = prepare_install_file(archive, artifact, target).map_err(|_| ())?;
-    let preparation = lifecycle.prepare().await?;
+    verify_artifact_file(archive, artifact).map_err(|_| InstallFailure::Failed)?;
+    let prepared =
+        prepare_install_file(archive, artifact, target).map_err(|_| InstallFailure::Failed)?;
+    let preparation = lifecycle
+        .prepare(reporter, output, versions)
+        .await
+        .map_err(|_| InstallFailure::Failed)?;
     let original = match preparation.outcome() {
         LifecyclePreparation::Ready(original) => original,
         LifecyclePreparation::ActiveRequestsRemain { count } => {
-            preparation.disarm()?;
+            preparation.disarm().map_err(|_| InstallFailure::Failed)?;
             return Ok(InstallOutcome::ActiveRequestsRemain { count });
         }
     };
@@ -1336,24 +1407,35 @@ async fn install_verified(
     let transaction = match prepared.begin() {
         Ok(transaction) => transaction,
         Err(UpdateError::RecoveryRequired) => {
-            preparation.disarm()?;
-            return Err(());
+            preparation.disarm().map_err(|_| InstallFailure::Failed)?;
+            return Err(InstallFailure::RecoveryRequired);
         }
         Err(_) => {
             lifecycle
-                .restore_previous(current_version, original)
-                .await?;
-            preparation.disarm()?;
-            return Err(());
+                .restore_previous(current_version, original, reporter, output, versions)
+                .await
+                .map_err(|_| InstallFailure::RecoveryRequired)?;
+            preparation.disarm().map_err(|_| InstallFailure::Failed)?;
+            return Err(InstallFailure::Failed);
         }
     };
-    match lifecycle.verify_installed(next_version, original).await {
+    match lifecycle
+        .verify_installed(next_version, original, reporter, output, versions)
+        .await
+    {
         Ok(()) => {
-            if transaction.commit().is_err() {
-                preparation.disarm()?;
-                return Err(());
+            match transaction.commit() {
+                Ok(()) => {}
+                Err(UpdateError::RecoveryRequired) => {
+                    preparation.disarm().map_err(|_| InstallFailure::Failed)?;
+                    return Err(InstallFailure::RecoveryRequired);
+                }
+                Err(_) => {
+                    preparation.disarm().map_err(|_| InstallFailure::Failed)?;
+                    return Err(InstallFailure::Failed);
+                }
             }
-            preparation.disarm()?;
+            preparation.disarm().map_err(|_| InstallFailure::Failed)?;
             return Ok(InstallOutcome::Installed {
                 from: current_version.clone(),
                 to: next_version.clone(),
@@ -1361,32 +1443,35 @@ async fn install_verified(
         }
         Err(VerificationFailure::RecoveryRequired) => {
             transaction.preserve_for_recovery();
-            preparation.disarm()?;
-            return Err(());
+            preparation.disarm().map_err(|_| InstallFailure::Failed)?;
+            return Err(InstallFailure::RecoveryRequired);
         }
         Err(VerificationFailure::SafeToRollback) => {}
     }
 
+    reporter.running(output, ProgressEvent::RollingBack(versions.clone()));
     match transaction.rollback() {
         Ok(()) => {
             lifecycle
-                .restore_previous(current_version, original)
-                .await?;
-            preparation.disarm()?;
+                .restore_previous(current_version, original, reporter, output, versions)
+                .await
+                .map_err(|_| InstallFailure::RecoveryRequired)?;
+            preparation.disarm().map_err(|_| InstallFailure::Failed)?;
             Ok(InstallOutcome::RolledBack {
                 attempted: next_version.clone(),
             })
         }
-        Err(UpdateError::RollbackDurabilityFailed) => {
+        Err(error @ UpdateError::RollbackDurabilityFailed) => {
             lifecycle
-                .restore_previous(current_version, original)
-                .await?;
-            preparation.disarm()?;
-            Err(())
+                .restore_previous(current_version, original, reporter, output, versions)
+                .await
+                .map_err(|_| InstallFailure::RecoveryRequired)?;
+            preparation.disarm().map_err(|_| InstallFailure::Failed)?;
+            Err(rollback_install_failure(&error))
         }
-        Err(_) => {
-            preparation.disarm()?;
-            Err(())
+        Err(error) => {
+            preparation.disarm().map_err(|_| InstallFailure::Failed)?;
+            Err(rollback_install_failure(&error))
         }
     }
 }
@@ -1437,7 +1522,7 @@ mod tests {
     };
     use wokcore_platform::{
         AppPaths, DiscoveryRecord, DiscoveryStore, RuntimeLease,
-        update::{UpdateArtifact, UpdateDecision, current_target},
+        update::{UpdateArtifact, UpdateDecision, UpdateError, current_target},
     };
     use wokcore_server::auth::{EntropySource, TokenError};
     use wokcore_storage::{MemorySecretStore, SecretStore, StateStore};
@@ -1450,12 +1535,12 @@ mod tests {
         classify_drain_response, download_artifact, install_verified, matches_current_service,
         matches_expected_discovery, matches_expected_service, read_startup_discovery,
         recovered_old_service_matches, render_install_result, report_install_check_result,
-        run as run_update, update_client, validate_initial_update_url,
+        rollback_install_failure, run as run_update, update_client, validate_initial_update_url,
         validated_latest_release_redirect, validated_release_asset_redirect,
     };
     use crate::commands::stop::LifecycleResponse;
     use crate::{
-        BufferOutput, Clock, ExitCode, IdSource, ProcessIdentity, RunDependencies,
+        BufferOutput, Clock, CommandOutput, ExitCode, IdSource, ProcessIdentity, RunDependencies,
         RuntimeValueError, ShutdownSignal, UpdateChild, UpdateProcess, UpdateSource, cli::Update,
     };
 
@@ -1503,6 +1588,19 @@ mod tests {
                 );
             }
             previous_last = indices.last().copied();
+        }
+    }
+
+    fn assert_ordered_phases(events: &[Value], expected: &[&str]) {
+        let mut next_index = 0;
+        for phase in expected {
+            let Some(relative_index) = events[next_index..]
+                .iter()
+                .position(|event| event["phase"].as_str() == Some(*phase))
+            else {
+                panic!("missing phase {phase}: {events:?}");
+            };
+            next_index += relative_index + 1;
         }
     }
     const INSTALL_PUBLIC_KEY: &str = include_str!(
@@ -1644,6 +1742,22 @@ mod tests {
                 expected_active_requests
             );
         }
+    }
+
+    #[test]
+    fn rollback_durability_failure_requires_manual_recovery() {
+        assert_eq!(
+            rollback_install_failure(&UpdateError::RollbackDurabilityFailed),
+            InstallFailure::RecoveryRequired
+        );
+        assert_eq!(
+            rollback_install_failure(&UpdateError::RecoveryRequired),
+            InstallFailure::RecoveryRequired
+        );
+        assert_eq!(
+            rollback_install_failure(&UpdateError::RollbackFailed),
+            InstallFailure::Failed
+        );
     }
 
     #[test]
@@ -2091,7 +2205,9 @@ mod tests {
         let lifecycle =
             ServiceUpdateLifecycle::new(&dependencies, directory.path().join("wokcore.exe"));
 
-        let preparation = lifecycle.prepare().await.unwrap();
+        let preparation = prepare_lifecycle_without_progress(&lifecycle)
+            .await
+            .unwrap();
 
         server.abort();
         assert_eq!(
@@ -2183,12 +2299,16 @@ mod tests {
         let lifecycle =
             ServiceUpdateLifecycle::new(&dependencies, directory.path().join("wokcore.exe"));
 
-        assert!(lifecycle.prepare().await.is_err());
+        assert!(
+            prepare_lifecycle_without_progress(&lifecycle)
+                .await
+                .is_err()
+        );
         server.abort();
     }
 
     #[tokio::test]
-    async fn update_real_lifecycle_stops_the_verified_old_service_and_removes_its_discovery() {
+    async fn lifecycle_progress_reports_real_running_service_preparation_in_operation_order() {
         let directory = private_tempdir();
         let paths = test_paths(directory.path());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2292,9 +2412,27 @@ mod tests {
         let lifecycle =
             ServiceUpdateLifecycle::new(&dependencies, directory.path().join("wokcore.exe"));
 
-        let preparation = lifecycle.prepare().await.unwrap();
+        let mut reporter = ProgressReporter::new(true);
+        let mut output = BufferOutput::default();
+        let preparation = lifecycle
+            .prepare(&mut reporter, &mut output, &ProgressDetails::default())
+            .await
+            .unwrap();
 
         server.abort();
+        let events = progress_events(output.stderr());
+        assert_ordered_phases(
+            &events,
+            &[
+                "preparing_service",
+                "draining",
+                "draining",
+                "stopping",
+                "draining",
+            ],
+        );
+        assert_eq!(events[2]["active_requests"], 0);
+        assert_eq!(events[4]["active_requests"], 0);
         assert_eq!(
             preparation.outcome(),
             LifecyclePreparation::Ready(OriginalServiceState::Running)
@@ -2429,7 +2567,9 @@ mod tests {
         .with_update_process(update_process);
         let lifecycle = ServiceUpdateLifecycle::new(&dependencies, target);
 
-        let preparation = lifecycle.prepare().await.unwrap();
+        let preparation = prepare_lifecycle_without_progress(&lifecycle)
+            .await
+            .unwrap();
         assert_eq!(
             preparation.outcome(),
             LifecyclePreparation::Ready(OriginalServiceState::Running)
@@ -2486,8 +2626,11 @@ mod tests {
         .with_update_process(update_process);
         let lifecycle = ServiceUpdateLifecycle::new(&dependencies, target);
         let next_version = Version::new(1, 2, 3);
-        let mut verification =
-            Box::pin(lifecycle.spawn_and_verify(&next_version, OriginalServiceState::Running));
+        let mut verification = Box::pin(lifecycle.spawn_and_verify(
+            &next_version,
+            OriginalServiceState::Running,
+            None,
+        ));
 
         tokio::select! {
             () = spawned.notified() => {}
@@ -2806,7 +2949,7 @@ mod tests {
             runtime,
         );
         let lifecycle = ServiceUpdateLifecycle::new(&dependencies, target);
-        let mut preparation = Box::pin(lifecycle.prepare());
+        let mut preparation = Box::pin(prepare_lifecycle_without_progress(&lifecycle));
 
         tokio::select! {
             () = drain_accepted.notified() => {}
@@ -2943,7 +3086,7 @@ mod tests {
         )
         .with_update_process(update_process);
         let lifecycle = ServiceUpdateLifecycle::new(&dependencies, target);
-        let mut preparation = Box::pin(lifecycle.prepare());
+        let mut preparation = Box::pin(prepare_lifecycle_without_progress(&lifecycle));
 
         tokio::select! {
             () = stop_accepted.notified() => {}
@@ -2981,20 +3124,29 @@ mod tests {
     #[tokio::test]
     async fn update_install_command_emits_progress_for_the_signed_stopped_service_flow_on_loopback()
     {
-        assert_signed_stopped_service_update(true, false).await;
+        assert_signed_service_update(true, false, false).await;
+    }
+
+    #[tokio::test]
+    async fn lifecycle_progress_reports_the_signed_running_service_flow_in_operation_order() {
+        assert_signed_service_update(true, false, true).await;
     }
 
     #[tokio::test]
     async fn update_install_command_without_progress_preserves_stdout_and_stderr() {
-        assert_signed_stopped_service_update(false, false).await;
+        assert_signed_service_update(false, false, false).await;
     }
 
     #[tokio::test]
     async fn update_install_command_reports_operation_in_progress_from_the_real_lease_path() {
-        assert_signed_stopped_service_update(true, true).await;
+        assert_signed_service_update(true, true, false).await;
     }
 
-    async fn assert_signed_stopped_service_update(progress_jsonl: bool, hold_update_lease: bool) {
+    async fn assert_signed_service_update(
+        progress_jsonl: bool,
+        hold_update_lease: bool,
+        original_running: bool,
+    ) {
         let directory = private_tempdir();
         let paths = test_paths(directory.path());
         let target = directory.path().join(if cfg!(windows) {
@@ -3006,7 +3158,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let base_url = format!("http://{address}");
-        let running = Arc::new(AtomicBool::new(false));
+        let running = Arc::new(AtomicBool::new(original_running));
         let observed = Arc::new(Mutex::new(Vec::new()));
         let instance_id = Uuid::new_v4();
         let artifact_path = format!(
@@ -3071,12 +3223,19 @@ mod tests {
                 "/wokcore/v1/capabilities",
                 get({
                     let observed = observed.clone();
+                    let target = target.clone();
                     move || {
                         let observed = observed.clone();
+                        let target = target.clone();
                         async move {
                             observed.lock().unwrap().push("capabilities");
+                            let version = if fs::read(&target).unwrap() == b"old executable" {
+                                env!("CARGO_PKG_VERSION")
+                            } else {
+                                "1.2.3"
+                            };
                             Json(json!({
-                                "wokcore_version": "1.2.3",
+                                "wokcore_version": version,
                                 "management_api_major": 1,
                                 "minimum_management_api_major": 1,
                                 "maximum_management_api_major": 1,
@@ -3121,6 +3280,18 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         let _lease = RuntimeLease::acquire(&paths).unwrap();
+        if original_running {
+            DiscoveryStore::new(&paths)
+                .unwrap()
+                .publish(&DiscoveryRecord {
+                    base_url: base_url.clone(),
+                    pid: 5000,
+                    instance_id,
+                    wokcore_version: env!("CARGO_PKG_VERSION").to_owned(),
+                    api_major: 1,
+                })
+                .unwrap();
+        }
         let secrets = Arc::new(MemorySecretStore::default());
         bind_management_secret(&paths, &secrets).await;
         let runtime = Arc::new(MutableProcessRuntime {
@@ -3245,15 +3416,67 @@ mod tests {
             );
             assert_eq!(events.last().unwrap()["state"], "succeeded");
             assert_eq!(events.last().unwrap()["phase"], "completed");
+            if original_running {
+                assert_ordered_phases(
+                    &events,
+                    &[
+                        "preparing_service",
+                        "draining",
+                        "stopping",
+                        "starting",
+                        "verifying_runtime",
+                        "completed",
+                    ],
+                );
+                for event in events.iter().filter(|event| {
+                    matches!(
+                        event["phase"].as_str(),
+                        Some(
+                            "preparing_service"
+                                | "draining"
+                                | "stopping"
+                                | "starting"
+                                | "verifying_runtime"
+                        )
+                    )
+                }) {
+                    assert_eq!(event["current_version"], env!("CARGO_PKG_VERSION"));
+                    assert_eq!(event["target_version"], "1.2.3");
+                    assert!(event.get("bytes_completed").is_none());
+                    assert!(event.get("bytes_total").is_none());
+                }
+            }
         } else {
             assert_eq!(output.stderr(), "");
         }
         assert_eq!(fs::read(&target).unwrap(), b"new executable");
-        assert!(!running.load(Ordering::Acquire));
-        assert!(!paths.discovery_file.exists());
-        assert_eq!(
-            *observed.lock().unwrap(),
-            [
+        assert_eq!(running.load(Ordering::Acquire), original_running);
+        if original_running {
+            assert_eq!(
+                DiscoveryStore::new(&paths)
+                    .unwrap()
+                    .read()
+                    .unwrap()
+                    .wokcore_version,
+                "1.2.3"
+            );
+        } else {
+            assert!(!paths.discovery_file.exists());
+        }
+        let expected_observed = if original_running {
+            vec![
+                "manifest",
+                "signature",
+                "artifact",
+                "health",
+                "capabilities",
+                "drain",
+                "stop",
+                "health",
+                "capabilities",
+            ]
+        } else {
+            vec![
                 "manifest",
                 "signature",
                 "artifact",
@@ -3264,7 +3487,8 @@ mod tests {
                 "drain",
                 "stop",
             ]
-        );
+        };
+        assert_eq!(*observed.lock().unwrap(), expected_observed);
     }
 
     #[tokio::test]
@@ -3290,6 +3514,44 @@ mod tests {
         assert_eq!(outcome, InstallOutcome::ActiveRequestsRemain { count: 3 });
         assert_eq!(fs::read(&fixture.target).unwrap(), b"old executable");
         assert_eq!(lifecycle.events(), vec!["prepare"]);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_progress_reports_active_requests_without_installing() {
+        let fixture = install_fixture();
+        let archive = fs::File::open(&fixture.archive).unwrap();
+        let lifecycle = FakeLifecycle::new(
+            LifecyclePreparation::ActiveRequestsRemain { count: 3 },
+            true,
+        );
+        let mut reporter = ProgressReporter::new(true);
+        let mut output = BufferOutput::default();
+        let versions = ProgressDetails {
+            current_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+            target_version: Some("1.2.3".to_owned()),
+            active_requests: None,
+        };
+
+        let result = install_verified(
+            &archive,
+            &fixture.artifact,
+            &fixture.target,
+            &Version::new(0, 1, 0),
+            &Version::new(1, 2, 3),
+            &lifecycle,
+            &mut reporter,
+            &mut output,
+            &versions,
+        )
+        .await;
+        render_install_result(&mut reporter, &mut output, result);
+
+        let events = progress_events(output.stderr());
+        assert!(!events.iter().any(|event| event["phase"] == "installing"));
+        let terminal = events.last().unwrap();
+        assert_eq!(terminal["phase"], "completed");
+        assert_eq!(terminal["error_code"], "active_requests_remain");
+        assert_eq!(terminal["active_requests"], 3);
     }
 
     #[tokio::test]
@@ -3379,6 +3641,234 @@ mod tests {
         );
         assert_eq!(fs::read(&fixture.target).unwrap(), b"old executable");
         assert_eq!(lifecycle.events(), vec!["prepare", "verify", "restore"]);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_progress_reports_rollback_before_the_terminal_result() {
+        let fixture = install_fixture();
+        let archive = fs::File::open(&fixture.archive).unwrap();
+        let lifecycle = FakeLifecycle::new(
+            LifecyclePreparation::Ready(OriginalServiceState::Running),
+            false,
+        );
+        let mut reporter = ProgressReporter::new(true);
+        let mut output = BufferOutput::default();
+
+        let result = install_verified(
+            &archive,
+            &fixture.artifact,
+            &fixture.target,
+            &Version::new(0, 1, 0),
+            &Version::new(1, 2, 3),
+            &lifecycle,
+            &mut reporter,
+            &mut output,
+            &ProgressDetails::default(),
+        )
+        .await;
+        render_install_result(&mut reporter, &mut output, result);
+
+        let events = progress_events(output.stderr());
+        assert_ordered_phases(&events, &["installing", "rolling_back", "completed"]);
+        assert_eq!(events.last().unwrap()["error_code"], "rolled_back");
+    }
+
+    #[tokio::test]
+    async fn lifecycle_progress_reports_new_runtime_failure_and_real_restore_in_order() {
+        let fixture = install_fixture();
+        let paths = test_paths(fixture._directory.path());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let base_url = format!("http://{address}");
+        let running = Arc::new(AtomicBool::new(true));
+        let original_instance = Uuid::new_v4();
+        let current_instance = Arc::new(Mutex::new(original_instance));
+        let app = Router::new()
+            .route(
+                "/wokcore/v1/health",
+                get({
+                    let current_instance = current_instance.clone();
+                    move || {
+                        let current_instance = current_instance.clone();
+                        async move {
+                            Json(json!({
+                                "status": "ok",
+                                "instance_id": *current_instance.lock().unwrap(),
+                            }))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/wokcore/v1/capabilities",
+                get({
+                    let current_instance = current_instance.clone();
+                    move || {
+                        let current_instance = current_instance.clone();
+                        async move {
+                            Json(json!({
+                                "wokcore_version": env!("CARGO_PKG_VERSION"),
+                                "management_api_major": 1,
+                                "minimum_management_api_major": 1,
+                                "maximum_management_api_major": 1,
+                                "provider_protocols": [],
+                                "capabilities": [],
+                                "instance_id": *current_instance.lock().unwrap(),
+                            }))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/wokcore/v1/service/drain",
+                post(|| async { Json(json!({"phase": "draining", "active_requests": 0})) }),
+            )
+            .route(
+                "/wokcore/v1/service/stop",
+                post({
+                    let running = running.clone();
+                    move || {
+                        let running = running.clone();
+                        async move {
+                            running.store(false, Ordering::Release);
+                            Json(json!({"phase": "stopping", "active_requests": 0}))
+                        }
+                    }
+                }),
+            );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let _lease = RuntimeLease::acquire(&paths).unwrap();
+        DiscoveryStore::new(&paths)
+            .unwrap()
+            .publish(&DiscoveryRecord {
+                base_url: base_url.clone(),
+                pid: 4242,
+                instance_id: original_instance,
+                wokcore_version: env!("CARGO_PKG_VERSION").to_owned(),
+                api_major: 1,
+            })
+            .unwrap();
+        let secrets = Arc::new(MemorySecretStore::default());
+        bind_management_secret(&paths, &secrets).await;
+        let runtime = Arc::new(MutableProcessRuntime {
+            pid: 4242,
+            running: running.clone(),
+        });
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let update_process = Arc::new(RollbackUpdateProcess {
+            target: fixture.target.clone(),
+            paths: paths.clone(),
+            base_url,
+            current_instance,
+            running: running.clone(),
+            spawns: spawns.clone(),
+        });
+        let dependencies = RunDependencies::new(
+            paths,
+            secrets,
+            runtime.clone(),
+            runtime.clone(),
+            runtime.clone(),
+            runtime.clone(),
+            runtime,
+        )
+        .with_update_process(update_process);
+        let lifecycle = ServiceUpdateLifecycle::new(&dependencies, fixture.target.clone());
+        let archive = fs::File::open(&fixture.archive).unwrap();
+        let mut reporter = ProgressReporter::new(true);
+        let mut output = BufferOutput::default();
+        let versions = ProgressDetails {
+            current_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+            target_version: Some("1.2.3".to_owned()),
+            active_requests: None,
+        };
+
+        let result = install_verified(
+            &archive,
+            &fixture.artifact,
+            &fixture.target,
+            &Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+            &Version::new(1, 2, 3),
+            &lifecycle,
+            &mut reporter,
+            &mut output,
+            &versions,
+        )
+        .await;
+        render_install_result(&mut reporter, &mut output, result);
+
+        server.abort();
+        let events = progress_events(output.stderr());
+        assert_ordered_phases(
+            &events,
+            &[
+                "starting",
+                "verifying_runtime",
+                "rolling_back",
+                "starting",
+                "verifying_runtime",
+                "completed",
+            ],
+        );
+        assert_eq!(events.last().unwrap()["error_code"], "rolled_back");
+        assert_eq!(spawns.load(Ordering::Acquire), 2);
+        assert_eq!(fs::read(&fixture.target).unwrap(), b"old executable");
+        assert!(running.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_progress_propagates_verification_recovery_required_to_terminal() {
+        let fixture = install_fixture();
+        let archive = fs::File::open(&fixture.archive).unwrap();
+        let lifecycle = FakeLifecycle::new(
+            LifecyclePreparation::Ready(OriginalServiceState::Running),
+            false,
+        )
+        .with_recovery_required();
+
+        let terminal = install_failure_terminal(&archive, &fixture, &lifecycle).await;
+
+        assert_eq!(terminal["error_code"], "recovery_required");
+        assert_eq!(fs::read(&fixture.target).unwrap(), b"new executable");
+    }
+
+    #[tokio::test]
+    async fn lifecycle_progress_propagates_atomic_begin_recovery_required_to_terminal() {
+        let fixture = install_fixture();
+        let archive = fs::File::open(&fixture.archive).unwrap();
+        let displaced = fixture.target.parent().unwrap().join("displaced-target");
+        let target = fixture.target.clone();
+        let lifecycle = FakeLifecycle::new(
+            LifecyclePreparation::Ready(OriginalServiceState::Running),
+            true,
+        )
+        .with_prepare_hook(move || {
+            fs::rename(&target, &displaced).unwrap();
+            fs::write(&target, b"untrusted executable").unwrap();
+        });
+
+        let terminal = install_failure_terminal(&archive, &fixture, &lifecycle).await;
+
+        assert_eq!(terminal["error_code"], "recovery_required");
+        assert_eq!(fs::read(&fixture.target).unwrap(), b"untrusted executable");
+    }
+
+    #[tokio::test]
+    async fn lifecycle_progress_propagates_previous_runtime_restore_failure_to_terminal() {
+        let fixture = install_fixture();
+        let archive = fs::File::open(&fixture.archive).unwrap();
+        let lifecycle = FakeLifecycle::new(
+            LifecyclePreparation::Ready(OriginalServiceState::Running),
+            false,
+        )
+        .with_restore_failure();
+
+        let terminal = install_failure_terminal(&archive, &fixture, &lifecycle).await;
+
+        assert_eq!(terminal["error_code"], "recovery_required");
+        assert_eq!(fs::read(&fixture.target).unwrap(), b"old executable");
     }
 
     #[tokio::test]
@@ -3474,7 +3964,7 @@ mod tests {
         current_version: &Version,
         next_version: &Version,
         lifecycle: &dyn UpdateLifecycle,
-    ) -> Result<InstallOutcome, ()> {
+    ) -> Result<InstallOutcome, InstallFailure> {
         let mut reporter = ProgressReporter::new(false);
         let mut output = BufferOutput::default();
         install_verified(
@@ -3489,6 +3979,41 @@ mod tests {
             &ProgressDetails::default(),
         )
         .await
+    }
+
+    async fn prepare_lifecycle_without_progress(
+        lifecycle: &dyn UpdateLifecycle,
+    ) -> Result<PreparedLifecycle, ()> {
+        let mut reporter = ProgressReporter::new(false);
+        let mut output = BufferOutput::default();
+        lifecycle
+            .prepare(&mut reporter, &mut output, &ProgressDetails::default())
+            .await
+    }
+
+    async fn install_failure_terminal(
+        archive: &std::fs::File,
+        fixture: &InstallFixture,
+        lifecycle: &dyn UpdateLifecycle,
+    ) -> Value {
+        let mut reporter = ProgressReporter::new(true);
+        let mut output = BufferOutput::default();
+        let result = install_verified(
+            archive,
+            &fixture.artifact,
+            &fixture.target,
+            &Version::new(0, 1, 0),
+            &Version::new(1, 2, 3),
+            lifecycle,
+            &mut reporter,
+            &mut output,
+            &ProgressDetails::default(),
+        )
+        .await;
+        let exit = render_install_result(&mut reporter, &mut output, result);
+        assert_eq!(exit, ExitCode::InternalFailure);
+        assert_eq!(output.stdout(), "{\"code\":\"update_install_failed\"}\n");
+        progress_events(output.stderr()).last().unwrap().clone()
     }
 
     fn artifact(bytes: &[u8]) -> UpdateArtifact {
@@ -3922,6 +4447,81 @@ mod tests {
         spawns: Arc<AtomicUsize>,
     }
 
+    struct RollbackUpdateProcess {
+        target: std::path::PathBuf,
+        paths: AppPaths,
+        base_url: String,
+        current_instance: Arc<Mutex<Uuid>>,
+        running: Arc<AtomicBool>,
+        spawns: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl UpdateProcess for RollbackUpdateProcess {
+        fn current_executable(&self) -> Result<std::path::PathBuf, RuntimeValueError> {
+            Ok(self.target.clone())
+        }
+
+        async fn spawn_service(
+            &self,
+            executable: &Path,
+        ) -> Result<Box<dyn UpdateChild>, RuntimeValueError> {
+            assert_eq!(executable, self.target);
+            let is_new = fs::read(executable).unwrap() == b"new executable";
+            let instance_id = Uuid::new_v4();
+            *self.current_instance.lock().unwrap() = instance_id;
+            self.running.store(true, Ordering::Release);
+            DiscoveryStore::new(&self.paths)
+                .unwrap()
+                .publish(&DiscoveryRecord {
+                    base_url: self.base_url.clone(),
+                    pid: 4242,
+                    instance_id,
+                    wokcore_version: if is_new {
+                        "9.9.9".to_owned()
+                    } else {
+                        env!("CARGO_PKG_VERSION").to_owned()
+                    },
+                    api_major: 1,
+                })
+                .unwrap();
+            self.spawns.fetch_add(1, Ordering::AcqRel);
+            Ok(Box::new(RollbackUpdateChild {
+                running: self.running.clone(),
+                detached: false,
+            }))
+        }
+    }
+
+    struct RollbackUpdateChild {
+        running: Arc<AtomicBool>,
+        detached: bool,
+    }
+
+    #[async_trait]
+    impl UpdateChild for RollbackUpdateChild {
+        fn pid(&self) -> Option<u32> {
+            Some(4242)
+        }
+
+        async fn kill(&mut self) -> Result<(), RuntimeValueError> {
+            self.running.store(false, Ordering::Release);
+            Ok(())
+        }
+
+        fn detach(&mut self) {
+            self.detached = true;
+        }
+    }
+
+    impl Drop for RollbackUpdateChild {
+        fn drop(&mut self) {
+            if !self.detached {
+                self.running.store(false, Ordering::Release);
+            }
+        }
+    }
+
     #[async_trait]
     impl UpdateProcess for RecoveryUpdateProcess {
         fn current_executable(&self) -> Result<std::path::PathBuf, RuntimeValueError> {
@@ -4050,6 +4650,7 @@ mod tests {
         verified_state: Mutex<Option<OriginalServiceState>>,
         prepare_hook: Option<Box<dyn Fn() + Send + Sync>>,
         recovery_required: bool,
+        restore_succeeds: bool,
     }
 
     impl FakeLifecycle {
@@ -4061,6 +4662,7 @@ mod tests {
                 verified_state: Mutex::new(None),
                 prepare_hook: None,
                 recovery_required: false,
+                restore_succeeds: true,
             }
         }
 
@@ -4071,6 +4673,11 @@ mod tests {
 
         fn with_recovery_required(mut self) -> Self {
             self.recovery_required = true;
+            self
+        }
+
+        fn with_restore_failure(mut self) -> Self {
+            self.restore_succeeds = false;
             self
         }
 
@@ -4085,7 +4692,12 @@ mod tests {
 
     #[async_trait]
     impl UpdateLifecycle for FakeLifecycle {
-        async fn prepare(&self) -> Result<PreparedLifecycle, ()> {
+        async fn prepare(
+            &self,
+            _reporter: &mut ProgressReporter,
+            _output: &mut dyn CommandOutput,
+            _versions: &ProgressDetails,
+        ) -> Result<PreparedLifecycle, ()> {
             self.events.lock().unwrap().push("prepare");
             if let Some(hook) = &self.prepare_hook {
                 hook();
@@ -4097,6 +4709,9 @@ mod tests {
             &self,
             _version: &Version,
             original: OriginalServiceState,
+            _reporter: &mut ProgressReporter,
+            _output: &mut dyn CommandOutput,
+            _versions: &ProgressDetails,
         ) -> Result<(), VerificationFailure> {
             self.events.lock().unwrap().push("verify");
             *self.verified_state.lock().unwrap() = Some(original);
@@ -4113,9 +4728,12 @@ mod tests {
             &self,
             _version: &Version,
             _original: OriginalServiceState,
+            _reporter: &mut ProgressReporter,
+            _output: &mut dyn CommandOutput,
+            _versions: &ProgressDetails,
         ) -> Result<(), ()> {
             self.events.lock().unwrap().push("restore");
-            Ok(())
+            self.restore_succeeds.then_some(()).ok_or(())
         }
     }
 }
