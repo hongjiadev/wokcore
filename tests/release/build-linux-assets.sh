@@ -46,6 +46,11 @@ EXPECTED_PACKAGE_FILES="/usr/bin/wokcore
 /usr/share/doc/wokcore/LICENSE-MIT
 /usr/share/doc/wokcore/NOTICE.md
 /usr/share/doc/wokcore/README.md"
+RPM_ALLOWED_DIRECTORIES="/usr
+/usr/bin
+/usr/share
+/usr/share/doc
+/usr/share/doc/wokcore"
 EXPECTED_DEB_NODE_INVENTORY="- ./usr/bin/wokcore
 - ./usr/share/doc/wokcore/LICENSE-APACHE
 - ./usr/share/doc/wokcore/LICENSE-MIT
@@ -81,6 +86,22 @@ verify_package_tree() {
             stat -c '%a' "$root/usr/share/doc/wokcore/$name"
         )" == 644 ]] ||
             fail "built $package_format package modes are invalid"
+    done
+}
+
+normalize_rpm_file_list() {
+    local path
+    local normalized
+    while IFS= read -r path; do
+        [[ -n "$path" ]] || fail "built RPM package file list is invalid"
+        normalized="${path%/}"
+        if printf '%s\n' "$RPM_ALLOWED_DIRECTORIES" |
+            grep -Fqx -- "$normalized"; then
+            [[ "$path" == "$normalized" || "$path" == "$normalized/" ]] ||
+                fail "built RPM package file list is invalid"
+        else
+            printf '%s\n' "$path"
+        fi
     done
 }
 
@@ -314,7 +335,7 @@ RPM_BUILT_ARCH="$(rpm -qp --queryformat '%{ARCH}' "$RPM_PACKAGE" 2>/dev/null)" |
     "$RPM_VERSION" == "$VERSION" &&
     "$RPM_BUILT_ARCH" == "$RPM_ARCH" ]] ||
     fail "built RPM package metadata is invalid"
-RPM_FILES="$(rpm -qpl "$RPM_PACKAGE" 2>/dev/null | LC_ALL=C sort)" ||
+RPM_FILES="$(rpm -qpl "$RPM_PACKAGE" 2>/dev/null | LC_ALL=C sort | normalize_rpm_file_list)" ||
     fail "built RPM package file list is invalid"
 [[ "$RPM_FILES" == "$EXPECTED_PACKAGE_FILES" ]] ||
     fail "built RPM package file list is invalid"

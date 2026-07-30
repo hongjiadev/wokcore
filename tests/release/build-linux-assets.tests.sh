@@ -15,6 +15,10 @@ if ! grep -Fq 'rpm -qpl "$RPM_PACKAGE" 2>/dev/null | LC_ALL=C sort' \
     printf 'RPM file-list validation must normalize rpm query order\n' >&2
     exit 1
 fi
+if ! grep -Fq 'RPM_ALLOWED_DIRECTORIES=' "$BUILD_LINUX_ASSETS"; then
+    printf 'RPM file-list validation must normalize implicit directories\n' >&2
+    exit 1
+fi
 if [[ "$#" -ne 2 ]]; then
     printf 'usage: %s TARGET PUBLIC_ARCH\n' "$0" >&2
     exit 2
