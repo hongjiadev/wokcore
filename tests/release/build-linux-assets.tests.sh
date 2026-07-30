@@ -19,6 +19,10 @@ if ! grep -Fq 'RPM_ALLOWED_DIRECTORIES=' "$BUILD_LINUX_ASSETS"; then
     printf 'RPM file-list validation must normalize implicit directories\n' >&2
     exit 1
 fi
+if ! grep -Fq 'verify_rpm_build_id_links()' "$BUILD_LINUX_ASSETS"; then
+    printf 'RPM file-list validation must verify generated build-id links\n' >&2
+    exit 1
+fi
 if [[ "$#" -ne 2 ]]; then
     printf 'usage: %s TARGET PUBLIC_ARCH\n' "$0" >&2
     exit 2

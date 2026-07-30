@@ -99,10 +99,35 @@ normalize_rpm_file_list() {
             grep -Fqx -- "$normalized"; then
             [[ "$path" == "$normalized" || "$path" == "$normalized/" ]] ||
                 fail "built RPM package file list is invalid"
+        elif [[
+            "$normalized" =~ ^/usr/lib/\.build-id$ ||
+            "$normalized" =~ ^/usr/lib/\.build-id/[0-9a-f]{2}$ ||
+            "$normalized" =~ ^/usr/lib/\.build-id/[0-9a-f]{2}/[0-9a-f]{38}$
+        ]]; then
+            [[ "$path" == "$normalized" || "$path" == "$normalized/" ]] ||
+                fail "built RPM package file list is invalid"
         else
             printf '%s\n' "$path"
         fi
     done
+}
+
+verify_rpm_build_id_links() {
+    local root="$1"
+    local link
+    local link_count=0
+    local links
+    links="$(
+        find "$root" -type l -printf '/%P -> %l\n' | LC_ALL=C sort
+    )" || fail "built RPM package file list is invalid"
+    while IFS= read -r link; do
+        [[ -n "$link" ]] || continue
+        link_count=$((link_count + 1))
+        [[ "$link" =~ ^/usr/lib/\.build-id/[0-9a-f]{2}/[0-9a-f]{38}\ \-\>\ ../../../../usr/bin/wokcore$ ]] ||
+            fail "built RPM package file list is invalid"
+    done <<< "$links"
+    [[ "$link_count" -le 1 ]] ||
+        fail "built RPM package file list is invalid"
 }
 
 while [[ "$#" -gt 0 ]]; do
@@ -344,6 +369,7 @@ mkdir "$RPM_VERIFY"
 rpm2cpio "$RPM_PACKAGE" 2>/dev/null |
     (cd "$RPM_VERIFY" && cpio -idmu --quiet 2>/dev/null) ||
     fail "built RPM package payload is invalid"
+verify_rpm_build_id_links "$RPM_VERIFY"
 verify_package_tree "$RPM_VERIFY" RPM
 
 trap - EXIT
