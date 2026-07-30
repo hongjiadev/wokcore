@@ -57,6 +57,20 @@ fn root_help_and_version_are_exact_and_deterministic() {
 
 #[test]
 fn update_progress_jsonl_is_available_only_for_install() {
+    for accepted in [
+        &["wokcore", "update", "--check", "--json"][..],
+        &["wokcore", "update", "--install", "--json"],
+        &[
+            "wokcore",
+            "update",
+            "--install",
+            "--json",
+            "--progress-jsonl",
+        ],
+    ] {
+        assert!(Cli::try_parse_from(accepted).is_ok(), "{accepted:?}");
+    }
+
     let parsed = Cli::try_parse_from([
         "wokcore",
         "update",
@@ -71,10 +85,17 @@ fn update_progress_jsonl_is_available_only_for_install() {
     assert!(update.install);
     assert!(update.progress_jsonl);
 
-    assert!(
-        Cli::try_parse_from(["wokcore", "update", "--check", "--json", "--progress-jsonl",])
-            .is_err()
-    );
+    for rejected in [
+        &["wokcore", "update", "--json"][..],
+        &["wokcore", "update", "--check"],
+        &["wokcore", "update", "--install"],
+        &["wokcore", "update", "--check", "--install", "--json"],
+        &["wokcore", "update", "--check", "--json", "--progress-jsonl"],
+        &["wokcore", "update", "--install", "--progress-jsonl"],
+        &["wokcore", "update", "--json", "--progress-jsonl"],
+    ] {
+        assert!(Cli::try_parse_from(rejected).is_err(), "{rejected:?}");
+    }
 }
 
 #[test]
