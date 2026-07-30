@@ -1541,7 +1541,8 @@ mod tests {
     use std::{
         fs,
         future::Future,
-        path::Path,
+        io,
+        path::{Path, PathBuf},
         pin::Pin,
         sync::{
             Arc, Mutex,
@@ -3694,6 +3695,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn broken_progress_pipe_preserves_full_install_rollback_outcome() {
+        let normal_fixture = install_fixture();
+        let normal_backup = install_backup_path(&normal_fixture.target);
+        let normal_lifecycle = FullPathRollbackLifecycle::new(&normal_fixture.target);
+        let mut normal_reporter = ProgressReporter::new(true);
+        let mut normal_output = BufferOutput::default();
+        let normal_exit = run_full_path_rollback(
+            &normal_fixture,
+            &normal_lifecycle,
+            &mut normal_reporter,
+            &mut normal_output,
+        )
+        .await;
+
+        let broken_fixture = install_fixture();
+        let broken_backup = install_backup_path(&broken_fixture.target);
+        let broken_lifecycle = FullPathRollbackLifecycle::new(&broken_fixture.target);
+        let mut broken_reporter = ProgressReporter::new(true);
+        let mut broken_output = BrokenPipeOutput::default();
+        let broken_exit = run_full_path_rollback(
+            &broken_fixture,
+            &broken_lifecycle,
+            &mut broken_reporter,
+            &mut broken_output,
+        )
+        .await;
+
+        assert_eq!(normal_exit, ExitCode::InternalFailure);
+        assert_eq!(broken_exit, normal_exit);
+        assert_eq!(broken_output.stdout, normal_output.stdout());
+        assert_eq!(
+            serde_json::from_str::<Value>(normal_output.stdout()).unwrap()["code"],
+            "rolled_back"
+        );
+        assert_eq!(fs::read(&normal_fixture.target).unwrap(), b"old executable");
+        assert_eq!(fs::read(&broken_fixture.target).unwrap(), b"old executable");
+        assert!(!normal_backup.exists());
+        assert!(!broken_backup.exists());
+        normal_lifecycle.assert_complete_rollback();
+        broken_lifecycle.assert_complete_rollback();
+        assert_eq!(broken_output.stderr_attempts, 1);
+        let first_event = serde_json::from_str::<Value>(
+            broken_output.first_stderr.as_deref().unwrap().trim_end(),
+        )
+        .unwrap();
+        assert_eq!(first_event["phase"], "verifying");
+        assert_eq!(first_event["state"], "running");
+
+        let events = progress_events(normal_output.stderr());
+        assert_ordered_phases(
+            &events,
+            &["verifying", "installing", "rolling_back", "completed"],
+        );
+        assert_eq!(events.last().unwrap()["error_code"], "rolled_back");
+    }
+
+    #[tokio::test]
     async fn lifecycle_progress_reports_rollback_before_the_terminal_result() {
         let fixture = install_fixture();
         let archive = fs::File::open(&fixture.archive).unwrap();
@@ -4205,6 +4263,38 @@ mod tests {
             target,
             artifact,
         }
+    }
+
+    fn install_backup_path(target: &Path) -> PathBuf {
+        target.parent().unwrap().join(format!(
+            ".{}.previous",
+            target.file_name().unwrap().to_string_lossy()
+        ))
+    }
+
+    async fn run_full_path_rollback(
+        fixture: &InstallFixture,
+        lifecycle: &FullPathRollbackLifecycle,
+        reporter: &mut ProgressReporter,
+        output: &mut dyn CommandOutput,
+    ) -> ExitCode {
+        let archive = fs::File::open(&fixture.archive).unwrap();
+        let result = install_verified(
+            &archive,
+            &fixture.artifact,
+            &fixture.target,
+            InstallVerificationContext {
+                current_version: &Version::new(0, 1, 0),
+                next_version: &Version::new(1, 2, 3),
+                lifecycle,
+                transactions: &PlatformUpdateTransactionFactory,
+            },
+            reporter,
+            output,
+            &ProgressDetails::default(),
+        )
+        .await;
+        render_install_result(reporter, output, result)
     }
 
     #[cfg(windows)]
@@ -4789,6 +4879,121 @@ mod tests {
         prepare_hook: Option<Box<dyn Fn() + Send + Sync>>,
         recovery_required: bool,
         restore_succeeds: bool,
+    }
+
+    #[derive(Default)]
+    struct BrokenPipeOutput {
+        stdout: String,
+        stderr_attempts: usize,
+        first_stderr: Option<String>,
+    }
+
+    impl CommandOutput for BrokenPipeOutput {
+        fn write_stdout(&mut self, value: &str) -> io::Result<()> {
+            self.stdout.push_str(value);
+            Ok(())
+        }
+
+        fn write_stderr(&mut self, value: &str) -> io::Result<()> {
+            self.stderr_attempts += 1;
+            self.first_stderr.get_or_insert_with(|| value.to_owned());
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "progress consumer closed",
+            ))
+        }
+    }
+
+    struct FullPathRollbackLifecycle {
+        target: PathBuf,
+        backup: PathBuf,
+        events: Mutex<Vec<&'static str>>,
+        target_during_verification: Mutex<Option<Vec<u8>>>,
+        backup_during_verification: Mutex<Option<Vec<u8>>>,
+        target_during_restore: Mutex<Option<Vec<u8>>>,
+        backup_existed_during_restore: Mutex<Option<bool>>,
+    }
+
+    impl FullPathRollbackLifecycle {
+        fn new(target: &Path) -> Self {
+            Self {
+                target: target.to_owned(),
+                backup: install_backup_path(target),
+                events: Mutex::new(Vec::new()),
+                target_during_verification: Mutex::new(None),
+                backup_during_verification: Mutex::new(None),
+                target_during_restore: Mutex::new(None),
+                backup_existed_during_restore: Mutex::new(None),
+            }
+        }
+
+        fn assert_complete_rollback(&self) {
+            assert_eq!(
+                *self.target_during_verification.lock().unwrap(),
+                Some(b"new executable".to_vec())
+            );
+            assert_eq!(
+                *self.backup_during_verification.lock().unwrap(),
+                Some(b"old executable".to_vec())
+            );
+            assert_eq!(
+                *self.target_during_restore.lock().unwrap(),
+                Some(b"old executable".to_vec())
+            );
+            assert_eq!(
+                *self.backup_existed_during_restore.lock().unwrap(),
+                Some(false)
+            );
+            assert_eq!(
+                *self.events.lock().unwrap(),
+                vec!["prepare", "verify", "restore"]
+            );
+        }
+    }
+
+    #[async_trait]
+    impl UpdateLifecycle for FullPathRollbackLifecycle {
+        async fn prepare(
+            &self,
+            _reporter: &mut ProgressReporter,
+            _output: &mut dyn CommandOutput,
+            _versions: &ProgressDetails,
+        ) -> Result<PreparedLifecycle, ()> {
+            self.events.lock().unwrap().push("prepare");
+            Ok(PreparedLifecycle::plain(LifecyclePreparation::Ready(
+                OriginalServiceState::Running,
+            )))
+        }
+
+        async fn verify_installed(
+            &self,
+            _version: &Version,
+            _original: OriginalServiceState,
+            _reporter: &mut ProgressReporter,
+            _output: &mut dyn CommandOutput,
+            _versions: &ProgressDetails,
+        ) -> Result<(), VerificationFailure> {
+            self.events.lock().unwrap().push("verify");
+            *self.target_during_verification.lock().unwrap() =
+                Some(fs::read(&self.target).unwrap());
+            *self.backup_during_verification.lock().unwrap() =
+                Some(fs::read(&self.backup).unwrap());
+            Err(VerificationFailure::SafeToRollback)
+        }
+
+        async fn restore_previous(
+            &self,
+            _version: &Version,
+            _original: OriginalServiceState,
+            _reporter: &mut ProgressReporter,
+            _output: &mut dyn CommandOutput,
+            _versions: &ProgressDetails,
+        ) -> Result<(), ()> {
+            self.events.lock().unwrap().push("restore");
+            *self.target_during_restore.lock().unwrap() = Some(fs::read(&self.target).unwrap());
+            *self.backup_existed_during_restore.lock().unwrap() = Some(self.backup.exists());
+            Ok(())
+        }
     }
 
     impl FakeLifecycle {

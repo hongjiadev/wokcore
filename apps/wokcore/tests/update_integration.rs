@@ -1,6 +1,5 @@
 use std::{
     future::Future,
-    io,
     pin::Pin,
     sync::{
         Arc,
@@ -16,8 +15,8 @@ use tokio::net::TcpListener;
 use url::Url;
 use uuid::Uuid;
 use wokcore::{
-    BufferOutput, Clock, CommandOutput, ExitCode, IdSource, ProcessIdentity, RunDependencies,
-    RuntimeValueError, ShutdownSignal,
+    BufferOutput, Clock, ExitCode, IdSource, ProcessIdentity, RunDependencies, RuntimeValueError,
+    ShutdownSignal,
     cli::{Cli, parse_command},
     run_with_dependencies,
 };
@@ -177,29 +176,6 @@ fn progress_events(stderr: &str) -> Vec<Value> {
     );
     assert_eq!(events.last().unwrap()["phase"], "completed");
     events
-}
-
-#[derive(Default)]
-struct BrokenPipeOutput {
-    stdout: String,
-    stderr_attempts: usize,
-    first_stderr: Option<String>,
-}
-
-impl CommandOutput for BrokenPipeOutput {
-    fn write_stdout(&mut self, value: &str) -> io::Result<()> {
-        self.stdout.push_str(value);
-        Ok(())
-    }
-
-    fn write_stderr(&mut self, value: &str) -> io::Result<()> {
-        self.stderr_attempts += 1;
-        self.first_stderr.get_or_insert_with(|| value.to_owned());
-        Err(io::Error::new(
-            io::ErrorKind::BrokenPipe,
-            "progress consumer closed",
-        ))
-    }
 }
 
 fn final_code(stdout: &str) -> String {
@@ -365,69 +341,6 @@ async fn update_install_progress_reports_a_malformed_signed_manifest_as_verifica
     assert_eq!(terminal["state"], "failed");
     assert_eq!(terminal["phase"], "completed");
     assert_eq!(terminal["error_code"], "update_verification_failed");
-}
-
-#[tokio::test]
-async fn broken_progress_pipe_preserves_update_install_exit_stdout_and_filesystem_outcome() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let app = Router::new()
-        .route(
-            "/wokcore-update-v2.json",
-            get(|| async { Response::builder().status(404).body(Body::empty()).unwrap() }),
-        )
-        .route(
-            "/wokcore-update-v1.json",
-            get(|| async { Response::new(Body::from(MIGRATION_V1)) }),
-        )
-        .route(
-            "/wokcore-update-v1.json.minisig",
-            get(|| async { Response::new(Body::from(MIGRATION_V1_SIGNATURE)) }),
-        );
-    let server = tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-    let origin = Url::parse(&format!("http://{address}/")).unwrap();
-    let (directory, dependencies) = dependencies();
-    let dependencies = dependencies
-        .with_loopback_update_source(origin, MIGRATION_PUBLIC_KEY)
-        .unwrap();
-    let command = || {
-        Cli::try_parse_from([
-            "wokcore",
-            "update",
-            "--install",
-            "--json",
-            "--progress-jsonl",
-        ])
-        .unwrap()
-    };
-
-    let mut normal = BufferOutput::default();
-    let normal_exit = run_with_dependencies(command(), &dependencies, &mut normal).await;
-    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
-
-    let mut broken = BrokenPipeOutput::default();
-    let broken_exit = run_with_dependencies(command(), &dependencies, &mut broken).await;
-    server.abort();
-
-    assert_eq!(normal_exit, ExitCode::InternalFailure);
-    assert_eq!(broken_exit, normal_exit);
-    assert_eq!(broken.stdout, normal.stdout());
-    assert_eq!(final_code(&broken.stdout), final_code(normal.stdout()));
-    assert_eq!(final_code(&broken.stdout), "update_install_failed");
-    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
-    let events = progress_events(normal.stderr());
-    assert_eq!(
-        events.last().unwrap()["error_code"],
-        "update_install_failed"
-    );
-    assert_eq!(broken.stderr_attempts, 1);
-    let first_stderr = broken.first_stderr.as_deref().unwrap();
-    assert!(first_stderr.ends_with('\n'));
-    let first_event = serde_json::from_str::<Value>(first_stderr.trim_end()).unwrap();
-    assert_eq!(first_event["phase"], "checking_release");
-    assert_eq!(first_event["state"], "running");
 }
 
 #[tokio::test]
