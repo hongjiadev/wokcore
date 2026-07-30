@@ -1446,12 +1446,12 @@ mod tests {
     use super::{
         ChildCleanupCoordinator, InstallFailure, InstallOutcome, LifecyclePreparation,
         ManagedUpdateChild, OriginalServiceState, PRODUCTION_UPDATE_ORIGIN, PreparedLifecycle,
-        ServiceUpdateLifecycle, UpdateLifecycle, VerificationFailure, classify_drain_response,
-        download_artifact, install_verified, matches_current_service, matches_expected_discovery,
-        matches_expected_service, read_startup_discovery, recovered_old_service_matches,
-        render_install_result, report_install_check_result, run as run_update, update_client,
-        validate_initial_update_url, validated_latest_release_redirect,
-        validated_release_asset_redirect,
+        ServiceUpdateLifecycle, UpdateLifecycle, VerificationFailure, acquire_update_lease,
+        classify_drain_response, download_artifact, install_verified, matches_current_service,
+        matches_expected_discovery, matches_expected_service, read_startup_discovery,
+        recovered_old_service_matches, render_install_result, report_install_check_result,
+        run as run_update, update_client, validate_initial_update_url,
+        validated_latest_release_redirect, validated_release_asset_redirect,
     };
     use crate::commands::stop::LifecycleResponse;
     use crate::{
@@ -1483,6 +1483,27 @@ mod tests {
             assert_eq!(event["sequence"], u64::try_from(sequence).unwrap());
         }
         events
+    }
+
+    fn assert_ordered_phase_groups(events: &[Value], expected: &[&str]) {
+        let mut previous_last = None;
+        for phase in expected {
+            let indices = events
+                .iter()
+                .enumerate()
+                .filter_map(|(index, event)| {
+                    (event["phase"].as_str() == Some(*phase)).then_some(index)
+                })
+                .collect::<Vec<_>>();
+            assert!(!indices.is_empty(), "missing phase {phase}: {events:?}");
+            if let Some(previous_last) = previous_last {
+                assert!(
+                    indices[0] > previous_last,
+                    "phase {phase} is out of order: {events:?}"
+                );
+            }
+            previous_last = indices.last().copied();
+        }
     }
     const INSTALL_PUBLIC_KEY: &str = include_str!(
         "../../../../crates/wokcore-platform/tests/fixtures/update/install-minisign.pub"
@@ -2960,15 +2981,20 @@ mod tests {
     #[tokio::test]
     async fn update_install_command_emits_progress_for_the_signed_stopped_service_flow_on_loopback()
     {
-        assert_signed_stopped_service_update(true).await;
+        assert_signed_stopped_service_update(true, false).await;
     }
 
     #[tokio::test]
     async fn update_install_command_without_progress_preserves_stdout_and_stderr() {
-        assert_signed_stopped_service_update(false).await;
+        assert_signed_stopped_service_update(false, false).await;
     }
 
-    async fn assert_signed_stopped_service_update(progress_jsonl: bool) {
+    #[tokio::test]
+    async fn update_install_command_reports_operation_in_progress_from_the_real_lease_path() {
+        assert_signed_stopped_service_update(true, true).await;
+    }
+
+    async fn assert_signed_stopped_service_update(progress_jsonl: bool, hold_update_lease: bool) {
         let directory = private_tempdir();
         let paths = test_paths(directory.path());
         let target = directory.path().join(if cfg!(windows) {
@@ -3124,6 +3150,7 @@ mod tests {
         .unwrap()
         .with_update_process(update_process);
         let mut output = BufferOutput::default();
+        let _held_update_lease = hold_update_lease.then(|| acquire_update_lease(&target).unwrap());
 
         let exit = run_update(
             Update {
@@ -3138,6 +3165,26 @@ mod tests {
         .await;
 
         server.abort();
+        if hold_update_lease {
+            assert_eq!(exit, ExitCode::InternalFailure);
+            assert_eq!(output.stdout(), "{\"code\":\"update_install_failed\"}\n");
+            let events = progress_events(output.stderr());
+            assert_eq!(events.first().unwrap()["phase"], "checking_release");
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event["phase"] == "completed")
+                    .count(),
+                1
+            );
+            let terminal = events.last().unwrap();
+            assert_eq!(terminal["state"], "failed");
+            assert_eq!(terminal["phase"], "completed");
+            assert_eq!(terminal["error_code"], "operation_in_progress");
+            assert_eq!(fs::read(&target).unwrap(), b"old executable");
+            assert_eq!(*observed.lock().unwrap(), ["manifest", "signature"]);
+            return;
+        }
         assert_eq!(
             exit,
             ExitCode::Success,
@@ -3163,7 +3210,16 @@ mod tests {
         );
         if progress_jsonl {
             let events = progress_events(output.stderr());
-            assert_eq!(events.first().unwrap()["phase"], "checking_release");
+            assert_ordered_phase_groups(
+                &events,
+                &[
+                    "checking_release",
+                    "downloading",
+                    "verifying",
+                    "installing",
+                    "completed",
+                ],
+            );
             let downloading = events
                 .iter()
                 .filter(|event| event["phase"] == "downloading")
