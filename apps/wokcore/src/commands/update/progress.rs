@@ -2,6 +2,8 @@ use serde::Serialize;
 
 use crate::CommandOutput;
 
+pub(super) const MAX_PROGRESS_EVENT_BYTES: usize = 16 * 1024;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum ProgressState {
@@ -225,6 +227,10 @@ impl ProgressReporter {
                 return;
             }
         };
+        if line.len() > MAX_PROGRESS_EVENT_BYTES {
+            self.write_failed = true;
+            return;
+        }
         self.next_sequence += 1;
 
         if output.write_stderr(&format!("{line}\n")).is_err() {
@@ -240,8 +246,8 @@ mod tests {
     use serde_json::Value;
 
     use super::{
-        DownloadProgressDetails, ProgressDetails, ProgressErrorCode, ProgressEvent,
-        ProgressReporter, ProgressState,
+        CoreOperationProgress, DownloadProgressDetails, MAX_PROGRESS_EVENT_BYTES, ProgressDetails,
+        ProgressErrorCode, ProgressEvent, ProgressPhase, ProgressReporter, ProgressState,
     };
     use crate::{BufferOutput, CommandOutput};
 
@@ -411,6 +417,83 @@ mod tests {
             ProgressEvent::CheckingRelease(ProgressDetails::default()),
         );
         assert_eq!(output.stderr_attempts, 1);
+    }
+
+    #[test]
+    fn reporter_enforces_the_serialized_event_byte_boundary_before_the_newline() {
+        for expected_bytes in [MAX_PROGRESS_EVENT_BYTES - 1, MAX_PROGRESS_EVENT_BYTES] {
+            let mut output = RecordingOutput::default();
+            let mut reporter = ProgressReporter::new(true);
+
+            reporter.running(
+                &mut output,
+                ProgressEvent::CheckingRelease(details_with_serialized_size(expected_bytes)),
+            );
+
+            assert_eq!(output.stderr_attempts, 1);
+            let line = output.stderr.strip_suffix('\n').unwrap();
+            assert_eq!(line.len(), expected_bytes);
+        }
+    }
+
+    #[test]
+    fn reporter_drops_an_oversized_event_and_disables_later_writes() {
+        let mut output = RecordingOutput::default();
+        let mut reporter = ProgressReporter::new(true);
+
+        reporter.running(
+            &mut output,
+            ProgressEvent::CheckingRelease(details_with_serialized_size(
+                MAX_PROGRESS_EVENT_BYTES + 1,
+            )),
+        );
+        reporter.running(
+            &mut output,
+            ProgressEvent::Verifying(ProgressDetails::default()),
+        );
+
+        assert_eq!(output.stderr_attempts, 0);
+        assert_eq!(output.stderr, "");
+    }
+
+    fn details_with_serialized_size(expected_bytes: usize) -> ProgressDetails {
+        let baseline = CoreOperationProgress {
+            schema_version: 1,
+            sequence: 0,
+            operation: "update",
+            state: ProgressState::Running,
+            phase: ProgressPhase::CheckingRelease,
+            current_version: Some(String::new()),
+            target_version: None,
+            bytes_completed: None,
+            bytes_total: None,
+            active_requests: None,
+            error_code: None,
+        };
+        let baseline_bytes = serde_json::to_vec(&baseline).unwrap().len();
+        assert!(expected_bytes >= baseline_bytes);
+        ProgressDetails {
+            current_version: Some("v".repeat(expected_bytes - baseline_bytes)),
+            ..ProgressDetails::default()
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingOutput {
+        stderr: String,
+        stderr_attempts: usize,
+    }
+
+    impl CommandOutput for RecordingOutput {
+        fn write_stdout(&mut self, _value: &str) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn write_stderr(&mut self, value: &str) -> io::Result<()> {
+            self.stderr_attempts += 1;
+            self.stderr.push_str(value);
+            Ok(())
+        }
     }
 
     #[derive(Default)]

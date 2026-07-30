@@ -30,7 +30,6 @@ use crate::{
     cli::Update,
 };
 
-#[allow(dead_code)]
 mod progress;
 
 use progress::{
@@ -50,6 +49,20 @@ const UPDATE_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const UPDATE_PROCESS_TIMEOUT: Duration = Duration::from_secs(10);
 const UPDATE_STOP_SETTLE_TIMEOUT: Duration = Duration::from_secs(50);
 const UPDATE_PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_PACKAGE_VERSION: Version;
+}
+
+fn package_version() -> Version {
+    #[cfg(test)]
+    if let Ok(version) = TEST_PACKAGE_VERSION.try_with(Clone::clone) {
+        return version;
+    }
+    Version::parse(env!("CARGO_PKG_VERSION")).expect("Cargo package version must be valid semver")
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OriginalServiceState {
     Running,
@@ -877,11 +890,12 @@ pub(super) async fn run(
     dependencies: &RunDependencies,
     output: &mut dyn CommandOutput,
 ) -> ExitCode {
+    let current_version = package_version();
     let mut reporter = ProgressReporter::new(options.progress_jsonl);
     reporter.running(
         output,
         ProgressEvent::CheckingRelease(ProgressDetails {
-            current_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+            current_version: Some(current_version.to_string()),
             ..ProgressDetails::default()
         }),
     );
@@ -897,15 +911,15 @@ pub(super) async fn run(
             json!({"code": "update_unavailable"}),
         );
     };
-    let decision = check(source).await;
-    report_install_check_result(&mut reporter, output, &decision);
+    let decision = check(source, &current_version).await;
+    report_install_check_result(&mut reporter, output, &decision, &current_version);
     match decision {
         Ok(UpdateDecision::Current) => render(
             output,
             ExitCode::Success,
             json!({
                 "code": "current",
-                "current_version": env!("CARGO_PKG_VERSION"),
+                "current_version": current_version.to_string(),
             }),
         ),
         Ok(UpdateDecision::Available(candidate)) if options.check => render(
@@ -913,14 +927,21 @@ pub(super) async fn run(
             ExitCode::Success,
             json!({
                 "code": "update_available",
-                "current_version": env!("CARGO_PKG_VERSION"),
+                "current_version": current_version.to_string(),
                 "target": candidate.artifact().target(),
                 "version": candidate.version().to_string(),
             }),
         ),
         Ok(UpdateDecision::Available(candidate)) => {
-            let result =
-                install_candidate(source, candidate, dependencies, &mut reporter, output).await;
+            let result = install_candidate(
+                source,
+                candidate,
+                dependencies,
+                &current_version,
+                &mut reporter,
+                output,
+            )
+            .await;
             render_install_result(&mut reporter, output, result)
         }
         Ok(UpdateDecision::IncompatibleManifest) => render(
@@ -940,12 +961,13 @@ fn report_install_check_result(
     reporter: &mut ProgressReporter,
     output: &mut dyn CommandOutput,
     result: &Result<UpdateDecision, ()>,
+    current_version: &Version,
 ) {
     match result {
         Ok(UpdateDecision::Current) => reporter.succeeded(
             output,
             ProgressEvent::Completed(ProgressDetails {
-                current_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+                current_version: Some(current_version.to_string()),
                 ..ProgressDetails::default()
             }),
         ),
@@ -1049,6 +1071,7 @@ async fn install_candidate(
     source: &UpdateSource,
     candidate: wokcore_platform::update::UpdateCandidate,
     dependencies: &RunDependencies,
+    current_version: &Version,
     reporter: &mut ProgressReporter,
     output: &mut dyn CommandOutput,
 ) -> Result<InstallOutcome, InstallFailure> {
@@ -1063,7 +1086,6 @@ async fn install_candidate(
         Err(_) => return Err(InstallFailure::Failed),
     };
     let client = update_client()?;
-    let current_version = Version::parse(env!("CARGO_PKG_VERSION")).map_err(|_| ())?;
     let versions = ProgressDetails {
         current_version: Some(current_version.to_string()),
         target_version: Some(candidate.version().to_string()),
@@ -1085,7 +1107,7 @@ async fn install_candidate(
         candidate.artifact(),
         &target,
         InstallVerificationContext {
-            current_version: &current_version,
+            current_version,
             next_version: candidate.version(),
             lifecycle: &lifecycle,
             transactions: &PlatformUpdateTransactionFactory,
@@ -1097,7 +1119,7 @@ async fn install_candidate(
     .await
 }
 
-async fn check(source: &UpdateSource) -> Result<UpdateDecision, ()> {
+async fn check(source: &UpdateSource, current_version: &Version) -> Result<UpdateDecision, ()> {
     validate_update_source(source)?;
     let client = update_client()?;
     let v2_url = source
@@ -1134,12 +1156,11 @@ async fn check(source: &UpdateSource) -> Result<UpdateDecision, ()> {
                 (manifest, signature, 1)
             }
         };
-    let current_version = Version::parse(env!("CARGO_PKG_VERSION")).map_err(|_| ())?;
     let decision = verify_manifest(
         &manifest,
         &signature,
         &source.public_key,
-        &current_version,
+        current_version,
         current_target(),
     )
     .map_err(|_| ())?;
@@ -1559,7 +1580,7 @@ mod tests {
         Json, Router,
         body::Body,
         response::Response,
-        routing::{get, post},
+        routing::{any, get, post},
     };
     use secrecy::SecretString;
     use semver::Version;
@@ -1588,12 +1609,13 @@ mod tests {
         ChildCleanupCoordinator, InstallFailure, InstallOutcome, InstallVerificationContext,
         LifecyclePreparation, ManagedUpdateChild, OriginalServiceState, PRODUCTION_UPDATE_ORIGIN,
         PlatformUpdateTransactionFactory, PreparedLifecycle, ServiceUpdateLifecycle,
-        UpdateInstallTransaction, UpdateLifecycle, UpdateTransactionFactory, VerificationFailure,
-        acquire_update_lease, classify_drain_response, download_artifact, install_verified,
-        matches_current_service, matches_expected_discovery, matches_expected_service,
-        read_startup_discovery, recovered_old_service_matches, render_install_result,
-        report_install_check_result, run as run_update, update_client, validate_initial_update_url,
-        validated_latest_release_redirect, validated_release_asset_redirect,
+        TEST_PACKAGE_VERSION, UpdateInstallTransaction, UpdateLifecycle, UpdateTransactionFactory,
+        VerificationFailure, acquire_update_lease, classify_drain_response, download_artifact,
+        install_verified, matches_current_service, matches_expected_discovery,
+        matches_expected_service, read_startup_discovery, recovered_old_service_matches,
+        render_install_result, report_install_check_result, run as run_update, update_client,
+        validate_initial_update_url, validated_latest_release_redirect,
+        validated_release_asset_redirect,
     };
     use crate::commands::stop::LifecycleResponse;
     use crate::{
@@ -1669,6 +1691,20 @@ mod tests {
     const INSTALL_SIGNATURE: &[u8] = include_bytes!(
         "../../../../crates/wokcore-platform/tests/fixtures/update/install-wokcore-update-v1.json.minisig"
     );
+    // TEST-ONLY: these two payloads share one public key whose ephemeral private key was generated
+    // in an OS temporary process and was never written to or committed in this repository.
+    const DECISION_PUBLIC_KEY: &str = "untrusted comment: minisign public key 0807060504030201\n\
+RWQBAgMEBQYHCAOhB7/zzhC+HXDdGOdLwJln5NYwm6UNXx3chmQSVTG4\n";
+    const CURRENT_MANIFEST: &[u8] = br#"{"schema_version":1,"product":"wokcore","api_major":1,"version":"9.9.9","signing_key_id":"0807060504030201","artifacts":[{"target":"x86_64-pc-windows-msvc","file":"wokcore-v9.9.9-x86_64-pc-windows-msvc.zip","executable":"wokcore.exe","size":46,"sha256":"47406a44a59871b1f2763693de2e00de60908fed1296c6260eb1ea8c4093047e","url":"https://github.com/hongjiadev/wokcore/releases/download/v9.9.9/wokcore-v9.9.9-x86_64-pc-windows-msvc.zip"},{"target":"x86_64-apple-darwin","file":"wokcore-v9.9.9-x86_64-apple-darwin.tar.gz","executable":"wokcore","size":46,"sha256":"01dd289292f272c3c07e42ac16c02007b1328f00299ae0a34ae63e3aa91ef036","url":"https://github.com/hongjiadev/wokcore/releases/download/v9.9.9/wokcore-v9.9.9-x86_64-apple-darwin.tar.gz"},{"target":"aarch64-apple-darwin","file":"wokcore-v9.9.9-aarch64-apple-darwin.tar.gz","executable":"wokcore","size":47,"sha256":"36f813a1a545e7a282a57eeb74eb1eae3e148e07a6ca1d612a0948d7bb8cb5e7","url":"https://github.com/hongjiadev/wokcore/releases/download/v9.9.9/wokcore-v9.9.9-aarch64-apple-darwin.tar.gz"},{"target":"x86_64-unknown-linux-gnu","file":"wokcore-v9.9.9-x86_64-unknown-linux-gnu.tar.gz","executable":"wokcore","size":51,"sha256":"e3424b0708642e463598f7b825e7151139f723704096684dd6426012fd785e02","url":"https://github.com/hongjiadev/wokcore/releases/download/v9.9.9/wokcore-v9.9.9-x86_64-unknown-linux-gnu.tar.gz"},{"target":"aarch64-unknown-linux-gnu","file":"wokcore-v9.9.9-aarch64-unknown-linux-gnu.tar.gz","executable":"wokcore","size":52,"sha256":"7b22c5943f5a89df1863272f450489fddab9068f45501da99a34d00b38cf2fb7","url":"https://github.com/hongjiadev/wokcore/releases/download/v9.9.9/wokcore-v9.9.9-aarch64-unknown-linux-gnu.tar.gz"}]}"#;
+    const CURRENT_SIGNATURE: &[u8] = b"untrusted comment: signature from minisign secret key\n\
+RUQBAgMEBQYHCIxWnA4rRrC0x8emb+nNdwPhYN/c4xYzF3/qa7gAv7QpDyFIwgirbIkiqcdfcIIG/BM0TrAXN7SySWTM+jA5+gE=\n\
+trusted comment: timestamp:0\\tfile:wokcore-update-v1.json\n\
+a+ujVzYsYv9xhMs15cFOWcRcF65x/H69SQyD5OwTUCyKttGgCb+IGx+mngTu4qNyjgOwKwabNQsPSw1G8mhZBw==\n";
+    const INCOMPATIBLE_MANIFEST: &[u8] = br#"{"schema_version":1,"api_major":2}"#;
+    const INCOMPATIBLE_SIGNATURE: &[u8] = b"untrusted comment: signature from minisign secret key\n\
+RUQBAgMEBQYHCE7xXshIfz2csTa5DkilQMDB/uAONJ8dK/wMfJsB6xxW2xiKfcmOq/1GKqlTs6sgOnJITlJKId9ygVXVQkz4YA0=\n\
+trusted comment: timestamp:0\\tfile:wokcore-update-v1.json\n\
+e8UcECCqF9zIJMd7hWc1qPebsotud4wH34im1sJPtJ9ROqhHbyQOgZf4di0oMc/AlZXzlDxNfJ1ozb37fuOyBA==\n";
     #[cfg(windows)]
     const INSTALL_ARCHIVE: &[u8] = &[
         80, 75, 3, 4, 20, 0, 0, 0, 0, 0, 0, 0, 33, 0, 248, 159, 107, 102, 14, 0, 0, 0, 14, 0, 0, 0,
@@ -1823,7 +1859,12 @@ mod tests {
             let mut output = BufferOutput::default();
             let mut reporter = ProgressReporter::new(true);
 
-            report_install_check_result(&mut reporter, &mut output, &result);
+            report_install_check_result(
+                &mut reporter,
+                &mut output,
+                &result,
+                &Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+            );
 
             let events = progress_events(output.stderr());
             assert_eq!(events.len(), 1);
@@ -1838,6 +1879,187 @@ mod tests {
                 terminal.get("current_version").and_then(Value::as_str),
                 expected_current_version
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn signed_install_command_reports_current_as_the_only_last_success_terminal() {
+        let outcome = TEST_PACKAGE_VERSION
+            .scope(
+                Version::new(9, 9, 9),
+                run_signed_install_decision(CURRENT_MANIFEST, CURRENT_SIGNATURE),
+            )
+            .await;
+
+        assert_eq!(outcome.exit, ExitCode::Success);
+        assert_eq!(
+            outcome.stdout,
+            "{\"code\":\"current\",\"current_version\":\"9.9.9\"}\n"
+        );
+        assert_eq!(outcome.target, b"old executable");
+        assert_eq!(outcome.manifest_requests, 1);
+        assert_eq!(outcome.signature_requests, 1);
+        assert_eq!(outcome.unexpected_requests, 0);
+        assert_eq!(outcome.events.len(), 2);
+        assert_eq!(outcome.events[0]["phase"], "checking_release");
+        assert_eq!(outcome.events[0]["state"], "running");
+        assert_eq!(outcome.events[0]["current_version"], "9.9.9");
+        let terminal = outcome.events.last().unwrap();
+        assert_eq!(terminal["phase"], "completed");
+        assert_eq!(terminal["state"], "succeeded");
+        assert_eq!(terminal["current_version"], "9.9.9");
+        assert!(terminal.get("error_code").is_none());
+    }
+
+    #[tokio::test]
+    async fn signed_install_command_reports_incompatible_manifest_as_the_only_last_failure_terminal()
+     {
+        assert_eq!(
+            wokcore_platform::update::verify_manifest(
+                INCOMPATIBLE_MANIFEST,
+                INCOMPATIBLE_SIGNATURE,
+                DECISION_PUBLIC_KEY,
+                &Version::new(0, 1, 5),
+                current_target(),
+            ),
+            Ok(UpdateDecision::IncompatibleManifest),
+        );
+        let outcome =
+            run_signed_install_decision(INCOMPATIBLE_MANIFEST, INCOMPATIBLE_SIGNATURE).await;
+
+        assert_eq!(
+            outcome.exit,
+            ExitCode::InvalidInput,
+            "stdout: {}; events: {:?}",
+            outcome.stdout,
+            outcome.events,
+        );
+        assert_eq!(outcome.stdout, "{\"code\":\"incompatible_manifest\"}\n");
+        assert_eq!(outcome.target, b"old executable");
+        assert_eq!(outcome.manifest_requests, 1);
+        assert_eq!(outcome.signature_requests, 1);
+        assert_eq!(outcome.unexpected_requests, 0);
+        assert_eq!(outcome.events.len(), 2);
+        assert_eq!(outcome.events[0]["phase"], "checking_release");
+        assert_eq!(outcome.events[0]["state"], "running");
+        let terminal = outcome.events.last().unwrap();
+        assert_eq!(terminal["phase"], "completed");
+        assert_eq!(terminal["state"], "failed");
+        assert_eq!(terminal["error_code"], "incompatible_manifest");
+    }
+
+    struct SignedDecisionOutcome {
+        exit: ExitCode,
+        stdout: String,
+        events: Vec<Value>,
+        target: Vec<u8>,
+        manifest_requests: usize,
+        signature_requests: usize,
+        unexpected_requests: usize,
+    }
+
+    async fn run_signed_install_decision(
+        manifest: &'static [u8],
+        signature: &'static [u8],
+    ) -> SignedDecisionOutcome {
+        let directory = private_tempdir();
+        let paths = test_paths(directory.path());
+        let target = directory.path().join(if cfg!(windows) {
+            "wokcore.exe"
+        } else {
+            "wokcore"
+        });
+        fs::write(&target, b"old executable").unwrap();
+        let manifest_requests = Arc::new(AtomicUsize::new(0));
+        let signature_requests = Arc::new(AtomicUsize::new(0));
+        let unexpected_requests = Arc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route(
+                "/wokcore-update-v2.json",
+                get(|| async { Response::builder().status(404).body(Body::empty()).unwrap() }),
+            )
+            .route(
+                "/wokcore-update-v1.json",
+                get({
+                    let requests = manifest_requests.clone();
+                    move || {
+                        let requests = requests.clone();
+                        async move {
+                            requests.fetch_add(1, Ordering::AcqRel);
+                            Response::new(Body::from(manifest))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/wokcore-update-v1.json.minisig",
+                get({
+                    let requests = signature_requests.clone();
+                    move || {
+                        let requests = requests.clone();
+                        async move {
+                            requests.fetch_add(1, Ordering::AcqRel);
+                            Response::new(Body::from(signature))
+                        }
+                    }
+                }),
+            )
+            .fallback(any({
+                let requests = unexpected_requests.clone();
+                move || {
+                    let requests = requests.clone();
+                    async move {
+                        requests.fetch_add(1, Ordering::AcqRel);
+                        Response::builder().status(404).body(Body::empty()).unwrap()
+                    }
+                }
+            }));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let runtime = Arc::new(AlwaysRunningRuntime);
+        let dependencies = RunDependencies::new(
+            paths,
+            Arc::new(MemorySecretStore::default()),
+            runtime.clone(),
+            runtime.clone(),
+            runtime.clone(),
+            runtime.clone(),
+            runtime,
+        )
+        .with_loopback_update_source(
+            Url::parse(&format!("http://{address}/")).unwrap(),
+            DECISION_PUBLIC_KEY,
+        )
+        .unwrap()
+        .with_update_process(Arc::new(StaticExecutableUpdateProcess {
+            target: target.clone(),
+        }));
+        let mut output = BufferOutput::default();
+
+        let exit = run_update(
+            Update {
+                check: false,
+                install: true,
+                json: true,
+                progress_jsonl: true,
+            },
+            &dependencies,
+            &mut output,
+        )
+        .await;
+
+        server.abort();
+        SignedDecisionOutcome {
+            exit,
+            stdout: output.stdout().to_owned(),
+            events: progress_events(output.stderr()),
+            target: fs::read(target).unwrap(),
+            manifest_requests: manifest_requests.load(Ordering::Acquire),
+            signature_requests: signature_requests.load(Ordering::Acquire),
+            unexpected_requests: unexpected_requests.load(Ordering::Acquire),
         }
     }
 
@@ -3435,17 +3657,27 @@ mod tests {
             let downloading = events
                 .iter()
                 .filter(|event| event["phase"] == "downloading")
+                .map(|event| {
+                    (
+                        event["bytes_completed"].as_u64().unwrap(),
+                        event["bytes_total"].as_u64().unwrap(),
+                    )
+                })
                 .collect::<Vec<_>>();
-            assert_eq!(downloading.first().unwrap()["bytes_completed"], 0);
+            assert!(!downloading.is_empty());
+            let total = downloading[0].1;
+            assert!(total > 0);
+            assert!(downloading.iter().all(|&(completed, event_total)| {
+                event_total == total && event_total > 0 && completed <= event_total
+            }));
             assert!(
                 downloading
-                    .iter()
-                    .all(|event| event["bytes_total"] == INSTALL_ARCHIVE.len() as u64)
+                    .windows(2)
+                    .all(|window| window[0].0 <= window[1].0)
             );
-            assert_eq!(
-                downloading.last().unwrap()["bytes_completed"],
-                INSTALL_ARCHIVE.len() as u64
-            );
+            assert_eq!(downloading.first().unwrap().0, 0);
+            assert_eq!(downloading.last().unwrap().0, total);
+            assert_eq!(total, INSTALL_ARCHIVE.len() as u64);
             assert!(events.iter().any(|event| event["phase"] == "verifying"));
             assert!(events.iter().any(|event| event["phase"] == "installing"));
             assert_eq!(
@@ -3696,6 +3928,8 @@ mod tests {
 
     #[tokio::test]
     async fn broken_progress_pipe_preserves_full_install_rollback_outcome() {
+        let next_version = Version::new(1, 2, 3);
+        let versions = ProgressDetails::default();
         let normal_fixture = install_fixture();
         let normal_backup = install_backup_path(&normal_fixture.target);
         let normal_lifecycle = FullPathRollbackLifecycle::new(&normal_fixture.target);
@@ -3706,6 +3940,8 @@ mod tests {
             &normal_lifecycle,
             &mut normal_reporter,
             &mut normal_output,
+            &next_version,
+            &versions,
         )
         .await;
 
@@ -3719,6 +3955,8 @@ mod tests {
             &broken_lifecycle,
             &mut broken_reporter,
             &mut broken_output,
+            &next_version,
+            &versions,
         )
         .await;
 
@@ -3749,6 +3987,65 @@ mod tests {
             &["verifying", "installing", "rolling_back", "completed"],
         );
         assert_eq!(events.last().unwrap()["error_code"], "rolled_back");
+    }
+
+    #[tokio::test]
+    async fn oversized_progress_preserves_full_install_rollback_outcome() {
+        let next_version = Version::parse(&format!("1.2.3+{}", "a".repeat(17 * 1024))).unwrap();
+        let versions = ProgressDetails {
+            current_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+            target_version: Some(next_version.to_string()),
+            active_requests: None,
+        };
+
+        let normal_fixture = install_fixture();
+        let normal_backup = install_backup_path(&normal_fixture.target);
+        let normal_lifecycle = FullPathRollbackLifecycle::new(&normal_fixture.target);
+        let mut disabled_reporter = ProgressReporter::new(false);
+        let mut normal_output = BufferOutput::default();
+        let normal_exit = run_full_path_rollback(
+            &normal_fixture,
+            &normal_lifecycle,
+            &mut disabled_reporter,
+            &mut normal_output,
+            &next_version,
+            &versions,
+        )
+        .await;
+
+        let oversized_fixture = install_fixture();
+        let oversized_backup = install_backup_path(&oversized_fixture.target);
+        let oversized_lifecycle = FullPathRollbackLifecycle::new(&oversized_fixture.target);
+        let mut oversized_reporter = ProgressReporter::new(true);
+        let mut oversized_output = CountingOutput::default();
+        let oversized_exit = run_full_path_rollback(
+            &oversized_fixture,
+            &oversized_lifecycle,
+            &mut oversized_reporter,
+            &mut oversized_output,
+            &next_version,
+            &versions,
+        )
+        .await;
+
+        assert_eq!(normal_exit, ExitCode::InternalFailure);
+        assert_eq!(oversized_exit, normal_exit);
+        assert_eq!(oversized_output.stdout, normal_output.stdout());
+        assert_eq!(
+            serde_json::from_str::<Value>(normal_output.stdout()).unwrap()["code"],
+            "rolled_back"
+        );
+        assert_eq!(oversized_output.stderr_attempts, 0);
+        assert_eq!(oversized_output.stderr, "");
+        assert_eq!(fs::read(&normal_fixture.target).unwrap(), b"old executable");
+        assert_eq!(
+            fs::read(&oversized_fixture.target).unwrap(),
+            b"old executable"
+        );
+        assert!(!normal_backup.exists());
+        assert!(!oversized_backup.exists());
+        normal_lifecycle.assert_complete_rollback();
+        oversized_lifecycle.assert_complete_rollback();
     }
 
     #[tokio::test]
@@ -4277,6 +4574,8 @@ mod tests {
         lifecycle: &FullPathRollbackLifecycle,
         reporter: &mut ProgressReporter,
         output: &mut dyn CommandOutput,
+        next_version: &Version,
+        versions: &ProgressDetails,
     ) -> ExitCode {
         let archive = fs::File::open(&fixture.archive).unwrap();
         let result = install_verified(
@@ -4285,13 +4584,13 @@ mod tests {
             &fixture.target,
             InstallVerificationContext {
                 current_version: &Version::new(0, 1, 0),
-                next_version: &Version::new(1, 2, 3),
+                next_version,
                 lifecycle,
                 transactions: &PlatformUpdateTransactionFactory,
             },
             reporter,
             output,
-            &ProgressDetails::default(),
+            versions,
         )
         .await;
         render_install_result(reporter, output, result)
@@ -4396,6 +4695,24 @@ mod tests {
     impl ShutdownSignal for AlwaysRunningRuntime {
         fn wait(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
             Box::pin(std::future::pending())
+        }
+    }
+
+    struct StaticExecutableUpdateProcess {
+        target: PathBuf,
+    }
+
+    #[async_trait]
+    impl UpdateProcess for StaticExecutableUpdateProcess {
+        fn current_executable(&self) -> Result<PathBuf, RuntimeValueError> {
+            Ok(self.target.clone())
+        }
+
+        async fn spawn_service(
+            &self,
+            _executable: &Path,
+        ) -> Result<Box<dyn UpdateChild>, RuntimeValueError> {
+            panic!("a current or incompatible signed manifest must not spawn a service")
         }
     }
 
@@ -4886,6 +5203,26 @@ mod tests {
         stdout: String,
         stderr_attempts: usize,
         first_stderr: Option<String>,
+    }
+
+    #[derive(Default)]
+    struct CountingOutput {
+        stdout: String,
+        stderr: String,
+        stderr_attempts: usize,
+    }
+
+    impl CommandOutput for CountingOutput {
+        fn write_stdout(&mut self, value: &str) -> io::Result<()> {
+            self.stdout.push_str(value);
+            Ok(())
+        }
+
+        fn write_stderr(&mut self, value: &str) -> io::Result<()> {
+            self.stderr_attempts += 1;
+            self.stderr.push_str(value);
+            Ok(())
+        }
     }
 
     impl CommandOutput for BrokenPipeOutput {
