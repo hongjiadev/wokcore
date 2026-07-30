@@ -349,6 +349,7 @@ rpmbuild \
     --define "license_mit $SOURCES/LICENSE-MIT" \
     --define "notice $SOURCES/NOTICE.md" \
     --define "readme $SOURCES/README.md" \
+    --define "__strip /bin/true" \
     -bb "$RPM_SPEC"
 BUILT_RPM="$RPM_ROOT/RPMS/$RPM_ARCH/wokcore-$VERSION-1.$RPM_ARCH.rpm"
 [[ -f "$BUILT_RPM" && ! -L "$BUILT_RPM" ]] ||
