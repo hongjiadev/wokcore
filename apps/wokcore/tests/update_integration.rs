@@ -9,7 +9,7 @@ use std::{
 
 use axum::{Router, body::Body, response::Response, routing::get};
 use clap::Parser;
-use serde_json::json;
+use serde_json::{Value, json};
 use tempfile::tempdir;
 use tokio::net::TcpListener;
 use url::Url;
@@ -96,10 +96,118 @@ fn dependencies() -> (tempfile::TempDir, RunDependencies) {
     (directory, dependencies)
 }
 
+fn progress_events(stderr: &str) -> Vec<Value> {
+    let events = stderr
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            serde_json::from_str::<Value>(line)
+                .unwrap_or_else(|error| panic!("invalid progress JSONL line {line:?}: {error}"))
+        })
+        .collect::<Vec<_>>();
+    assert!(!events.is_empty(), "enabled progress transcript is empty");
+    for (sequence, event) in events.iter().enumerate() {
+        let object = event
+            .as_object()
+            .unwrap_or_else(|| panic!("progress event is not an object: {event:?}"));
+        assert_eq!(object.get("schema_version"), Some(&json!(1)));
+        assert_eq!(object.get("operation"), Some(&json!("update")));
+        assert_eq!(
+            object.get("sequence").and_then(Value::as_u64),
+            Some(u64::try_from(sequence).unwrap())
+        );
+        for forbidden in [
+            "url",
+            "path",
+            "command",
+            "token",
+            "body",
+            "manifest",
+            "signature",
+        ] {
+            assert!(
+                !object.contains_key(forbidden),
+                "progress event exposed {forbidden}: {event:?}"
+            );
+        }
+        match object.get("phase").and_then(Value::as_str) {
+            Some("downloading") => {
+                assert!(
+                    object
+                        .get("bytes_completed")
+                        .and_then(Value::as_u64)
+                        .is_some(),
+                    "download event lacks a non-negative integer bytes_completed: {event:?}"
+                );
+                assert!(
+                    object.get("bytes_total").and_then(Value::as_u64).is_some(),
+                    "download event lacks a non-negative integer bytes_total: {event:?}"
+                );
+            }
+            Some(_) => {
+                assert!(
+                    !object.contains_key("bytes_completed"),
+                    "non-download event has bytes_completed: {event:?}"
+                );
+                assert!(
+                    !object.contains_key("bytes_total"),
+                    "non-download event has bytes_total: {event:?}"
+                );
+            }
+            None => panic!("progress event lacks a string phase: {event:?}"),
+        }
+        assert!(
+            matches!(
+                object.get("state").and_then(Value::as_str),
+                Some("running" | "succeeded" | "failed")
+            ),
+            "progress event has an invalid state: {event:?}"
+        );
+    }
+    let terminal_indexes = events
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| (event["state"] != "running").then_some(index))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        terminal_indexes,
+        [events.len() - 1],
+        "progress transcript must have exactly one final terminal event: {events:?}"
+    );
+    assert_eq!(events.last().unwrap()["phase"], "completed");
+    events
+}
+
+fn final_code(stdout: &str) -> String {
+    let lines = stdout.lines().collect::<Vec<_>>();
+    assert_eq!(
+        lines.len(),
+        1,
+        "command must emit exactly one final stdout JSON document"
+    );
+    serde_json::from_str::<Value>(lines[0]).unwrap()["code"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
 #[test]
 fn update_cli_accepts_exactly_one_explicit_action_with_json_output() {
     assert!(parse_command(["wokcore", "update", "--check", "--json"]).is_ok());
     assert!(parse_command(["wokcore", "update", "--install", "--json"]).is_ok());
+    assert!(
+        parse_command([
+            "wokcore",
+            "update",
+            "--install",
+            "--json",
+            "--progress-jsonl",
+        ])
+        .is_ok()
+    );
+    assert!(
+        parse_command(["wokcore", "update", "--check", "--json", "--progress-jsonl",]).is_err()
+    );
 }
 
 #[test]
@@ -123,6 +231,116 @@ async fn update_check_without_a_verification_key_fails_closed_before_network_acc
     assert_eq!(exit, ExitCode::InternalFailure);
     assert_eq!(output.stdout(), "{\"code\":\"update_unavailable\"}\n");
     assert_eq!(output.stderr(), "");
+}
+
+#[tokio::test]
+async fn update_install_without_progress_preserves_the_final_json_and_empty_stderr() {
+    let (_directory, dependencies) = dependencies();
+    let mut output = BufferOutput::default();
+
+    let exit = run_with_dependencies(
+        Cli::try_parse_from(["wokcore", "update", "--install", "--json"]).unwrap(),
+        &dependencies,
+        &mut output,
+    )
+    .await;
+
+    assert_eq!(exit, ExitCode::InternalFailure);
+    assert_eq!(output.stdout(), "{\"code\":\"update_unavailable\"}\n");
+    assert_eq!(final_code(output.stdout()), "update_unavailable");
+    assert_eq!(output.stderr(), "");
+}
+
+#[tokio::test]
+async fn update_install_progress_reports_an_unavailable_source_as_the_last_terminal_event() {
+    let (_directory, dependencies) = dependencies();
+    let mut output = BufferOutput::default();
+
+    let exit = run_with_dependencies(
+        Cli::try_parse_from([
+            "wokcore",
+            "update",
+            "--install",
+            "--json",
+            "--progress-jsonl",
+        ])
+        .unwrap(),
+        &dependencies,
+        &mut output,
+    )
+    .await;
+
+    assert_eq!(exit, ExitCode::InternalFailure);
+    assert_eq!(output.stdout(), "{\"code\":\"update_unavailable\"}\n");
+    let events = progress_events(output.stderr());
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["phase"] == "completed")
+            .count(),
+        1
+    );
+    let terminal = events.last().unwrap();
+    assert_eq!(terminal["state"], "failed");
+    assert_eq!(terminal["phase"], "completed");
+    assert_eq!(terminal["error_code"], "update_unavailable");
+}
+
+#[tokio::test]
+async fn update_install_progress_reports_a_malformed_signed_manifest_as_verification_failed() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let app = Router::new()
+        .route(
+            "/wokcore-update-v2.json",
+            get(|| async { Response::new(Body::from(MIGRATION_V1)) }),
+        )
+        .route(
+            "/wokcore-update-v2.json.minisig",
+            get(|| async { Response::new(Body::from(MIGRATION_V1_SIGNATURE)) }),
+        );
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let origin = Url::parse(&format!("http://{address}/")).unwrap();
+    let (_directory, dependencies) = dependencies();
+    let dependencies = dependencies
+        .with_loopback_update_source(origin, MIGRATION_PUBLIC_KEY)
+        .unwrap();
+    let mut output = BufferOutput::default();
+
+    let exit = run_with_dependencies(
+        Cli::try_parse_from([
+            "wokcore",
+            "update",
+            "--install",
+            "--json",
+            "--progress-jsonl",
+        ])
+        .unwrap(),
+        &dependencies,
+        &mut output,
+    )
+    .await;
+
+    server.abort();
+    assert_eq!(exit, ExitCode::InternalFailure);
+    assert_eq!(
+        output.stdout(),
+        "{\"code\":\"update_verification_failed\"}\n"
+    );
+    let events = progress_events(output.stderr());
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["phase"] == "completed")
+            .count(),
+        1
+    );
+    let terminal = events.last().unwrap();
+    assert_eq!(terminal["state"], "failed");
+    assert_eq!(terminal["phase"], "completed");
+    assert_eq!(terminal["error_code"], "update_verification_failed");
 }
 
 #[tokio::test]

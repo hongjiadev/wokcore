@@ -187,6 +187,9 @@ pub struct Update {
     /// Emit the stable JSON response.
     #[arg(long, required = true)]
     pub json: bool,
+    /// Emit schema-v1 progress events as JSON Lines on stderr.
+    #[arg(long, requires = "install", conflicts_with = "check")]
+    pub progress_jsonl: bool,
 }
 
 #[derive(Debug, Args)]

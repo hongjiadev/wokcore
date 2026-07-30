@@ -3,9 +3,10 @@ use std::{
     process::{Command, Output},
 };
 
+use clap::Parser;
 use wokcore::{
     ExitCode,
-    cli::{Command as CliCommand, parse_command},
+    cli::{Cli, Command as CliCommand, parse_command},
 };
 
 const ROOT_HELP: &str = "\
@@ -55,6 +56,49 @@ fn root_help_and_version_are_exact_and_deterministic() {
 }
 
 #[test]
+fn update_progress_jsonl_is_available_only_for_install() {
+    for accepted in [
+        &["wokcore", "update", "--check", "--json"][..],
+        &["wokcore", "update", "--install", "--json"],
+        &[
+            "wokcore",
+            "update",
+            "--install",
+            "--json",
+            "--progress-jsonl",
+        ],
+    ] {
+        assert!(Cli::try_parse_from(accepted).is_ok(), "{accepted:?}");
+    }
+
+    let parsed = Cli::try_parse_from([
+        "wokcore",
+        "update",
+        "--install",
+        "--json",
+        "--progress-jsonl",
+    ])
+    .unwrap();
+    let CliCommand::Update(update) = parsed.command else {
+        panic!("expected update command");
+    };
+    assert!(update.install);
+    assert!(update.progress_jsonl);
+
+    for rejected in [
+        &["wokcore", "update", "--json"][..],
+        &["wokcore", "update", "--check"],
+        &["wokcore", "update", "--install"],
+        &["wokcore", "update", "--check", "--install", "--json"],
+        &["wokcore", "update", "--check", "--json", "--progress-jsonl"],
+        &["wokcore", "update", "--install", "--progress-jsonl"],
+        &["wokcore", "update", "--json", "--progress-jsonl"],
+    ] {
+        assert!(Cli::try_parse_from(rejected).is_err(), "{rejected:?}");
+    }
+}
+
+#[test]
 fn only_the_documented_commands_and_options_are_accepted() {
     let cases = [
         (
@@ -95,7 +139,7 @@ fn only_the_documented_commands_and_options_are_accepted() {
         ),
         (
             "update",
-            "Check for or install a signed WokCore update\n\nUsage: wokcore update --json <--check|--install>\n\nOptions:\n      --check    Check whether a newer signed WokCore release is available\n      --install  Install a newer signed WokCore release\n      --json     Emit the stable JSON response\n  -h, --help     Print help\n",
+            "Check for or install a signed WokCore update\n\nUsage: wokcore update [OPTIONS] --json <--check|--install>\n\nOptions:\n      --check           Check whether a newer signed WokCore release is available\n      --install         Install a newer signed WokCore release\n      --json            Emit the stable JSON response\n      --progress-jsonl  Emit schema-v1 progress events as JSON Lines on stderr\n  -h, --help            Print help\n",
         ),
     ];
 
