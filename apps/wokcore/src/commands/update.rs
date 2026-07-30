@@ -18,8 +18,8 @@ use tokio::io::AsyncWriteExt;
 use wokcore_platform::{
     DiscoveryRecord, DiscoveryStore, PlatformError,
     update::{
-        InstallOutcome, MAX_UPDATE_ARTIFACT_BYTES, MAX_UPDATE_MANIFEST_BYTES,
-        MAX_UPDATE_SIGNATURE_BYTES, UpdateArtifact, UpdateDecision, UpdateError,
+        InstallOutcome, InstallTransaction, MAX_UPDATE_ARTIFACT_BYTES, MAX_UPDATE_MANIFEST_BYTES,
+        MAX_UPDATE_SIGNATURE_BYTES, PreparedInstall, UpdateArtifact, UpdateDecision, UpdateError,
         acquire_update_lease, current_target, prepare_install_file, verify_artifact_file,
         verify_manifest,
     },
@@ -120,6 +120,44 @@ fn rollback_install_failure(error: &UpdateError) -> InstallFailure {
             InstallFailure::RecoveryRequired
         }
         _ => InstallFailure::Failed,
+    }
+}
+
+trait UpdateInstallTransaction: Send {
+    fn commit(self: Box<Self>) -> Result<(), UpdateError>;
+    fn rollback(self: Box<Self>) -> Result<(), UpdateError>;
+    fn preserve_for_recovery(self: Box<Self>);
+}
+
+impl UpdateInstallTransaction for InstallTransaction {
+    fn commit(self: Box<Self>) -> Result<(), UpdateError> {
+        (*self).commit()
+    }
+
+    fn rollback(self: Box<Self>) -> Result<(), UpdateError> {
+        (*self).rollback()
+    }
+
+    fn preserve_for_recovery(self: Box<Self>) {
+        (*self).preserve_for_recovery();
+    }
+}
+
+trait UpdateTransactionFactory: Send + Sync {
+    fn begin(
+        &self,
+        prepared: PreparedInstall,
+    ) -> Result<Box<dyn UpdateInstallTransaction>, UpdateError>;
+}
+
+struct PlatformUpdateTransactionFactory;
+
+impl UpdateTransactionFactory for PlatformUpdateTransactionFactory {
+    fn begin(
+        &self,
+        prepared: PreparedInstall,
+    ) -> Result<Box<dyn UpdateInstallTransaction>, UpdateError> {
+        Ok(Box::new(prepared.begin()?))
     }
 }
 
@@ -1049,6 +1087,7 @@ async fn install_candidate(
         &current_version,
         candidate.version(),
         &lifecycle,
+        &PlatformUpdateTransactionFactory,
         reporter,
         output,
         &versions,
@@ -1383,6 +1422,7 @@ async fn install_verified(
     current_version: &Version,
     next_version: &Version,
     lifecycle: &dyn UpdateLifecycle,
+    transactions: &dyn UpdateTransactionFactory,
     reporter: &mut ProgressReporter,
     output: &mut dyn CommandOutput,
     versions: &ProgressDetails,
@@ -1404,7 +1444,7 @@ async fn install_verified(
     };
 
     reporter.running(output, ProgressEvent::Installing(versions.clone()));
-    let transaction = match prepared.begin() {
+    let transaction = match transactions.begin(prepared) {
         Ok(transaction) => transaction,
         Err(UpdateError::RecoveryRequired) => {
             preparation.disarm().map_err(|_| InstallFailure::Failed)?;
@@ -1522,7 +1562,10 @@ mod tests {
     };
     use wokcore_platform::{
         AppPaths, DiscoveryRecord, DiscoveryStore, RuntimeLease,
-        update::{UpdateArtifact, UpdateDecision, UpdateError, current_target},
+        update::{
+            InstallTransaction, PreparedInstall, UpdateArtifact, UpdateDecision, UpdateError,
+            current_target,
+        },
     };
     use wokcore_server::auth::{EntropySource, TokenError};
     use wokcore_storage::{MemorySecretStore, SecretStore, StateStore};
@@ -1530,12 +1573,13 @@ mod tests {
     use super::progress::{ProgressDetails, ProgressReporter};
     use super::{
         ChildCleanupCoordinator, InstallFailure, InstallOutcome, LifecyclePreparation,
-        ManagedUpdateChild, OriginalServiceState, PRODUCTION_UPDATE_ORIGIN, PreparedLifecycle,
-        ServiceUpdateLifecycle, UpdateLifecycle, VerificationFailure, acquire_update_lease,
-        classify_drain_response, download_artifact, install_verified, matches_current_service,
-        matches_expected_discovery, matches_expected_service, read_startup_discovery,
-        recovered_old_service_matches, render_install_result, report_install_check_result,
-        rollback_install_failure, run as run_update, update_client, validate_initial_update_url,
+        ManagedUpdateChild, OriginalServiceState, PRODUCTION_UPDATE_ORIGIN,
+        PlatformUpdateTransactionFactory, PreparedLifecycle, ServiceUpdateLifecycle,
+        UpdateInstallTransaction, UpdateLifecycle, UpdateTransactionFactory, VerificationFailure,
+        acquire_update_lease, classify_drain_response, download_artifact, install_verified,
+        matches_current_service, matches_expected_discovery, matches_expected_service,
+        read_startup_discovery, recovered_old_service_matches, render_install_result,
+        report_install_check_result, run as run_update, update_client, validate_initial_update_url,
         validated_latest_release_redirect, validated_release_asset_redirect,
     };
     use crate::commands::stop::LifecycleResponse;
@@ -1742,22 +1786,6 @@ mod tests {
                 expected_active_requests
             );
         }
-    }
-
-    #[test]
-    fn rollback_durability_failure_requires_manual_recovery() {
-        assert_eq!(
-            rollback_install_failure(&UpdateError::RollbackDurabilityFailed),
-            InstallFailure::RecoveryRequired
-        );
-        assert_eq!(
-            rollback_install_failure(&UpdateError::RecoveryRequired),
-            InstallFailure::RecoveryRequired
-        );
-        assert_eq!(
-            rollback_install_failure(&UpdateError::RollbackFailed),
-            InstallFailure::Failed
-        );
     }
 
     #[test]
@@ -3539,6 +3567,7 @@ mod tests {
             &Version::new(0, 1, 0),
             &Version::new(1, 2, 3),
             &lifecycle,
+            &PlatformUpdateTransactionFactory,
             &mut reporter,
             &mut output,
             &versions,
@@ -3548,6 +3577,13 @@ mod tests {
 
         let events = progress_events(output.stderr());
         assert!(!events.iter().any(|event| event["phase"] == "installing"));
+        assert!(!events.iter().any(|event| event["phase"] == "rolling_back"));
+        let terminals = events
+            .iter()
+            .filter(|event| event["state"] != "running")
+            .collect::<Vec<_>>();
+        assert_eq!(terminals.len(), 1);
+        assert_eq!(terminals[0], events.last().unwrap());
         let terminal = events.last().unwrap();
         assert_eq!(terminal["phase"], "completed");
         assert_eq!(terminal["error_code"], "active_requests_remain");
@@ -3661,6 +3697,7 @@ mod tests {
             &Version::new(0, 1, 0),
             &Version::new(1, 2, 3),
             &lifecycle,
+            &PlatformUpdateTransactionFactory,
             &mut reporter,
             &mut output,
             &ProgressDetails::default(),
@@ -3792,6 +3829,7 @@ mod tests {
             &Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
             &Version::new(1, 2, 3),
             &lifecycle,
+            &PlatformUpdateTransactionFactory,
             &mut reporter,
             &mut output,
             &versions,
@@ -3869,6 +3907,80 @@ mod tests {
 
         assert_eq!(terminal["error_code"], "recovery_required");
         assert_eq!(fs::read(&fixture.target).unwrap(), b"old executable");
+    }
+
+    struct RollbackDurabilityFailureFactory;
+
+    impl UpdateTransactionFactory for RollbackDurabilityFailureFactory {
+        fn begin(
+            &self,
+            prepared: PreparedInstall,
+        ) -> Result<Box<dyn UpdateInstallTransaction>, UpdateError> {
+            Ok(Box::new(RollbackDurabilityFailureTransaction {
+                inner: prepared.begin()?,
+            }))
+        }
+    }
+
+    struct RollbackDurabilityFailureTransaction {
+        inner: InstallTransaction,
+    }
+
+    impl UpdateInstallTransaction for RollbackDurabilityFailureTransaction {
+        fn commit(self: Box<Self>) -> Result<(), UpdateError> {
+            self.inner.commit()
+        }
+
+        fn rollback(self: Box<Self>) -> Result<(), UpdateError> {
+            self.inner.rollback()?;
+            Err(UpdateError::RollbackDurabilityFailed)
+        }
+
+        fn preserve_for_recovery(self: Box<Self>) {
+            self.inner.preserve_for_recovery();
+        }
+    }
+
+    #[tokio::test]
+    async fn lifecycle_progress_propagates_rollback_durability_failure_to_terminal() {
+        let fixture = install_fixture();
+        let archive = fs::File::open(&fixture.archive).unwrap();
+        let lifecycle = FakeLifecycle::new(
+            LifecyclePreparation::Ready(OriginalServiceState::Running),
+            false,
+        );
+        let mut reporter = ProgressReporter::new(true);
+        let mut output = BufferOutput::default();
+
+        let result = install_verified(
+            &archive,
+            &fixture.artifact,
+            &fixture.target,
+            &Version::new(0, 1, 0),
+            &Version::new(1, 2, 3),
+            &lifecycle,
+            &RollbackDurabilityFailureFactory,
+            &mut reporter,
+            &mut output,
+            &ProgressDetails::default(),
+        )
+        .await;
+        let exit = render_install_result(&mut reporter, &mut output, result);
+
+        let events = progress_events(output.stderr());
+        let terminals = events
+            .iter()
+            .filter(|event| event["state"] != "running")
+            .collect::<Vec<_>>();
+        assert_eq!(terminals.len(), 1);
+        assert_eq!(terminals[0], events.last().unwrap());
+        assert_eq!(terminals[0]["phase"], "completed");
+        assert_eq!(terminals[0]["state"], "failed");
+        assert_eq!(terminals[0]["error_code"], "recovery_required");
+        assert_eq!(output.stdout(), "{\"code\":\"update_install_failed\"}\n");
+        assert_eq!(exit, ExitCode::InternalFailure);
+        assert_eq!(fs::read(&fixture.target).unwrap(), b"old executable");
+        assert_eq!(lifecycle.events(), vec!["prepare", "verify", "restore"]);
     }
 
     #[tokio::test]
@@ -3974,6 +4086,7 @@ mod tests {
             current_version,
             next_version,
             lifecycle,
+            &PlatformUpdateTransactionFactory,
             &mut reporter,
             &mut output,
             &ProgressDetails::default(),
@@ -4005,6 +4118,7 @@ mod tests {
             &Version::new(0, 1, 0),
             &Version::new(1, 2, 3),
             lifecycle,
+            &PlatformUpdateTransactionFactory,
             &mut reporter,
             &mut output,
             &ProgressDetails::default(),
