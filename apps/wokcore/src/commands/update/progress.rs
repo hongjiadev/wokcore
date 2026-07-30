@@ -130,16 +130,16 @@ enum EventDetails {
     Downloading(DownloadProgressDetails),
 }
 
+type EventFields = (
+    Option<String>,
+    Option<String>,
+    Option<u64>,
+    Option<u64>,
+    Option<usize>,
+);
+
 impl EventDetails {
-    fn into_fields(
-        self,
-    ) -> (
-        Option<String>,
-        Option<String>,
-        Option<u64>,
-        Option<u64>,
-        Option<usize>,
-    ) {
+    fn into_fields(self) -> EventFields {
         match self {
             Self::Standard(details) => (
                 details.current_version,

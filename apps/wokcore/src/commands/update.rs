@@ -1084,10 +1084,12 @@ async fn install_candidate(
         download.file(),
         candidate.artifact(),
         &target,
-        &current_version,
-        candidate.version(),
-        &lifecycle,
-        &PlatformUpdateTransactionFactory,
+        InstallVerificationContext {
+            current_version: &current_version,
+            next_version: candidate.version(),
+            lifecycle: &lifecycle,
+            transactions: &PlatformUpdateTransactionFactory,
+        },
         reporter,
         output,
         &versions,
@@ -1415,18 +1417,28 @@ fn validated_latest_release_redirect(initial: &url::Url, redirect: &url::Url) ->
     .ok_or(())
 }
 
+struct InstallVerificationContext<'a> {
+    current_version: &'a Version,
+    next_version: &'a Version,
+    lifecycle: &'a dyn UpdateLifecycle,
+    transactions: &'a dyn UpdateTransactionFactory,
+}
+
 async fn install_verified(
     archive: &File,
     artifact: &UpdateArtifact,
     target: &Path,
-    current_version: &Version,
-    next_version: &Version,
-    lifecycle: &dyn UpdateLifecycle,
-    transactions: &dyn UpdateTransactionFactory,
+    context: InstallVerificationContext<'_>,
     reporter: &mut ProgressReporter,
     output: &mut dyn CommandOutput,
     versions: &ProgressDetails,
 ) -> Result<InstallOutcome, InstallFailure> {
+    let InstallVerificationContext {
+        current_version,
+        next_version,
+        lifecycle,
+        transactions,
+    } = context;
     reporter.running(output, ProgressEvent::Verifying(versions.clone()));
     verify_artifact_file(archive, artifact).map_err(|_| InstallFailure::Failed)?;
     let prepared =
@@ -1572,8 +1584,8 @@ mod tests {
 
     use super::progress::{ProgressDetails, ProgressReporter};
     use super::{
-        ChildCleanupCoordinator, InstallFailure, InstallOutcome, LifecyclePreparation,
-        ManagedUpdateChild, OriginalServiceState, PRODUCTION_UPDATE_ORIGIN,
+        ChildCleanupCoordinator, InstallFailure, InstallOutcome, InstallVerificationContext,
+        LifecyclePreparation, ManagedUpdateChild, OriginalServiceState, PRODUCTION_UPDATE_ORIGIN,
         PlatformUpdateTransactionFactory, PreparedLifecycle, ServiceUpdateLifecycle,
         UpdateInstallTransaction, UpdateLifecycle, UpdateTransactionFactory, VerificationFailure,
         acquire_update_lease, classify_drain_response, download_artifact, install_verified,
@@ -3564,10 +3576,12 @@ mod tests {
             &archive,
             &fixture.artifact,
             &fixture.target,
-            &Version::new(0, 1, 0),
-            &Version::new(1, 2, 3),
-            &lifecycle,
-            &PlatformUpdateTransactionFactory,
+            InstallVerificationContext {
+                current_version: &Version::new(0, 1, 0),
+                next_version: &Version::new(1, 2, 3),
+                lifecycle: &lifecycle,
+                transactions: &PlatformUpdateTransactionFactory,
+            },
             &mut reporter,
             &mut output,
             &versions,
@@ -3694,10 +3708,12 @@ mod tests {
             &archive,
             &fixture.artifact,
             &fixture.target,
-            &Version::new(0, 1, 0),
-            &Version::new(1, 2, 3),
-            &lifecycle,
-            &PlatformUpdateTransactionFactory,
+            InstallVerificationContext {
+                current_version: &Version::new(0, 1, 0),
+                next_version: &Version::new(1, 2, 3),
+                lifecycle: &lifecycle,
+                transactions: &PlatformUpdateTransactionFactory,
+            },
             &mut reporter,
             &mut output,
             &ProgressDetails::default(),
@@ -3826,10 +3842,12 @@ mod tests {
             &archive,
             &fixture.artifact,
             &fixture.target,
-            &Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
-            &Version::new(1, 2, 3),
-            &lifecycle,
-            &PlatformUpdateTransactionFactory,
+            InstallVerificationContext {
+                current_version: &Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+                next_version: &Version::new(1, 2, 3),
+                lifecycle: &lifecycle,
+                transactions: &PlatformUpdateTransactionFactory,
+            },
             &mut reporter,
             &mut output,
             &versions,
@@ -3956,10 +3974,12 @@ mod tests {
             &archive,
             &fixture.artifact,
             &fixture.target,
-            &Version::new(0, 1, 0),
-            &Version::new(1, 2, 3),
-            &lifecycle,
-            &RollbackDurabilityFailureFactory,
+            InstallVerificationContext {
+                current_version: &Version::new(0, 1, 0),
+                next_version: &Version::new(1, 2, 3),
+                lifecycle: &lifecycle,
+                transactions: &RollbackDurabilityFailureFactory,
+            },
             &mut reporter,
             &mut output,
             &ProgressDetails::default(),
@@ -4083,10 +4103,12 @@ mod tests {
             archive,
             artifact,
             target,
-            current_version,
-            next_version,
-            lifecycle,
-            &PlatformUpdateTransactionFactory,
+            InstallVerificationContext {
+                current_version,
+                next_version,
+                lifecycle,
+                transactions: &PlatformUpdateTransactionFactory,
+            },
             &mut reporter,
             &mut output,
             &ProgressDetails::default(),
@@ -4115,10 +4137,12 @@ mod tests {
             archive,
             &fixture.artifact,
             &fixture.target,
-            &Version::new(0, 1, 0),
-            &Version::new(1, 2, 3),
-            lifecycle,
-            &PlatformUpdateTransactionFactory,
+            InstallVerificationContext {
+                current_version: &Version::new(0, 1, 0),
+                next_version: &Version::new(1, 2, 3),
+                lifecycle,
+                transactions: &PlatformUpdateTransactionFactory,
+            },
             &mut reporter,
             &mut output,
             &ProgressDetails::default(),
