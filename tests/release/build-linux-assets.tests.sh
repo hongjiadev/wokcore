@@ -60,7 +60,11 @@ TECHNICAL_DIST="$TEST_ROOT/technical"
 DIST="$TEST_ROOT/dist"
 mkdir -p "$FIXTURE_REPOSITORY" "$TECHNICAL_DIST" "$DIST"
 
-printf 'wokcore Linux %s fixture executable\n' "$PUBLIC_ARCH" >"$TEST_ROOT/wokcore"
+[[ -x /bin/true ]] || {
+    printf 'Linux asset tests require an ELF fixture executable: /bin/true\n' >&2
+    exit 1
+}
+cp -- /bin/true "$TEST_ROOT/wokcore"
 printf 'Apache fixture\n' >"$FIXTURE_REPOSITORY/LICENSE-APACHE"
 printf 'MIT fixture\n' >"$FIXTURE_REPOSITORY/LICENSE-MIT"
 printf 'notice fixture\n' >"$FIXTURE_REPOSITORY/NOTICE.md"
@@ -117,12 +121,32 @@ test "$(
 )" = "$expected_deb_archive_files"
 verify_package_tree() {
     local root="$1"
-    test "$(
-        find "$root" -mindepth 1 ! -type d -printf '%y /%P\n' |
+    local allow_build_id_links="${2:-false}"
+    local actual_files
+    local symlinks
+    local link
+    local link_count=0
+    actual_files="$(
+        find "$root" -type f -printf 'f /%P\n' |
             LC_ALL=C sort
-    )" = "$(
+    )"
+    test "$actual_files" = "$(
         printf '%s\n' "$expected_package_files" | sed 's|^|f |'
     )"
+    symlinks="$(
+        find "$root" -type l -printf '/%P -> %l\n' |
+            LC_ALL=C sort
+    )"
+    if [[ "$allow_build_id_links" == true ]]; then
+        while IFS= read -r link; do
+            [[ -n "$link" ]] || continue
+            link_count=$((link_count + 1))
+            [[ "$link" =~ ^/usr/lib/\.build-id/[0-9a-f]{2}/[0-9a-f]{38}\ \-\>\ ../../../../usr/bin/wokcore$ ]]
+        done <<< "$symlinks"
+        test "$link_count" -le 1
+    else
+        test -z "$symlinks"
+    fi
     cmp "$TEST_ROOT/wokcore" "$root/usr/bin/wokcore"
     for name in LICENSE-APACHE LICENSE-MIT NOTICE.md README.md; do
         cmp "$FIXTURE_REPOSITORY/$name" \
@@ -139,11 +163,23 @@ mkdir "$DEB_EXTRACT"
 dpkg-deb --extract "$DEB_PACKAGE" "$DEB_EXTRACT"
 verify_package_tree "$DEB_EXTRACT"
 
-test "$(rpm -qpl "$RPM_PACKAGE" | LC_ALL=C sort)" = "$expected_package_files"
+test "$(
+    rpm -qpl "$RPM_PACKAGE" |
+        LC_ALL=C sort |
+        sed -E \
+            -e '\#^/usr/?$#d' \
+            -e '\#^/usr/bin/?$#d' \
+            -e '\#^/usr/share/?$#d' \
+            -e '\#^/usr/share/doc/?$#d' \
+            -e '\#^/usr/share/doc/wokcore/?$#d' \
+            -e '\#^/usr/lib/\.build-id/?$#d' \
+            -e '\#^/usr/lib/\.build-id/[0-9a-f]{2}/?$#d' \
+            -e '\#^/usr/lib/\.build-id/[0-9a-f]{2}/[0-9a-f]{38}/?$#d'
+)" = "$expected_package_files"
 RPM_EXTRACT="$TEST_ROOT/rpm-extract"
 mkdir "$RPM_EXTRACT"
 rpm2cpio "$RPM_PACKAGE" | (cd "$RPM_EXTRACT" && cpio -idmu --quiet)
-verify_package_tree "$RPM_EXTRACT"
+verify_package_tree "$RPM_EXTRACT" true
 
 expect_failure() {
     local expected_error="$1"

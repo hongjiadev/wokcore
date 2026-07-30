@@ -67,6 +67,10 @@ verify_package_tree() {
     local root="$1"
     local package_format="$2"
     local actual_files
+    if [[ "$package_format" != RPM &&
+        -n "$(find "$root" -type l -print -quit)" ]]; then
+        fail "built $package_format package file list is invalid"
+    fi
     actual_files="$(
         find "$root" -type f -printf '/%P\n' | LC_ALL=C sort
     )" || fail "built $package_format package file list is invalid"
