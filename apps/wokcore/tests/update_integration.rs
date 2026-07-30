@@ -100,6 +100,19 @@ fn dependencies() -> (tempfile::TempDir, RunDependencies) {
 fn update_cli_accepts_exactly_one_explicit_action_with_json_output() {
     assert!(parse_command(["wokcore", "update", "--check", "--json"]).is_ok());
     assert!(parse_command(["wokcore", "update", "--install", "--json"]).is_ok());
+    assert!(
+        parse_command([
+            "wokcore",
+            "update",
+            "--install",
+            "--json",
+            "--progress-jsonl",
+        ])
+        .is_ok()
+    );
+    assert!(
+        parse_command(["wokcore", "update", "--check", "--json", "--progress-jsonl",]).is_err()
+    );
 }
 
 #[test]

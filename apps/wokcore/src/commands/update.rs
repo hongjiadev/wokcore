@@ -30,6 +30,9 @@ use crate::{
     cli::Update,
 };
 
+#[allow(dead_code)]
+mod progress;
+
 use super::{
     client::{ControlClient, ControlClientError},
     status::verify_identity,
@@ -2821,6 +2824,7 @@ mod tests {
                 check: false,
                 install: true,
                 json: true,
+                progress_jsonl: false,
             },
             &dependencies,
             &mut output,
